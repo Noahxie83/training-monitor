@@ -12,6 +12,8 @@
 | **Phase 2** | [`02-probe-telemetry-autostart-store.md`](./02-probe-telemetry-autostart-store.md) | 通用 ML 进程树归属（DDP/`torchrun`/`python -m`/`tee`/超 128 FD/`eofBytes` 修复）、通用指标解析与目录级 Checkpoint、多卡任意命令自动启动与主机级排队 GC、SQLite v2（时序表+FTS5+读写分离）、异常检测告警、一键进程发现与可选远程作业控制 | `feat(probe,store,launch): ...` |
 | **Phase 3** | [`03-frontend-aesthetic-redesign.md`](./03-frontend-aesthetic-redesign.md) | 前端视觉审美彻底重塑（现代精密工程观测台风、本地打包 `Inter`+`JetBrains Mono`、`lucide-react`、浅深色统一布局、三层明度表面、GPU 集群汇总+双进度条+负载色阶+趋势折线图、ANSI/搜索高亮/原地刷新的日志终端、表单与抽屉重构、中英双语 i18n、Electron 无边框融合标题栏、更新 `DESIGN.md` 与多分辨率截图验收） | `feat(ui): ...` |
 | **Phase 4** | [`04-desktop-resilience-and-hygiene.md`](./04-desktop-resilience-and-hygiene.md) | 系统托盘与关闭最小化后台常驻、多屏安全窗口几何记忆、CSP 修复与 React `ErrorBoundary`、配置损坏隔离恢复、跨平台打包与 CI、全仓死代码与根目录残留彻底清理、全链路最终验收 | `chore(desktop,ci): ...` |
+| **Phase 5a** | [`05a-backend-desktop-fixes.md`](./05a-backend-desktop-fixes.md) | **收官复核修复（后端/探针/自动启动/桌面端/测试，建议 Codex）**：修 Checkpoint 字段错位、ANSI/`\r` 字节校验、`log_only`/`inferred_tree` 进度、共享锁 `EXDEV`、`restart` 故障、`main.ts` 刷新卸 IPC、Windows Python/Desktop 测试全绿及物理清理根目录脏文件 | `fix(core,desktop): ...` |
+| **Phase 5b** | [`05b-frontend-polish-and-wiring.md`](./05b-frontend-polish-and-wiring.md) | **收官复核精修（前端交互/双语/对比度/小屏微调，建议 Gemini）**：补离线 `forceLocal` 确认弹窗、导出取消态、清零 193 行残留中文与 `GpuMonitor` i18n、修深色 2.77:1 对比度与窄窗/macOS 标题栏重叠、优化 `960×650` 头部紧凑度与 `DESIGN.md` 对齐 | `fix(ui): ...` |
 
 ---
 
