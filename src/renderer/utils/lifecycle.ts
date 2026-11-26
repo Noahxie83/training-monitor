@@ -16,6 +16,8 @@ export function getLifecycleBadge(lifecycle: Lifecycle): {
       return { text: '已完成', symbol: '✓', className: 'lifecycle-completed' };
     case 'failed':
       return { text: '失败', symbol: '✕', className: 'lifecycle-failed' };
+    case 'stopped_unconfirmed':
+      return { text: '已停止', symbol: '■', className: 'lifecycle-stopped' };
     case 'unconfirmed':
       return { text: '待确认', symbol: '?', className: 'lifecycle-unconfirmed' };
     case 'not_observed':

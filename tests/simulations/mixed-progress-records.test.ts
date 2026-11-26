@@ -37,7 +37,10 @@ describe('mixed progress and diagnostic lines', () => {
       fixture.append('RESULT job=a completed=1/20\n');
       await fixture.api.requestRefresh({});
       const snapshot = (await fixture.api.getSnapshot()).tasks[0]!;
-      expect(snapshot.lifecycle).not.toBe('running');
+      // Phase 2 decouples verified live process liveness from parsed progress lines,
+      // while ensuring diagnostic lines alone never fabricate training progress.
+      expect(snapshot.lifecycle).toBe('running');
+      expect(snapshot.attributionConfidence).toBe('confirmed_process');
       expect(snapshot.progress.session.completedCount).toBeNull();
     } finally { await fixture.close(); }
   });

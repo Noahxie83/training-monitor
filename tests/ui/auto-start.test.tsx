@@ -58,10 +58,10 @@ describe('remote GPU waiting interface', () => {
     const { save } = setup({ config: baseConfig }); const dialog = await editor(); fireEvent.change(within(dialog).getByLabelText('日志路径'), { target: { value: '/data2/cy/xzn/Code/Flow_Matching/new.log' } });
     fireEvent.click(within(dialog).getByRole('button', { name: '保存更改' })); await waitFor(() => expect(save).toHaveBeenCalledTimes(1)); expect(save.mock.calls[0]![0].tasks[0]!.autoStart!.armId).not.toBe(baseConfig.armId);
   });
-  it('explicitly converts an old desktop rule without silently reusing its arm', async () => {
+  it('explicitly converts an old desktop rule without silently reusing its arm while preserving GPU whitelist', async () => {
     const old = { ...baseConfig, execution: undefined, gpuDeviceIds: ['GPU 0', 'GPU 1'] }; const { save } = setup({ config: old }); const dialog = await editor();
     fireEvent.click(within(dialog).getByRole('button', { name: '保存更改' })); await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
-    const saved = save.mock.calls[0]![0].tasks[0]!.autoStart!; expect(saved.execution).toBe('server_tmux'); expect(saved.gpuDeviceIds).toEqual([]); expect(saved.armId).not.toBe(old.armId);
+    const saved = save.mock.calls[0]![0].tasks[0]!.autoStart!; expect(saved.execution).toBe('server_tmux'); expect(saved.gpuDeviceIds).toEqual(['GPU 0', 'GPU 1']); expect(saved.armId).not.toBe(old.armId);
   });
   it('shows the server candidate and single-card interval', async () => {
     setup({ config: baseConfig, phase: 'countdown' }); const panel = await screen.findByRole('region', { name: 'GPU 空闲自动启动' });

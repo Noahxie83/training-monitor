@@ -415,7 +415,8 @@ describe('cache retention', () => {
     const expired = await openTestStore(directory, () => Date.parse(daySeven));
     const after = await expired.getLogs({ requestId: 'cr-after-expiry', sourceId: 'cr-source', before: null, limit: 10 });
     await expired.close();
-    expect(before.events.filter((event) => event.startOffset === '0' && event.text !== null).map((event) => event.kind).sort()).toEqual(['line', 'redraw']);
+    // Phase 2 unifies \r redraw and final \n under one logical line event (no duplicate redraw+line row)
+    expect(before.events.filter((event) => event.startOffset === '0' && event.text !== null).map((event) => event.kind).sort()).toEqual(['line']);
     expect(after.events.filter((event) => event.startOffset === '0' && event.text !== null)).toEqual([]);
   });
 });

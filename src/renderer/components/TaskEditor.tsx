@@ -35,7 +35,7 @@ export function TaskEditor({ registry, task, hostId, hostSnapshots, focusAutoSta
   const [fields, setFields] = useState<TaskFormInputs>(() => ({
     taskId: task?.taskId ?? '', hostId: task?.hostId ?? hostId ?? registry.hosts[0]?.hostId ?? '',
     label: task?.label ?? '', algorithm: task ? taskAlgorithmName(task) : '',
-    logFormat: task ? taskLogFormat(task) : 'generic',
+    logFormat: task ? (taskLogFormat(task).replace(/^legacy_/, '') as TaskFormInputs['logFormat']) : 'generic',
     allowedDirsStr: task?.allowedDirectories.join('; ') ?? '',
     entryPathsStr: task?.entryPaths.join('; ') ?? '',
     ckptDirsStr: task?.checkpointDirectories.join('; ') ?? '',
@@ -92,7 +92,7 @@ export function TaskEditor({ registry, task, hostId, hostSnapshots, focusAutoSta
     const resolvedDraft = resolveAutoStartDraft(draft, taskContext);
     if (!draft.enabled) {
       if (!prior) return { config: undefined, error: null };
-      const entryPath = taskContext.entryPaths.includes(prior.launch.entryPath) ? prior.launch.entryPath : taskContext.entryPaths[0];
+      const entryPath = prior.launch.entryPath && taskContext.entryPaths.includes(prior.launch.entryPath) ? prior.launch.entryPath : taskContext.entryPaths[0];
       const cwd = taskContext.allowedDirectories.some(dir => prior.launch.cwd === dir || prior.launch.cwd.startsWith(dir.replace(/\/$/, '') + '/'))
         ? prior.launch.cwd : taskContext.allowedDirectories[0];
       const logSourceId = taskContext.logSources.some(source => source.sourceId === prior.launch.logSourceId)
@@ -119,6 +119,9 @@ export function TaskEditor({ registry, task, hostId, hostSnapshots, focusAutoSta
       && sameAutoStartPayload(payload, {
         execution: prior.execution,
         gpuDeviceIds: prior.gpuDeviceIds,
+        gpuExcludeIds: prior.gpuExcludeIds,
+        requiredGpuCount: prior.requiredGpuCount,
+        cudaVisibleDevicesMode: prior.cudaVisibleDevicesMode,
         idleSeconds: prior.idleSeconds,
         maxUtilizationPercent: prior.maxUtilizationPercent,
         maxMemoryMiB: prior.maxMemoryMiB,
@@ -126,6 +129,8 @@ export function TaskEditor({ registry, task, hostId, hostSnapshots, focusAutoSta
         minFreeDiskMiB: prior.minFreeDiskMiB,
         gpuSharing: prior.gpuSharing,
         retryOnExit: prior.retryOnExit,
+        maxRetries: prior.maxRetries,
+        retryBackoffSeconds: prior.retryBackoffSeconds,
         launch: prior.launch,
       });
     const candidate: AutoStartConfig = {

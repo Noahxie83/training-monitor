@@ -1,8 +1,26 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { DesktopApi, MonitorApi, MonitorUpdate } from '../shared/api';
+import type { DesktopApi, MonitorApi } from '../shared/api';
 import type { Preferences, Registry } from '../shared/contracts';
 import { CHANNELS as c } from './channels';
-import { validateDiscoveredSshHosts, validateDiscoveredWslDistros, validateLogPage, validateLogQuery, validateLogSearchPage, validateLogSearchRequest, validateMonitorSnapshot, validateMonitorUpdate, validatePreferences, validateRefreshScope, validateRegistry } from '../shared/validate';
+import {
+  validateControlTaskRequest,
+  validateDiscoveredProcesses,
+  validateDiscoveredSshHosts,
+  validateDiscoveredWslDistros,
+  validateExportLogsQuery,
+  validateGpuSeriesQuery,
+  validateLogPage,
+  validateLogQuery,
+  validateLogSearchPage,
+  validateLogSearchRequest,
+  validateMetricSeriesQuery,
+  validateMonitorSnapshot,
+  validateMonitorUpdate,
+  validatePreferences,
+  validateRefreshScope,
+  validateRegistry,
+  validateWebhookChannelConfig,
+} from '../shared/validate';
 
 const sessionId = crypto.randomUUID();
 let sequence = 0;
@@ -22,10 +40,23 @@ const api: MonitorApi = {
   async searchLogs(query) { return validateLogSearchPage(await ipcRenderer.invoke(c.search, validateLogSearchRequest(query))); },
   async cancelRequest(requestId) { if (typeof requestId !== 'string' || !requestId) throw new TypeError('INVALID_REQUEST_ID'); await ipcRenderer.invoke(c.cancel, requestId); },
   async getRegistry() { return validateRegistry(await ipcRenderer.invoke(c.getRegistry)); },
-  async saveRegistry(registry) { return validateRegistry(await ipcRenderer.invoke(c.saveRegistry, validateRegistry(registry))); },
+  async saveRegistry(registry, options) {
+    const validated = validateRegistry(registry);
+    const payload = options ? { registry: validated, options } : validated;
+    return validateRegistry(await ipcRenderer.invoke(c.saveRegistry, payload));
+  },
   async getPreferences() { return validatePreferences(await ipcRenderer.invoke(c.getPrefs)); },
   async savePreferences(value) { return validatePreferences(await ipcRenderer.invoke(c.savePrefs, validatePreferences(value))); },
   async copyRegisteredPath(value) { if (!value || typeof value !== 'object' || Object.keys(value).some((k) => !['taskId', 'sourceId'].includes(k)) || typeof value.taskId !== 'string' || (value.sourceId !== undefined && typeof value.sourceId !== 'string')) throw new TypeError('INVALID_COPY_REQUEST'); await ipcRenderer.invoke(c.copy, value); },
+  async getMetricSeries(query) { return ipcRenderer.invoke(c.metricSeries, validateMetricSeriesQuery(query)); },
+  async getGpuSeries(query) { return ipcRenderer.invoke(c.gpuSeries, validateGpuSeriesQuery(query)); },
+  async exportLogs(query) { return ipcRenderer.invoke(c.exportLogs, validateExportLogsQuery(query)); },
+  async discoverProcesses(hostId) {
+    if (typeof hostId !== 'string' || !hostId || hostId.length > 256) throw new TypeError('INVALID_HOST_ID');
+    return validateDiscoveredProcesses(await ipcRenderer.invoke(c.discoverProcesses, hostId));
+  },
+  async controlTask(request) { return ipcRenderer.invoke(c.controlTask, validateControlTaskRequest(request)); },
+  async testWebhook(webhook) { return ipcRenderer.invoke(c.testWebhook, validateWebhookChannelConfig(webhook, 'INVALID_WEBHOOK')); },
 };
 contextBridge.exposeInMainWorld('monitor', Object.freeze(api));
 
@@ -66,5 +97,14 @@ const desktop: DesktopApi = {
   },
   async discoverSshHosts() { return validateDiscoveredSshHosts(await ipcRenderer.invoke(c.discoverSsh)); },
   async discoverWslDistros() { return validateDiscoveredWslDistros(await ipcRenderer.invoke(c.discoverWsl)); },
+  async openSshTerminal(request) { return ipcRenderer.invoke(c.openSshTerminal, request); },
+  async copyCommand(request) { return ipcRenderer.invoke(c.copyCommand, request); },
+  onFocusTask(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, taskId: unknown) => {
+      if (typeof taskId === 'string' && taskId) listener(taskId);
+    };
+    ipcRenderer.on(c.focusTask, handler);
+    return () => { ipcRenderer.removeListener(c.focusTask, handler); };
+  },
 };
 contextBridge.exposeInMainWorld('desktop', Object.freeze(desktop));

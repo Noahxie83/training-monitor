@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Fail-closed launcher for a single registered Python training task."""
+"""Fail-closed launcher and opt-in job controller for registered ML training tasks."""
 import base64
 import csv
 import datetime
@@ -12,6 +12,7 @@ import posixpath
 import re
 import shlex
 import shutil
+import signal as _signal
 import stat
 import subprocess
 import sys
@@ -32,6 +33,7 @@ MAX_ARGUMENTS_CHARS = 8192
 MAX_ARGUMENTS = 256
 MAX_ITEMS = 256
 MAX_STRING_BYTES = 8192
+MAX_ENV_VARS = 64
 STATE_DIRECTORY = ".training-monitor-autostart"
 REQUEST_B64 = "__MONITOR_REQUEST_B64__"
 PROBE_SOURCE_B64 = "__READONLY_PROBE_SOURCE_B64__"
@@ -39,8 +41,11 @@ PROBE_SOURCE_B64 = "__READONLY_PROBE_SOURCE_B64__"
 _PROBE = None
 _HEX64 = re.compile(r"[a-fA-F0-9]{64}\Z")
 _PYTHON_BASENAME = re.compile(r"python(?:3(?:\.\d+)?)?\Z")
+_MODULE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*\Z")
+_ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
 _MISSING_GPU_VALUE_RE = re.compile(r"^(?:\[?\s*(?:N/A|NA|Not Supported|Unknown)\s*\]?|-)$", re.IGNORECASE)
 _GPU_OR_MIG_UUID_RE = re.compile(r"(?:GPU|MIG)-[A-Za-z0-9._:/-]+\Z")
+_DEVICE_ID_RE = re.compile(r"GPU (0|[1-9][0-9]{0,3})\Z")
 
 
 class _LaunchError(Exception):
@@ -117,6 +122,48 @@ def _require_fcntl():
     return _fcntl
 
 
+def _ensure_private_dir(target_path, *, create=True):
+    """Ensure a 0700 non-symlink directory owned by current UID."""
+    uid = _current_uid()
+    try:
+        before = os.lstat(target_path)
+    except FileNotFoundError:
+        if not create:
+            return None
+        try:
+            os.makedirs(target_path, mode=0o700, exist_ok=True)
+            os.chmod(target_path, 0o700)
+        except OSError as exc:
+            raise _LaunchError("STATE_DIRECTORY_INVALID") from exc
+        before = os.lstat(target_path)
+    except OSError as exc:
+        raise _LaunchError("STATE_DIRECTORY_INVALID") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise _LaunchError("STATE_DIRECTORY_INVALID")
+    if before.st_uid != uid or (os.name != "nt" and stat.S_IMODE(before.st_mode) != 0o700):
+        raise _LaunchError("STATE_DIRECTORY_INVALID")
+    after = os.lstat(target_path)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise _LaunchError("STATE_DIRECTORY_INVALID")
+    return target_path
+
+
+def _runtime_lock_dir(uid=None):
+    """Return a short local-tmpfs directory for Unix sockets and flock locks (never NFS)."""
+    resolved_uid = _current_uid() if uid is None else uid
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    candidates = []
+    if xdg_runtime and os.path.isabs(xdg_runtime) and len(xdg_runtime) < 70:
+        candidates.append(os.path.join(xdg_runtime, "training-monitor"))
+    candidates.append(f"/tmp/training-monitor-{resolved_uid}")
+    for candidate in candidates:
+        try:
+            return _ensure_private_dir(candidate, create=True)
+        except _LaunchError:
+            continue
+    raise _LaunchError("RUNTIME_DIRECTORY_INVALID")
+
+
 def _string(value, *, allow_empty=False, max_length=MAX_STRING_BYTES):
     if not isinstance(value, str) or "\0" in value:
         raise _LaunchError("INVALID_REQUEST")
@@ -138,6 +185,21 @@ def _number(value, *, low, high):
     if not math.isfinite(numeric) or numeric < low or (high is not None and numeric > high):
         raise _LaunchError("INVALID_REQUEST")
     return numeric
+
+
+def _validate_env(value):
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > MAX_ENV_VARS:
+        raise _LaunchError("INVALID_REQUEST")
+    cleaned = {}
+    for k, v in value.items():
+        if not isinstance(k, str) or not _ENV_KEY_RE.fullmatch(k):
+            raise _LaunchError("INVALID_REQUEST")
+        if k == "CUDA_VISIBLE_DEVICES":
+            continue
+        cleaned[k] = _string(v, allow_empty=True, max_length=4096)
+    return cleaned
 
 
 def _validate_request(request):
@@ -174,7 +236,7 @@ def _validate_request(request):
             raise _LaunchError("INVALID_REQUEST")
         source_id = _string(source.get("sourceId"), max_length=512)
         path = _string(source.get("path"))
-        kind = _string(source.get("kind"), max_length=64)
+        _string(source.get("kind"), max_length=64)
         if source_id in source_ids or not os.path.isabs(path):
             raise _LaunchError("INVALID_REQUEST")
         source_ids.add(source_id)
@@ -182,14 +244,39 @@ def _validate_request(request):
     launch = request.get("launch")
     if not isinstance(launch, dict):
         raise _LaunchError("INVALID_REQUEST")
-    python_path = _string(launch.get("pythonPath"))
-    if not posixpath.isabs(python_path) or not _PYTHON_BASENAME.fullmatch(posixpath.basename(python_path)):
+
+    mode = launch.get("mode") or "python_script"
+    if mode not in ("python_script", "python_module", "command"):
         raise _LaunchError("INVALID_REQUEST")
-    entry_path = _string(launch.get("entryPath"))
-    if entry_path not in entry_paths:
-        raise _LaunchError("INVALID_REQUEST")
+
+    python_path = None
+    entry_path = None
+    module_name = None
+    command_argv = None
+
+    if mode == "python_script":
+        python_path = _string(launch.get("pythonPath"))
+        if not posixpath.isabs(python_path) or not _PYTHON_BASENAME.fullmatch(posixpath.basename(python_path)):
+            raise _LaunchError("INVALID_REQUEST")
+        entry_path = _string(launch.get("entryPath"))
+        if entry_path not in entry_paths:
+            raise _LaunchError("INVALID_REQUEST")
+    elif mode == "python_module":
+        python_path = _string(launch.get("pythonPath"))
+        if not posixpath.isabs(python_path) or not _PYTHON_BASENAME.fullmatch(posixpath.basename(python_path)):
+            raise _LaunchError("INVALID_REQUEST")
+        module_name = _string(launch.get("moduleName"), max_length=256)
+        if not _MODULE_NAME_RE.fullmatch(module_name):
+            raise _LaunchError("INVALID_REQUEST")
+    else:  # mode == "command"
+        command_argv = _string_list(launch.get("command"), nonempty=True)
+        if len(command_argv) > MAX_ARGUMENTS:
+            raise _LaunchError("INVALID_ARGUMENTS")
+        if ".." in command_argv[0].split("/"):
+            raise _LaunchError("INVALID_REQUEST")
+
     cwd = _string(launch.get("cwd"))
-    arguments = _string(launch.get("arguments"), allow_empty=True, max_length=MAX_ARGUMENTS_CHARS)
+    arguments = _string(launch.get("arguments", ""), allow_empty=True, max_length=MAX_ARGUMENTS_CHARS)
     log_source_id = _string(launch.get("logSourceId"), max_length=512)
     if not os.path.isabs(cwd):
         raise _LaunchError("INVALID_REQUEST")
@@ -203,15 +290,31 @@ def _validate_request(request):
     if len(matching_logs) != 1:
         raise _LaunchError("INVALID_REQUEST")
 
+    venv_path = launch.get("venvPath")
+    if venv_path is not None:
+        venv_path = _string(venv_path)
+        if not os.path.isabs(venv_path) or ".." in venv_path.split("/"):
+            raise _LaunchError("INVALID_REQUEST")
+    conda_env = launch.get("condaEnv")
+    if conda_env is not None:
+        conda_env = _string(conda_env, max_length=512)
+        if ".." in conda_env.split("/"):
+            raise _LaunchError("INVALID_REQUEST")
+    modules = launch.get("modules")
+    if modules is not None:
+        modules = _string_list(modules, nonempty=False)
+    user_env = _validate_env(launch.get("env"))
+
     gpu_devices = request.get("gpuDevices")
     if not isinstance(gpu_devices, list) or not gpu_devices or len(gpu_devices) > 64:
         raise _LaunchError("INVALID_REQUEST")
     uuids = []
+    gpu_indices = []
     seen_uuids = set()
     for device in gpu_devices:
         if not isinstance(device, dict):
             raise _LaunchError("INVALID_REQUEST")
-        _string(device.get("deviceId"), max_length=256)
+        dev_id = _string(device.get("deviceId"), max_length=256)
         gpu_uuid = _string(device.get("uuid"), max_length=256)
         if (not _GPU_OR_MIG_UUID_RE.fullmatch(gpu_uuid)
                 or ".." in gpu_uuid
@@ -219,6 +322,12 @@ def _validate_request(request):
             raise _LaunchError("INVALID_REQUEST")
         seen_uuids.add(gpu_uuid)
         uuids.append(gpu_uuid)
+        m = _DEVICE_ID_RE.fullmatch(dev_id)
+        gpu_indices.append(m.group(1) if m else gpu_uuid)
+
+    cuda_mode = request.get("cudaVisibleDevicesMode") or "index"
+    if cuda_mode not in ("index", "uuid"):
+        raise _LaunchError("INVALID_REQUEST")
 
     max_utilization = _number(request.get("maxUtilizationPercent"), low=0.0, high=100.0)
     max_memory_mib = _number(request.get("maxMemoryMiB"), low=0.0, high=None)
@@ -228,12 +337,45 @@ def _validate_request(request):
         _number(request["minFreeDiskMiB"], low=0, high=1073741824)
     sharing = request.get("gpuSharing")
     if sharing is not None:
-        if (not isinstance(sharing, dict) or set(sharing) != {"groupId", "maxDevices", "maxWorkersPerDevice"}
+        allowed_sharing_keys = {"groupId", "maxDevices", "maxWorkersPerDevice", "readyAfterSeconds"}
+        if (not isinstance(sharing, dict)
+                or not {"groupId", "maxDevices", "maxWorkersPerDevice"}.issubset(set(sharing))
+                or not set(sharing).issubset(allowed_sharing_keys)
                 or not isinstance(sharing["groupId"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sharing["groupId"])
                 or type(sharing["maxDevices"]) is not int or not 1 <= sharing["maxDevices"] <= 64
                 or type(sharing["maxWorkersPerDevice"]) is not int or not 1 <= sharing["maxWorkersPerDevice"] <= 16
                 or not request.get("minFreeMemoryMiB") or len(uuids) != 1):
             raise _LaunchError("INVALID_REQUEST")
+
+    state_dir = request.get("stateDir")
+    if state_dir is not None:
+        state_dir = _string(state_dir)
+        if not os.path.isabs(state_dir) or ".." in state_dir.split("/"):
+            raise _LaunchError("INVALID_REQUEST")
+
+    normalized_launch = dict(launch)
+    normalized_launch.update({
+        "mode": mode,
+        "cwd": cwd,
+        "arguments": arguments,
+        "logSourceId": log_source_id,
+        "env": user_env,
+    })
+    if python_path is not None:
+        normalized_launch["pythonPath"] = python_path
+    if entry_path is not None:
+        normalized_launch["entryPath"] = entry_path
+    if module_name is not None:
+        normalized_launch["moduleName"] = module_name
+    if command_argv is not None:
+        normalized_launch["command"] = command_argv
+    if venv_path is not None:
+        normalized_launch["venvPath"] = venv_path
+    if conda_env is not None:
+        normalized_launch["condaEnv"] = conda_env
+    if modules is not None:
+        normalized_launch["modules"] = modules
+
     normalized = dict(request)
     normalized.update({
         "armId": arm_id,
@@ -243,15 +385,18 @@ def _validate_request(request):
         "taskAllowedDirectories": task_directories,
         "entryPaths": entry_paths,
         "sources": sources,
-        "launch": dict(launch, pythonPath=python_path, entryPath=entry_path, cwd=cwd,
-                       arguments=arguments, logSourceId=log_source_id),
+        "launch": normalized_launch,
         "gpuDevices": gpu_devices,
+        "cudaVisibleDevicesMode": cuda_mode,
         "maxUtilizationPercent": max_utilization,
         "maxMemoryMiB": max_memory_mib,
         "_arguments": arguments_parsed,
         "_logPath": matching_logs[0]["path"],
         "_gpuUuids": uuids,
+        "_gpuIndices": gpu_indices,
     })
+    if state_dir is not None:
+        normalized["stateDir"] = state_dir
     return normalized
 
 
@@ -283,56 +428,68 @@ def _canonical_scope(request, probe):
     if not stat.S_ISDIR(cwd_info.st_mode) or not probe._path_in_scope(cwd, hosts, tasks):
         raise _LaunchError("CWD_PATH_INVALID")
 
-    canonical_entries = []
-    raw_entry = request["launch"]["entryPath"]
-    for entry in request["entryPaths"]:
-        candidate = entry if os.path.isabs(entry) else os.path.join(tasks[0], entry)
-        resolved = os.path.realpath(candidate)
-        if not probe._path_in_scope(resolved, hosts, tasks):
-            raise _LaunchError("ENTRY_PATH_INVALID")
-        canonical_entries.append(resolved)
-    raw_candidate = raw_entry if os.path.isabs(raw_entry) else os.path.join(tasks[0], raw_entry)
-    script = os.path.realpath(raw_candidate)
-    if script not in canonical_entries:
-        raise _LaunchError("ENTRY_PATH_NOT_REGISTERED")
-    opened = probe.open_readonly(script, hosts, tasks, limit_bytes=0)
-    if opened.get("status") != "ok":
-        raise _LaunchError("SCRIPT_PATH_INVALID")
+    mode = request["launch"].get("mode") or "python_script"
+    script = None
+    if mode == "python_script":
+        canonical_entries = []
+        raw_entry = request["launch"]["entryPath"]
+        for entry in request["entryPaths"]:
+            if entry.startswith("module:") or entry.startswith("-m "):
+                continue
+            candidate = entry if os.path.isabs(entry) else os.path.join(tasks[0], entry)
+            resolved = os.path.realpath(candidate)
+            if not probe._path_in_scope(resolved, hosts, tasks):
+                raise _LaunchError("ENTRY_PATH_INVALID")
+            canonical_entries.append(resolved)
+        raw_candidate = raw_entry if os.path.isabs(raw_entry) else os.path.join(tasks[0], raw_entry)
+        script = os.path.realpath(raw_candidate)
+        if script not in canonical_entries:
+            raise _LaunchError("ENTRY_PATH_NOT_REGISTERED")
+        opened = probe.open_readonly(script, hosts, tasks, limit_bytes=0)
+        if opened.get("status") != "ok":
+            raise _LaunchError("SCRIPT_PATH_INVALID")
 
     log_path = request["_logPath"]
     log_parent = os.path.realpath(os.path.dirname(log_path))
     if not probe._path_in_scope(log_parent, hosts, tasks):
         raise _LaunchError("LOG_PATH_INVALID")
-    for path in (cwd, script, log_parent):
+    check_paths = [cwd, log_parent] + ([script] if script is not None else [])
+    for path in check_paths:
         if not probe._path_in_scope(os.path.realpath(path), hosts, tasks):
             raise _LaunchError("PATH_OUTSIDE_ALLOWED_ROOT")
     return hosts, tasks, cwd, script, log_path
 
 
-def _state_directory(host_root):
-    state_path = os.path.join(host_root, STATE_DIRECTORY)
-    try:
-        before = os.lstat(state_path)
-    except FileNotFoundError:
+def _default_persistent_state_dir():
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    if xdg_state and os.path.isabs(xdg_state):
+        return os.path.join(xdg_state, "training-monitor")
+    home = os.path.expanduser("~")
+    if home and home != "~" and os.path.isabs(home):
+        return os.path.join(home, ".local", "state", "training-monitor")
+    return None
+
+
+def _state_directory(host_root, state_dir=None):
+    """Resolve private 0700 persistent wait state directory."""
+    if state_dir:
+        return _ensure_private_dir(state_dir, create=True)
+    legacy_path = os.path.join(host_root, STATE_DIRECTORY)
+    if os.path.exists(legacy_path):
+        resolved_dir = _ensure_private_dir(legacy_path, create=False)
+        if os.path.dirname(os.path.realpath(resolved_dir)) != os.path.realpath(host_root):
+            raise _LaunchError("STATE_DIRECTORY_INVALID")
+        return resolved_dir
+    preferred = _default_persistent_state_dir()
+    if preferred:
         try:
-            os.mkdir(state_path, 0o700)
-            os.chmod(state_path, 0o700)
-        except OSError as exc:
-            raise _LaunchError("STATE_DIRECTORY_INVALID") from exc
-        before = os.lstat(state_path)
-    except OSError as exc:
-        raise _LaunchError("STATE_DIRECTORY_INVALID") from exc
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            return _ensure_private_dir(preferred, create=True)
+        except _LaunchError:
+            pass
+    resolved_dir = _ensure_private_dir(legacy_path, create=True)
+    if os.path.dirname(os.path.realpath(resolved_dir)) != os.path.realpath(host_root):
         raise _LaunchError("STATE_DIRECTORY_INVALID")
-    if before.st_uid != _current_uid() or stat.S_IMODE(before.st_mode) != 0o700:
-        raise _LaunchError("STATE_DIRECTORY_INVALID")
-    resolved = os.path.realpath(state_path)
-    if os.path.dirname(resolved) != os.path.realpath(host_root):
-        raise _LaunchError("STATE_DIRECTORY_INVALID")
-    after = os.lstat(state_path)
-    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-        raise _LaunchError("STATE_DIRECTORY_INVALID")
-    return state_path
+    return resolved_dir
 
 
 def _attempt_key(task_id, arm_id):
@@ -344,6 +501,11 @@ def _attempt_paths(state_directory, task_id, arm_id):
     key = _attempt_key(task_id, arm_id)
     return (os.path.join(state_directory, ".claim-" + key),
             os.path.join(state_directory, ".receipt-" + key))
+
+
+def _exit_receipt_path(state_directory, task_id, arm_id):
+    key = _attempt_key(task_id, arm_id)
+    return os.path.join(state_directory, ".exit-" + key + ".json")
 
 
 def _open_state_readonly(path):
@@ -470,6 +632,43 @@ def _fsync_directory(path):
         os.close(fd)
 
 
+def _atomic_write_json(target_path, directory, payload_obj):
+    body = json.dumps(payload_obj, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    key = os.path.basename(target_path)
+    temporary = os.path.join(directory, key + ".tmp-" + str(os.getpid()) + "-" + str(time.time_ns()))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = None
+    try:
+        fd = os.open(temporary, flags, 0o600)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != _current_uid():
+            raise OSError("atomic write identity")
+        _write_all(fd, body)
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(temporary, target_path)
+        try:
+            _fsync_directory(directory)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
 def _create_claim(claim_path, state_directory, config_hash):
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
@@ -505,43 +704,11 @@ def _write_receipt(receipt_path, state_directory, config_hash, result):
     safe_result = _sanitize_result(result, receipt=True)
     if safe_result is None:
         return False
-    body = json.dumps({
+    return _atomic_write_json(receipt_path, state_directory, {
         "version": VERSION,
         "configHash": config_hash,
         "result": safe_result,
-    }, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-    key = os.path.basename(receipt_path)
-    temporary = os.path.join(state_directory, key + ".tmp-" + str(os.getpid()) + "-" + str(time.time_ns()))
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = None
-    try:
-        fd = os.open(temporary, flags, 0o600)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != _current_uid():
-            raise OSError("receipt identity")
-        _write_all(fd, body)
-        os.fsync(fd)
-        os.close(fd)
-        fd = None
-        os.replace(temporary, receipt_path)
-        _fsync_directory(state_directory)
-        return True
-    except OSError:
-        return False
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+    })
 
 
 def _lock_filename(gpu_uuid):
@@ -549,12 +716,12 @@ def _lock_filename(gpu_uuid):
     return ".gpu-" + digest + ".lock"
 
 
-def _acquire_gpu_locks(state_directory, gpu_uuids, *, shared=False):
+def _acquire_gpu_locks(lock_directory, gpu_uuids, *, shared=False):
     lock_module = _require_fcntl()
     handles = []
     try:
         for gpu_uuid in sorted(gpu_uuids, key=lambda item: hashlib.sha256(item.encode("utf-8")).hexdigest()):
-            path = os.path.join(state_directory, _lock_filename(gpu_uuid))
+            path = os.path.join(lock_directory, _lock_filename(gpu_uuid))
             flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
@@ -584,8 +751,36 @@ def _acquire_gpu_locks(state_directory, gpu_uuids, *, shared=False):
         raise
 
 
+def _is_gpu_locked(lock_directory, gpu_uuid):
+    """Non-blocking probe to check whether an exclusive GPU lock is currently held."""
+    if _fcntl is None or not os.path.isdir(lock_directory):
+        return False
+    path = os.path.join(lock_directory, _lock_filename(gpu_uuid))
+    if not os.path.exists(path):
+        return False
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = None
+    try:
+        fd = os.open(path, flags)
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            return False
+        except (BlockingIOError, PermissionError):
+            return True
+        except OSError as exc:
+            return exc.errno in {11, 13, 35}
+    except OSError:
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _close_gpu_locks(handles):
-    for fd, lock_module in reversed(handles or []):
+    for fd, _lock_module in reversed(handles or []):
         try:
             os.close(fd)
         except OSError:
@@ -605,30 +800,81 @@ def _sharing_lock(state_directory, name):
     return fd
 
 
+def _pid_is_alive(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _sharing_meta_path(slot_path):
+    return slot_path + ".meta"
+
+
+def _read_sharing_slot_data(slot_path, fd):
+    meta_path = _sharing_meta_path(slot_path)
+    slot_data = None
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 32768).decode("utf-8", errors="replace")
+        if raw.strip():
+            slot_data = json.loads(raw)
+    except (OSError, ValueError):
+        slot_data = None
+    if isinstance(slot_data, dict):
+        return slot_data
+    try:
+        with open(meta_path, "r", encoding="utf-8") as stream:
+            meta = json.load(stream)
+            if isinstance(meta, dict):
+                return meta
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
 def _sharing_occupancy(state_directory, sharing):
-    """Live inherited flocks are authoritative; stale files consume no slots."""
+    """Live flocks are authoritative; stale files consume no slots. Supports both status_json and grace-window readiness."""
     locks = _require_fcntl()
     prefix = _sharing_prefix(sharing) + "-"
+    grace_seconds = float(sharing.get("readyAfterSeconds", 15))
     occupied = {}
     for name in os.listdir(state_directory):
         if not name.startswith(prefix) or not name.endswith(".slot"):
             continue
+        slot_path = os.path.join(state_directory, name)
         fd = _sharing_lock(state_directory, name)
         try:
             try:
                 locks.flock(fd, locks.LOCK_EX | locks.LOCK_NB)
             except BlockingIOError:
-                try:
-                    data = json.loads(os.read(fd, 32768).decode())
-                except ValueError:
-                    data = {}
+                data = _read_sharing_slot_data(slot_path, fd)
                 ready = False
-                try:
-                    with open(data["statusPath"], encoding="utf-8") as stream:
-                        status_data = json.load(stream)
-                    ready = status_data.get("pid") == data.get("pid") and status_data.get("status") in {"running", "worker_finished", "completed"}
-                except (OSError, ValueError, KeyError):
-                    pass
+                status_path = data.get("statusPath")
+                if isinstance(status_path, str) and status_path:
+                    try:
+                        with open(status_path, encoding="utf-8") as stream:
+                            status_data = json.load(stream)
+                        ready = (
+                            status_data.get("pid") == data.get("pid")
+                            and status_data.get("status") in {"running", "completed"}
+                        )
+                    except (OSError, ValueError, KeyError):
+                        pass
+                else:
+                    # Without private status_json, consider the worker ready once it is alive
+                    # and has passed the memory-stabilization grace window.
+                    pid = data.get("pid")
+                    started_epoch = data.get("startedAtEpoch")
+                    if _pid_is_alive(pid) and isinstance(started_epoch, (int, float)):
+                        ready = (time.time() - float(started_epoch)) >= grace_seconds
                 gpu_hash = name[len(prefix):].rsplit("-", 1)[0]
                 occupied.setdefault(gpu_hash, []).append({"name": name, "ready": ready})
         finally:
@@ -660,17 +906,31 @@ def _acquire_shared_gpu_locks(state_directory, request):
         occupied = _sharing_occupancy(state_directory, sharing)
         gpu_hash = hashlib.sha256(gpu_uuid.encode()).hexdigest()
         used = {slot["name"] for slot in occupied.get(gpu_hash, [])}
+        status_path = next(
+            (s["path"] for s in request.get("sources", []) if isinstance(s, dict) and s.get("kind") == "status_json"),
+            None,
+        )
         for slot in range(sharing["maxWorkersPerDevice"]):
             name = _sharing_prefix(sharing) + "-" + gpu_hash + "-" + str(slot) + ".slot"
             if name in used:
                 continue
+            slot_path = os.path.join(state_directory, name)
             fd = _sharing_lock(state_directory, name)
             try:
                 locks.flock(fd, locks.LOCK_EX | locks.LOCK_NB)
-                data = {"gpuUuid": gpu_uuid, "pid": None, "statusPath": next(s["path"] for s in request["sources"] if s["kind"] == "status_json")}
+                data = {
+                    "gpuUuid": gpu_uuid,
+                    "pid": None,
+                    "statusPath": status_path,
+                    "startedAtEpoch": time.time(),
+                }
+                encoded = json.dumps(data, separators=(",", ":")).encode("utf-8")
+                os.lseek(fd, 0, os.SEEK_SET)
                 os.ftruncate(fd, 0)
-                os.write(fd, json.dumps(data).encode())
-                request["_sharingSlotPath"] = os.path.join(state_directory, name)
+                _write_all(fd, encoded)
+                os.fsync(fd)
+                _atomic_write_json(_sharing_meta_path(slot_path), state_directory, data)
+                request["_sharingSlotPath"] = slot_path
                 handles.append((fd, locks))
                 return handles
             except Exception:
@@ -752,13 +1012,16 @@ def _boot_id():
 
 def _scan_for_registered_process(probe, request, hosts, tasks):
     boot = _boot_id()
+    normalized_entries = []
+    for entry in request["entryPaths"]:
+        if entry.startswith("module:") or entry.startswith("-m "):
+            normalized_entries.append(entry)
+        else:
+            normalized_entries.append(os.path.realpath(entry if os.path.isabs(entry) else os.path.join(tasks[0], entry)))
     scan = probe.scan_registered_processes("/proc", boot, {
         "hostAllowedRoots": hosts,
         "allowedDirectories": tasks,
-        "entryPaths": [
-            os.path.realpath(entry if os.path.isabs(entry) else os.path.join(tasks[0], entry))
-            for entry in request["entryPaths"]
-        ],
+        "entryPaths": normalized_entries,
         "sources": [],
     })
     if not isinstance(scan, dict) or scan.get("scanComplete") is not True:
@@ -837,40 +1100,217 @@ def _process_key(probe, pid, boot):
     return {"hostBootId": boot, "pid": pid, "startTicks": start_ticks}
 
 
-def _spawn_process(request, script, cwd, log_fd, boot, gpu_lock_fds):
+def _build_launch_argv_and_env(request, script):
+    launch = request["launch"]
+    mode = launch.get("mode") or "python_script"
+    if mode == "python_script":
+        argv = [launch["pythonPath"], "-u", script, *request["_arguments"]]
+    elif mode == "python_module":
+        argv = [launch["pythonPath"], "-u", "-m", launch["moduleName"], *request["_arguments"]]
+    else:
+        argv = [*launch["command"], *request["_arguments"]]
+
     process_env = dict(os.environ)
-    # The training process outlives the waiter's tmux pane and must not inherit
-    # that pane as the default target for its own later tmux commands.
     process_env.pop("TMUX", None)
     process_env.pop("TMUX_PANE", None)
-    process_env["CUDA_VISIBLE_DEVICES"] = ",".join(request["_gpuUuids"])
-    log_stream = os.fdopen(log_fd, "ab", buffering=0, closefd=True)
+
+    # Environment activation without shell interpolation
+    extra_path_entries = []
+    venv_path = launch.get("venvPath")
+    if venv_path:
+        extra_path_entries.append(os.path.join(venv_path, "bin"))
+        process_env["VIRTUAL_ENV"] = venv_path
+    conda_env = launch.get("condaEnv")
+    if conda_env:
+        if os.path.isabs(conda_env):
+            extra_path_entries.append(os.path.join(conda_env, "bin"))
+            process_env["CONDA_PREFIX"] = conda_env
+        else:
+            process_env["CONDA_DEFAULT_ENV"] = conda_env
+            home = os.path.expanduser("~")
+            for base in (os.environ.get("CONDA_PREFIX"), os.path.join(home, "miniconda3"), os.path.join(home, "anaconda3"), os.path.join(home, "mambaforge"), "/opt/conda"):
+                if not base:
+                    continue
+                cand = os.path.join(base, "envs", conda_env, "bin")
+                if os.path.isdir(cand):
+                    extra_path_entries.append(cand)
+                    process_env["CONDA_PREFIX"] = os.path.dirname(cand)
+                    break
+    if extra_path_entries:
+        existing_path = process_env.get("PATH", "")
+        process_env["PATH"] = ":".join(extra_path_entries + ([existing_path] if existing_path else []))
+
+    if launch.get("modules"):
+        process_env["TM_REQUESTED_MODULES"] = ",".join(launch["modules"])
+
+    for k, v in (launch.get("env") or {}).items():
+        if k != "CUDA_VISIBLE_DEVICES":
+            process_env[k] = v
+
+    cuda_mode = request.get("cudaVisibleDevicesMode") or "index"
+    if cuda_mode == "uuid":
+        process_env["CUDA_VISIBLE_DEVICES"] = ",".join(request["_gpuUuids"])
+    else:
+        process_env["CUDA_VISIBLE_DEVICES"] = ",".join(request["_gpuIndices"])
+
+    return argv, process_env
+
+
+def _write_supervisor_script(state_directory):
+    """Write a minimal detached supervisor script that owns GPU locks and records real exit codes."""
+    code = (
+        "import datetime, json, os, subprocess, sys, time\n"
+        "def main():\n"
+        "    meta_path = sys.argv[1]\n"
+        "    with open(meta_path, 'r', encoding='utf-8') as s:\n"
+        "        meta = json.load(s)\n"
+        "    try:\n"
+        "        os.unlink(meta_path)\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    log_fd = int(meta['logFd'])\n"
+        "    ready_fd = int(meta['readyFd'])\n"
+        "    exit_path = meta['exitPath']\n"
+        "    log_stream = os.fdopen(log_fd, 'ab', buffering=0, closefd=True)\n"
+        "    try:\n"
+        "        child = subprocess.Popen(\n"
+        "            meta['argv'], shell=False, cwd=meta['cwd'],\n"
+        "            stdin=subprocess.DEVNULL, stdout=log_stream, stderr=subprocess.STDOUT,\n"
+        "            start_new_session=True, close_fds=True, env=meta['env'],\n"
+        "        )\n"
+        "    except Exception as exc:\n"
+        "        try:\n"
+        "            os.write(ready_fd, json.dumps({'ok': False, 'error': str(exc)}).encode('utf-8'))\n"
+        "        finally:\n"
+        "            os.close(ready_fd)\n"
+        "            log_stream.close()\n"
+        "        return 1\n"
+        "    log_stream.close()\n"
+        "    try:\n"
+        "        os.write(ready_fd, json.dumps({'ok': True, 'pid': child.pid}).encode('utf-8'))\n"
+        "    finally:\n"
+        "        os.close(ready_fd)\n"
+        "    rc = child.wait()\n"
+        "    tmp = exit_path + '.tmp-' + str(os.getpid())\n"
+        "    body = json.dumps({'version': 1, 'pid': child.pid, 'exitCode': rc, 'exitedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')}).encode('ascii')\n"
+        "    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
+        "    try:\n"
+        "        os.write(fd, body)\n"
+        "        os.fsync(fd)\n"
+        "    finally:\n"
+        "        os.close(fd)\n"
+        "    os.replace(tmp, exit_path)\n"
+        "    return 0\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n"
+    ).encode("utf-8")
+    digest = hashlib.sha256(code).hexdigest()[:16]
+    script_path = os.path.join(state_directory, ".tm-supervisor-" + digest + ".py")
+    if not os.path.exists(script_path):
+        tmp = script_path + ".tmp-" + str(os.getpid()) + "-" + str(time.time_ns())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            _write_all(fd, code)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, script_path)
+    return script_path
+
+
+def _update_sharing_slot_pid(slot_path, state_directory, pid):
     try:
-        child = subprocess.Popen(
-            [request["launch"]["pythonPath"], "-u", script, *request["_arguments"]],
-            shell=False,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_stream,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-            pass_fds=tuple(gpu_lock_fds),
-            env=process_env,
-        )
-    finally:
-        log_stream.close()
-    pid = child.pid
+        with open(slot_path, "r+", encoding="utf-8") as stream:
+            data = json.load(stream)
+            data["pid"] = pid
+            data["startedAtEpoch"] = time.time()
+            stream.seek(0)
+            json.dump(data, stream, separators=(",", ":"))
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+        _atomic_write_json(_sharing_meta_path(slot_path), state_directory, data)
+    except OSError:
+        pass
+
+
+def _spawn_process(request, script, cwd, log_fd, boot, gpu_lock_fds, state_directory=None):
+    argv, process_env = _build_launch_argv_and_env(request, script)
+
+    if request.get("useSupervisor") and state_directory:
+        # Thin supervisor wrapper owns the GPU lock FDs and records real exit code without
+        # leaking flock FDs into the user's training process or its descendants.
+        sup_script = _write_supervisor_script(state_directory)
+        exit_path = _exit_receipt_path(state_directory, request["taskId"], request["armId"])
+        ready_r, ready_w = os.pipe()
+        meta_path = os.path.join(state_directory, f".sup-meta-{os.getpid()}-{time.time_ns()}.json")
+        _atomic_write_json(meta_path, state_directory, {
+            "argv": argv,
+            "cwd": cwd,
+            "env": process_env,
+            "logFd": log_fd,
+            "readyFd": ready_w,
+            "exitPath": exit_path,
+        })
+        pass_fds = tuple(list(gpu_lock_fds) + [log_fd, ready_w])
+        try:
+            subprocess.Popen(
+                [sys.executable or "/usr/bin/python3", "-I", "-S", "-B", sup_script, meta_path],
+                shell=False,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+                pass_fds=pass_fds,
+            )
+        except Exception:
+            os.close(ready_r)
+            os.close(ready_w)
+            os.close(log_fd)
+            try:
+                os.unlink(meta_path)
+            except OSError:
+                pass
+            raise
+        os.close(ready_w)
+        os.close(log_fd)
+        try:
+            raw = os.read(ready_r, 4096)
+        finally:
+            os.close(ready_r)
+        try:
+            reply = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise _LaunchError("PROCESS_SPAWN_FAILED") from exc
+        if not isinstance(reply, dict) or not reply.get("ok"):
+            raise _LaunchError("PROCESS_SPAWN_FAILED")
+        pid = reply.get("pid")
+    else:
+        log_stream = os.fdopen(log_fd, "ab", buffering=0, closefd=True)
+        try:
+            child = subprocess.Popen(
+                argv,
+                shell=False,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+                pass_fds=tuple(gpu_lock_fds),
+                env=process_env,
+            )
+        finally:
+            log_stream.close()
+        pid = child.pid
+
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         raise _LaunchError("PROCESS_SPAWN_FAILED")
     process_key = _process_key(_probe(), pid, boot)
-    if request.get("_sharingSlotPath"):
-        with open(request["_sharingSlotPath"], "r+", encoding="utf-8") as stream:
-            data = json.load(stream)
-            data["pid"] = pid
-            stream.seek(0)
-            json.dump(data, stream)
-            stream.truncate()
+    if request.get("_sharingSlotPath") and state_directory:
+        _update_sharing_slot_pid(request["_sharingSlotPath"], state_directory, pid)
     return _payload("started", pid=pid, process_key=process_key, started_at=_started_at())
 
 
@@ -884,7 +1324,12 @@ def launch_task(request):
             normalized["hostAllowedRoots"], normalized["taskAllowedDirectories"])
         if canonical_hosts is None or canonical_tasks is None:
             raise _LaunchError("PATH_OUTSIDE_ALLOWED_ROOT")
-        state_directory = _state_directory(canonical_hosts[0])
+        state_directory = (
+            _state_directory(canonical_hosts[0], normalized["stateDir"])
+            if normalized.get("stateDir")
+            else _state_directory(canonical_hosts[0])
+        )
+        lock_directory = _runtime_lock_dir() if normalized.get("useLocalLocks") else state_directory
 
         existing = _inspect_existing_attempt(
             state_directory, normalized["taskId"], normalized["armId"], normalized["configHash"])
@@ -896,8 +1341,8 @@ def launch_task(request):
             return _busy()
 
         try:
-            locks = (_acquire_shared_gpu_locks(state_directory, normalized) if normalized.get("gpuSharing")
-                     else _acquire_gpu_locks(state_directory, normalized["_gpuUuids"]))
+            locks = (_acquire_shared_gpu_locks(lock_directory, normalized) if normalized.get("gpuSharing")
+                     else _acquire_gpu_locks(lock_directory, normalized["_gpuUuids"]))
         except _GpuLockBusy:
             return _busy()
         boot = None
@@ -928,7 +1373,8 @@ def launch_task(request):
             try:
                 result = _spawn_process(
                     normalized, script, cwd, log_fd, boot,
-                    [fd for fd, _lock_module in locks])
+                    [fd for fd, _lock_module in locks],
+                    state_directory=state_directory)
                 log_fd = None
             except _LaunchError:
                 raise
@@ -962,6 +1408,70 @@ def launch_task(request):
         return _failed("LAUNCH_INTERNAL_ERROR")
 
 
+def signal_task(request):
+    """Opt-in remote job control (stop/kill): strictly verifies bootId, pid, startTicks, and UID before signaling."""
+    if not isinstance(request, dict) or request.get("op") != "signal_task":
+        return {"ok": False, "action": "stop", "pidsSignaled": [], "errorCode": "INVALID_REQUEST"}
+    action = request.get("action")
+    if action not in ("stop", "kill"):
+        return {"ok": False, "action": "stop", "pidsSignaled": [], "errorCode": "INVALID_ACTION"}
+    keys = request.get("processKeys")
+    if not isinstance(keys, list) or not keys or len(keys) > 64:
+        return {"ok": False, "action": action, "pidsSignaled": [], "errorCode": "INVALID_PROCESS_KEYS"}
+    try:
+        boot = _boot_id()
+        uid = _current_uid()
+    except _LaunchError as exc:
+        return {"ok": False, "action": action, "pidsSignaled": [], "errorCode": exc.error_code}
+
+    sig = _signal.SIGKILL if action == "kill" else _signal.SIGTERM
+    own_pid = os.getpid()
+    own_pgid = os.getpgrp() if hasattr(os, "getpgrp") else None
+    signaled = []
+    signaled_pgids = set()
+
+    for key in keys:
+        if not isinstance(key, dict):
+            continue
+        pid = key.get("pid")
+        host_boot = key.get("hostBootId")
+        start_ticks = key.get("startTicks")
+        if (host_boot != boot
+                or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1 or pid == own_pid
+                or not isinstance(start_ticks, str) or not start_ticks.isdecimal()):
+            continue
+        proc_dir = f"/proc/{pid}"
+        try:
+            proc_stat_info = os.stat(proc_dir)
+            if proc_stat_info.st_uid != uid:
+                continue
+            with open(os.path.join(proc_dir, "stat"), "r", encoding="ascii") as stream:
+                stat_line = stream.read(4096)
+            close_paren = stat_line.rfind(")")
+            if close_paren < 0:
+                continue
+            fields = stat_line[close_paren + 2:].split()
+            if len(fields) <= 19 or fields[19] != start_ticks:
+                continue
+            pgid = int(fields[2]) if len(fields) > 2 and fields[2].lstrip("-").isdecimal() else None
+            if pgid and pgid > 1 and pgid != own_pgid and pgid not in signaled_pgids:
+                try:
+                    os.killpg(pgid, sig)
+                    signaled_pgids.add(pgid)
+                    signaled.append(pid)
+                    continue
+                except OSError:
+                    pass
+            os.kill(pid, sig)
+            signaled.append(pid)
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            continue
+
+    if not signaled:
+        return {"ok": False, "action": action, "pidsSignaled": [], "errorCode": "NO_MATCHING_LIVE_PROCESS"}
+    return {"ok": True, "action": action, "pidsSignaled": signaled, "errorCode": None}
+
+
 def _emit_frame(envelope):
     payload = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(payload) > MAX_RESPONSE_BYTES:
@@ -985,7 +1495,11 @@ def main():
         request = json.loads(base64.b64decode(REQUEST_B64, validate=True).decode("utf-8"))
         if not isinstance(request, dict):
             raise ValueError("request schema")
-        payload = launch_task(request)
+        op = request.get("op")
+        if op == "signal_task":
+            payload = signal_task(request)
+        else:
+            payload = launch_task(request)
         request_id = request.get("requestId") if isinstance(request.get("requestId"), str) else None
         _emit_frame({
             "version": VERSION,

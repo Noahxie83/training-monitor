@@ -39,10 +39,10 @@ describe('server-owned GPU wait controller', () => {
     expect(f.ensure).toHaveBeenCalledTimes(1);
     expect(f.status()?.phase).toBe('waiting');
   });
-  it('requires a registered completion status source for persistent retry', () => {
+  it('allows persistent retry without requiring a private completion status_json source', () => {
     const registry = autoRegistry(); const task = registry.tasks[0]!;
     task.autoStart!.retryOnExit = true;
-    expect(() => validateRegistry(registry)).toThrow('INVALID_AUTO_START');
+    expect(validateRegistry(registry).tasks[0]!.autoStart!.retryOnExit).toBe(true);
     task.sources.push({ sourceId: 'status', kind: 'status_json', path: '/allowed/run/status.json' });
     expect(validateRegistry(registry).tasks[0]!.autoStart!.retryOnExit).toBe(true);
   });

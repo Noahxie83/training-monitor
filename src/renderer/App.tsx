@@ -71,7 +71,7 @@ export function App() {
       await updateRegistry({
         ...registry,
         tasks: registry.tasks.map(item => item.taskId === taskId
-          ? { ...item, autoStart: { ...item.autoStart!, execution: 'server_tmux' as const, gpuDeviceIds: [], armId: newAutoStartArmId() } }
+          ? { ...item, autoStart: { ...item.autoStart!, execution: 'server_tmux' as const, armId: newAutoStartArmId() } }
           : item),
       });
     } catch (reason) {

@@ -4,8 +4,12 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type {
   AcceleratorAvailability,
+  DiscoveredProcess,
   HostRegistration,
+  HostSystemHealth,
   HostTarget,
+  JobControlAction,
+  JobControlResult,
   ProcessKey,
   Registry,
   TaskRegistration,
@@ -335,7 +339,41 @@ function linuxGpuObservation(value: unknown, receivedAt: string): NonNullable<Ho
   if (row.status !== 'ok' || typeof row.csv !== 'string') {
     return unavailableGpu(typeof row.errorCode === 'string' ? row.errorCode : 'GPU_DATA_UNAVAILABLE', 'unavailable');
   }
-  return projectGpuCsv(row.csv, receivedAt);
+  return projectGpuCsv(row.csv, receivedAt, row.devices);
+}
+
+function parseHostSystemHealth(value: unknown, fallbackObservedAt: string): HostSystemHealth | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  const numOrNull = (v: unknown) => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+  const disks = Array.isArray(row.disks)
+    ? row.disks
+        .filter((d): d is Record<string, unknown> => !!d && typeof d === 'object' && typeof (d as any).path === 'string')
+        .slice(0, 16)
+        .map((d) => ({
+          path: String(d.path),
+          usedBytes: typeof d.usedBytes === 'string' && /^\d+$/.test(d.usedBytes) ? d.usedBytes : '0',
+          availableBytes: typeof d.availableBytes === 'string' && /^\d+$/.test(d.availableBytes)
+            ? d.availableBytes
+            : (typeof d.freeBytes === 'string' && /^\d+$/.test(d.freeBytes) ? d.freeBytes : '0'),
+          totalBytes: typeof d.totalBytes === 'string' && /^\d+$/.test(d.totalBytes) ? d.totalBytes : '0',
+        }))
+    : [];
+  const observedAt = iso(row.observedAt) ?? fallbackObservedAt;
+  const memUsed = typeof row.memoryUsedBytes === 'string' && /^\d+$/.test(row.memoryUsedBytes)
+    ? row.memoryUsedBytes
+    : (typeof row.ramUsedBytes === 'string' && /^\d+$/.test(row.ramUsedBytes) ? row.ramUsedBytes : null);
+  const memTotal = typeof row.memoryTotalBytes === 'string' && /^\d+$/.test(row.memoryTotalBytes)
+    ? row.memoryTotalBytes
+    : (typeof row.ramTotalBytes === 'string' && /^\d+$/.test(row.ramTotalBytes) ? row.ramTotalBytes : null);
+  return {
+    observedAt,
+    freshness: observedAt ? 'fresh' : 'unobserved',
+    cpuUtilizationPct: numOrNull(row.cpuUtilizationPct) ?? numOrNull(row.cpuPercent),
+    memoryUsedBytes: memUsed,
+    memoryTotalBytes: memTotal,
+    disks,
+  };
 }
 
 export function resolveWindowsNvidiaSmiPaths(env: NodeJS.ProcessEnv = process.env): string[] {
@@ -858,6 +896,7 @@ export function projectTaskObservation(task: TaskRegistration, payload: unknown,
       evidenceComplete: status === 'ok' && !!fileIdentity && typeof result?.eofBytes === 'string' && /^\d+$/.test(result.eofBytes),
       errorScope: typeof result?.errorCode === 'string' ? 'source' as const : null,
       phase: typeof result?.errorCode === 'string' ? 'source_read' as const : null,
+      ...(typeof result?.resolvedPath === 'string' ? { resolvedPath: result.resolvedPath } : {}),
     };
   });
   const sourceIdentityById = new Map(sources.map((row) => [row.sourceId, { fileIdentity: row.fileIdentity, eofBytes: row.eofBytes }]));
@@ -873,28 +912,71 @@ export function projectTaskObservation(task: TaskRegistration, payload: unknown,
       if (typeof id !== 'string' || !task.sources.some((item) => item.sourceId === id)) return false;
       const expected = sourceIdentityById.get(id);
       const actual = evidence[id] && typeof evidence[id] === 'object' ? evidence[id] as Record<string, unknown> : {};
-      return !!expected && expected.fileIdentity !== null && expected.eofBytes !== null &&
-        JSON.stringify(actual.fileIdentity) === JSON.stringify(expected.fileIdentity) && actual.eofBytes === expected.eofBytes;
+      if (!expected || expected.fileIdentity === null || expected.eofBytes === null) return false;
+      if (JSON.stringify(actual.fileIdentity) !== JSON.stringify(expected.fileIdentity)) return false;
+      if (typeof actual.eofBytes !== 'string' || !/^\d+$/.test(actual.eofBytes)) return false;
+      // Active log files grow monotonically during training; allow actual.eofBytes >= expected.eofBytes.
+      return BigInt(actual.eofBytes) >= BigInt(expected.eofBytes);
     });
     const launcherEntry = typeof row.launcherEntry === 'string' && typeof row.cwd === 'string' && isRegisteredLauncherPath(task, { cwd: row.cwd, launcherEntry: row.launcherEntry }) ? row.launcherEntry : null;
-    const entryVerified = row.roleEvidence === 'exact_script_entry' || row.roleEvidence === 'exact_entry_and_direct_writer_fd' || launcherEntry !== null;
+    const treeMember = row.treeMember === true;
+    const entryVerified = row.roleEvidence === 'exact_script_entry' || row.roleEvidence === 'exact_entry_and_direct_writer_fd' || launcherEntry !== null || treeMember;
     const confirmedWriter = (row.roleEvidence === 'exact_entry_and_direct_writer_fd' || launcherEntry !== null) && writerIds.length > 0;
     const writerSourceEvidence: NonNullable<TaskObservation['processes'][number]['writerSourceEvidence']> = {};
     for (const id of writerIds) writerSourceEvidence[id] = evidence[id] as { fileIdentity: SourceObservation['fileIdentity']; eofBytes: string };
     processes.push({
       key,
-      role: 'unknown',
+      role: row.role === 'worker' ? 'worker' : 'unknown',
+      ...(typeof row.ppid === 'number' && Number.isSafeInteger(row.ppid) ? { ppid: row.ppid } : {}),
+      ...(typeof row.pgid === 'number' && Number.isSafeInteger(row.pgid) ? { pgid: row.pgid } : {}),
+      ...(typeof row.nsPid === 'number' && Number.isSafeInteger(row.nsPid) ? { nsPid: row.nsPid } : {}),
       cwd: typeof row.cwd === 'string' ? row.cwd : null,
       scriptEntry: typeof row.scriptEntry === 'string' ? row.scriptEntry : null,
       launcherEntry,
+      ...(typeof row.exe === 'string' ? { exe: row.exe } : {}),
+      ...(typeof row.command === 'string' ? { command: row.command } : {}),
       observedAt,
       roleEvidence: confirmedWriter ? 'exact_entry_and_direct_writer_fd' : entryVerified ? 'exact_script_entry' : 'none',
       directWriterSourceIds: confirmedWriter ? writerIds : [],
       writerSourceEvidence,
       writerEvidenceComplete: row.writerEvidenceComplete === true && complete && writerIds.length === reportedWriterIds.length,
       evidenceComplete: row.evidenceComplete === true && entryVerified && complete,
+      ...(row.fdScanTruncated === true ? { fdScanTruncated: true } : {}),
+      ...(treeMember ? { treeMember: true } : {}),
+      ...(typeof row.rssBytes === 'number' && Number.isFinite(row.rssBytes) && row.rssBytes >= 0 ? { rssBytes: row.rssBytes } : {}),
+      ...(typeof row.cpuPercent === 'number' && Number.isFinite(row.cpuPercent) && row.cpuPercent >= 0 ? { cpuPercent: row.cpuPercent } : {}),
       interpreterFlags: Array.isArray(row.interpreterFlags) ? row.interpreterFlags.filter((flag): flag is string => typeof flag === 'string').slice(0, 16) : [],
     });
+  }
+  const rawCp = data.checkpointScan && typeof data.checkpointScan === 'object' ? data.checkpointScan as Record<string, unknown> : null;
+  let checkpointScan: TaskObservation['checkpointScan'] = null;
+  if (rawCp) {
+    const rawLatest = rawCp.latest && typeof rawCp.latest === 'object' ? rawCp.latest as Record<string, unknown> : null;
+    const latestId = rawLatest?.fileIdentity && typeof rawLatest.fileIdentity === 'object'
+      ? rawLatest.fileIdentity as Record<string, unknown>
+      : null;
+    checkpointScan = {
+      scanComplete: rawCp.scanComplete === true,
+      errorCode: typeof rawCp.errorCode === 'string' ? rawCp.errorCode : null,
+      latest: rawLatest && typeof rawLatest.path === 'string' && typeof rawLatest.sizeBytes === 'string' && typeof rawLatest.mtime === 'string'
+        ? {
+            path: rawLatest.path,
+            name: typeof rawLatest.name === 'string' ? rawLatest.name : path.posix.basename(rawLatest.path),
+            isDirectory: rawLatest.isDirectory === true,
+            fileCount: typeof rawLatest.fileCount === 'number' && Number.isSafeInteger(rawLatest.fileCount) ? rawLatest.fileCount : null,
+            sizeBytes: /^\d+$/.test(rawLatest.sizeBytes) ? rawLatest.sizeBytes : '0',
+            mtime: iso(rawLatest.mtime) ?? observedAt,
+            fileIdentity: latestId && typeof latestId.dev === 'string' && typeof latestId.inode === 'string'
+              ? { dev: latestId.dev, inode: latestId.inode }
+              : null,
+            fileStepIndex: typeof rawLatest.fileStepIndex === 'number' && Number.isSafeInteger(rawLatest.fileStepIndex) ? rawLatest.fileStepIndex : null,
+            stepSource: rawLatest.stepSource === 'filename' || rawLatest.stepSource === 'metadata' ? rawLatest.stepSource : null,
+            ...(rawLatest.metadata && typeof rawLatest.metadata === 'object' && !Array.isArray(rawLatest.metadata)
+              ? { metadata: rawLatest.metadata as Record<string, string | number | boolean | null> }
+              : {}),
+          }
+        : null,
+    };
   }
   const hostError = data.errorScope === 'host' && typeof data.errorCode === 'string' ? data.errorCode : null;
   const requestError = data.errorScope === 'request' && typeof data.errorCode === 'string' ? data.errorCode : null;
@@ -914,6 +996,8 @@ export function projectTaskObservation(task: TaskRegistration, payload: unknown,
     sources,
     errorCode: hostError ?? requestError ?? taskError,
     errorScope: hostError ? 'host' : requestError ? 'request' : taskError ? 'task' : null,
+    ...(checkpointScan ? { checkpointScan } : {}),
+    ...(data.fdScanTruncated === true ? { fdScanTruncated: true } : {}),
   };
 }
 
@@ -963,11 +1047,13 @@ export function createTransport(context: TransportHostContext, options: CreateTr
     sessionPool.call(host.hostId, host.target, options.probeSource, request, signal, spawnChild, { timeoutMs, platform });
 
   const parseServerWaitPayload = (data: Record<string, unknown>, armId: string, configHash: string): ServerWaitResult => {
-    const keys = ['state', 'armId', 'configHash', 'idleElapsedSeconds', 'requiredIdleSeconds', 'lastCheckedAt', 'startedAt', 'pid', 'errorCode', 'message', 'sessionName', 'selectedDeviceId'];
+    const requiredKeys = ['state', 'armId', 'configHash', 'idleElapsedSeconds', 'requiredIdleSeconds', 'lastCheckedAt', 'startedAt', 'pid', 'errorCode', 'message', 'sessionName', 'selectedDeviceId'];
+    const optionalKeys = ['errorParams', 'selectedDeviceIds', 'retryCount', 'maxRetries', 'exitCode', 'backend'];
+    const allowedKeys = new Set([...requiredKeys, ...optionalKeys]);
     if (
       !data ||
-      Object.keys(data).length !== keys.length ||
-      Object.keys(data).some(key => !keys.includes(key)) ||
+      requiredKeys.some(key => !(key in data)) ||
+      Object.keys(data).some(key => !allowedKeys.has(key)) ||
       !['missing', 'waiting', 'countdown', 'blocked', 'starting', 'started', 'failed', 'cancelled'].includes(String(data.state)) ||
       data.armId !== armId ||
       data.configHash !== configHash ||
@@ -979,6 +1065,8 @@ export function createTransport(context: TransportHostContext, options: CreateTr
       !(data.message === null || (typeof data.message === 'string' && data.message.length <= 512 && !/[\u0000-\u001f\u007f]/.test(data.message))) ||
       !(data.sessionName === null || (typeof data.sessionName === 'string' && /^tm-wait-[a-f0-9]{40}$/.test(data.sessionName))) ||
       !(data.selectedDeviceId === null || (typeof data.selectedDeviceId === 'string' && /^GPU (0|[1-9]\d{0,3})$/.test(data.selectedDeviceId))) ||
+      (data.selectedDeviceIds !== undefined && (!Array.isArray(data.selectedDeviceIds) || data.selectedDeviceIds.some(d => typeof d !== 'string' || !/^GPU (0|[1-9]\d{0,3})$/.test(d)))) ||
+      (data.backend !== undefined && !['tmux', 'systemd_run', 'setsid'].includes(String(data.backend))) ||
       (data.state === 'started' && (data.pid === null || data.startedAt === null))
     ) {
       throw coded('SERVER_WAIT_PROTOCOL_INVALID');
@@ -1014,11 +1102,15 @@ export function createTransport(context: TransportHostContext, options: CreateTr
         armId: config.armId,
         configHash,
         ...scopes,
+        ...(host.stateDir ? { stateDir: host.stateDir } : {}),
       };
       if (op === 'ensure_server_wait') {
         Object.assign(req, {
           idleSeconds: config.idleSeconds,
           retryOnExit: config.retryOnExit ?? false,
+          ...(typeof config.maxRetries === 'number' ? { maxRetries: config.maxRetries } : {}),
+          ...(typeof config.retryBackoffSeconds === 'number' ? { retryBackoffSeconds: config.retryBackoffSeconds } : {}),
+          ...(typeof config.requiredGpuCount === 'number' ? { requiredGpuCount: config.requiredGpuCount } : {}),
           launchRequest: {
             version: PROTOCOL_VERSION,
             requestId,
@@ -1028,10 +1120,17 @@ export function createTransport(context: TransportHostContext, options: CreateTr
             armId: config.armId,
             configHash,
             ...scopes,
+            ...(host.stateDir ? { stateDir: host.stateDir } : {}),
             entryPaths: registered.entryPaths,
             sources: registered.sources,
             launch: config.launch,
             gpuDevices: [],
+            ...(config.gpuDeviceIds?.length ? { gpuDeviceIds: config.gpuDeviceIds } : {}),
+            ...(config.gpuExcludeIds?.length ? { gpuExcludeIds: config.gpuExcludeIds } : {}),
+            ...(typeof config.requiredGpuCount === 'number' ? { requiredGpuCount: config.requiredGpuCount } : {}),
+            cudaVisibleDevicesMode: config.cudaVisibleDevicesMode ?? 'index',
+            useSupervisor: true,
+            useLocalLocks: true,
             maxUtilizationPercent: config.maxUtilizationPercent,
             maxMemoryMiB: config.maxMemoryMiB,
             ...(config.minFreeMemoryMiB ? { minFreeMemoryMiB: config.minFreeMemoryMiB } : {}),
@@ -1106,10 +1205,12 @@ export function createTransport(context: TransportHostContext, options: CreateTr
         : gpu?.state === 'available' ? 'available' : undefined);
     lastAcceleratorAvailability = acceleratorAvailability;
 
+    const observedAt = now();
+    const system = parseHostSystemHealth(data.system, observedAt);
     return {
       hostId: host.hostId,
       freshness: 'fresh',
-      observedAt: now(),
+      observedAt,
       phase: validProbePhase(data.phase) ?? 'probe',
       connection: 'connected',
       scanComplete: data.scanComplete === true,
@@ -1118,6 +1219,7 @@ export function createTransport(context: TransportHostContext, options: CreateTr
       errorScope: null,
       ...(acceleratorAvailability ? { acceleratorAvailability } : {}),
       ...(gpu ? { gpu } : {}),
+      ...(system ? { system } : {}),
     };
   };
 
@@ -1227,6 +1329,9 @@ export function createTransport(context: TransportHostContext, options: CreateTr
           sourceId: null,
           op: 'probe_host',
           includeGpu: !useWindowsNvidia,
+          includeGpuDetails: !useWindowsNvidia,
+          includeSystem: true,
+          diskPaths: host.allowedRoots,
         }, signal);
         const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
         return await projectHostData(host, data, signal);
@@ -1267,6 +1372,8 @@ export function createTransport(context: TransportHostContext, options: CreateTr
               allowedDirectories: scopes.taskAllowedDirectories,
               entryPaths: registered.entryPaths,
               sources: registered.sources,
+              checkpointDirectories: registered.checkpointDirectories,
+              ...(registered.allowCrossUidScan ? { allowCrossUidScan: true } : {}),
             },
           });
         }
@@ -1277,7 +1384,10 @@ export function createTransport(context: TransportHostContext, options: CreateTr
           sourceId: null,
           op: 'probe_host_and_tasks',
           includeGpu: !useWindowsNvidia,
+          includeGpuDetails: !useWindowsNvidia,
           includeProcessGpu: !useWindowsNvidia,
+          includeSystem: true,
+          diskPaths: host.allowedRoots,
           proc: { root: '/proc' },
           tasks: eligibleTasks.map((item) => item.requestTask),
         }, signal);
@@ -1316,7 +1426,15 @@ export function createTransport(context: TransportHostContext, options: CreateTr
           proc: { root: '/proc' },
           includeProcessGpu,
           gpuDevices: includeProcessGpu ? devices : [],
-          task: { taskId: registered.taskId, ...scopes, allowedDirectories: scopes.taskAllowedDirectories, entryPaths: registered.entryPaths, sources: registered.sources },
+          task: {
+            taskId: registered.taskId,
+            ...scopes,
+            allowedDirectories: scopes.taskAllowedDirectories,
+            entryPaths: registered.entryPaths,
+            sources: registered.sources,
+            checkpointDirectories: registered.checkpointDirectories,
+            ...(registered.allowCrossUidScan ? { allowCrossUidScan: true } : {}),
+          },
         }, signal);
         const observation = projectTaskObservation(registered, payload, now());
         const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
@@ -1341,6 +1459,75 @@ export function createTransport(context: TransportHostContext, options: CreateTr
       }, signal) as Record<string, unknown>;
       if (!data || typeof data.scanComplete !== 'boolean' || typeof data.running !== 'boolean' || !(data.errorCode === null || typeof data.errorCode === 'string')) throw coded('PROTOCOL_INVALID');
       return { scanComplete: data.scanComplete, running: data.running, errorCode: data.errorCode as string | null };
+    },
+    async discoverProcesses(signal): Promise<DiscoveredProcess[]> {
+      const { host } = await currentContext();
+      if (!host.enabled) return [];
+      const payload = await callProbeSession(host, {
+        version: PROTOCOL_VERSION,
+        requestId: randomUUID(),
+        sourceId: null,
+        op: 'discover_processes',
+        proc: { root: '/proc' },
+      }, signal, 10_000) as Record<string, unknown>;
+      if (!payload || !Array.isArray(payload.processes)) return [];
+      const out: DiscoveredProcess[] = [];
+      for (const item of payload.processes.slice(0, 64)) {
+        if (!item || typeof item !== 'object') continue;
+        const row = item as Record<string, unknown>;
+        if (typeof row.pid !== 'number' || !Number.isSafeInteger(row.pid) || row.pid <= 0) continue;
+        out.push({
+          pid: row.pid,
+          pgid: typeof row.pgid === 'number' && Number.isSafeInteger(row.pgid) ? row.pgid : row.pid,
+          command: typeof row.command === 'string' ? row.command.slice(0, 1024) : '',
+          cwd: typeof row.cwd === 'string' ? row.cwd : null,
+          gpuIndices: Array.isArray(row.gpuIndices) ? row.gpuIndices.filter((n): n is number => typeof n === 'number' && Number.isSafeInteger(n)) : [],
+          gpuMemoryMiB: typeof row.gpuMemoryMiB === 'number' && Number.isFinite(row.gpuMemoryMiB) ? row.gpuMemoryMiB : null,
+          openLogPaths: Array.isArray(row.openLogPaths) ? row.openLogPaths.filter((p): p is string => typeof p === 'string').slice(0, 16) : [],
+          suggestedName: typeof row.suggestedName === 'string' ? row.suggestedName.slice(0, 128) : `pid-${row.pid}`,
+          suggestedEntry: typeof row.suggestedEntry === 'string' ? row.suggestedEntry.slice(0, 512) : '',
+          ...(typeof row.user === 'string' ? { user: row.user } : {}),
+        });
+      }
+      return out;
+    },
+    async signalTask(task: TaskRegistration, action: JobControlAction, processKeys: ProcessKey[], signal: AbortSignal): Promise<JobControlResult> {
+      const { registry, host } = await currentContext();
+      if (host.allowJobControl !== true) {
+        return { ok: false, action, taskId: task.taskId, pidsSignaled: [], errorCode: 'JOB_CONTROL_DISABLED', message: 'Job control is disabled for this host.' };
+      }
+      if (!options.launcherSource) {
+        return { ok: false, action, taskId: task.taskId, pidsSignaled: [], errorCode: 'LAUNCHER_UNAVAILABLE', message: 'Launcher source is unavailable.' };
+      }
+      if (action === 'restart') {
+        if (processKeys.length > 0) {
+          await invokeOneShotScript({ ...context, host, registry }, options.launcherSource, {
+            version: PROTOCOL_VERSION,
+            requestId: randomUUID(),
+            sourceId: null,
+            op: 'signal_task',
+            action: 'stop',
+            processKeys,
+          }, signal, spawnChild, { timeoutMs: 10_000 });
+        }
+        return { ok: true, action: 'restart', taskId: task.taskId, pidsSignaled: processKeys.map((k) => k.pid), errorCode: null, message: 'Stop signal sent for restart.' };
+      }
+      const data = await invokeOneShotScript({ ...context, host, registry }, options.launcherSource, {
+        version: PROTOCOL_VERSION,
+        requestId: randomUUID(),
+        sourceId: null,
+        op: 'signal_task',
+        action,
+        processKeys,
+      }, signal, spawnChild, { timeoutMs: 10_000 }) as Record<string, unknown>;
+      return {
+        ok: data?.ok === true,
+        action,
+        taskId: task.taskId,
+        pidsSignaled: Array.isArray(data?.pidsSignaled) ? data.pidsSignaled.filter((n): n is number => typeof n === 'number') : [],
+        errorCode: typeof data?.errorCode === 'string' ? data.errorCode : null,
+        message: data?.ok === true ? `Signal ${action} sent.` : (typeof data?.errorCode === 'string' ? data.errorCode : 'SIGNAL_FAILED'),
+      };
     },
     async launchTask(task, armId, configHash, signal) {
       const { registry, host } = await currentContext();
@@ -1409,6 +1596,7 @@ export function createTransport(context: TransportHostContext, options: CreateTr
         op: 'read_log',
         path: remotePath,
         currentPath: registration.source.path,
+        ...(registration.source.pathMode ? { pathMode: registration.source.pathMode } : {}),
         ...scopes,
         offset: request.offset,
         limitBytes: request.limitBytes,

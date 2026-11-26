@@ -225,8 +225,8 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(kwargs["start_new_session"])
         self.assertTrue(kwargs["close_fds"])
         self.assertEqual(kwargs["pass_fds"], ())
-        self.assertEqual(kwargs["env"]["CUDA_VISIBLE_DEVICES"],
-                         "GPU-aaaaaaaa,GPU-bbbbbbbb")
+        # Phase 2 defaults cudaVisibleDevicesMode to 'index' for multi-GPU / container compatibility
+        self.assertEqual(kwargs["env"]["CUDA_VISIBLE_DEVICES"], "6,2")
         self.assertNotIn("TMUX", kwargs["env"])
         self.assertNotIn("TMUX_PANE", kwargs["env"])
 

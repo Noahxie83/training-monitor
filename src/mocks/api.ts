@@ -118,9 +118,29 @@ export function createMockApi(options: { demo?: boolean } = {}): MonitorApi {
     },
     async cancelRequest(requestId) { if (activeSearches.has(requestId)) cancelledSearches.add(requestId); },
     async getRegistry() { return structuredClone(registry); },
-    async saveRegistry(value) { const validated = validateRegistry(value); if (validated.revision !== registry.revision) throw new Error('REVISION_CONFLICT'); registry = { ...structuredClone(validated), revision: registry.revision + 1 }; publishSnapshot(); return structuredClone(registry); },
+    async saveRegistry(value, _options) { const validated = validateRegistry(value); if (validated.revision !== registry.revision) throw new Error('REVISION_CONFLICT'); registry = { ...structuredClone(validated), revision: registry.revision + 1 }; publishSnapshot(); return structuredClone(registry); },
     async getPreferences() { return { ...preferences }; },
     async savePreferences(value) { preferences = { ...value }; return { ...preferences }; },
     async copyRegisteredPath() {},
+    async getMetricSeries(query) { return { taskId: query.taskId, series: {} }; },
+    async getGpuSeries(query) { return { hostId: query.hostId, gpu: [], host: [] }; },
+    async exportLogs(query) {
+      const matched = events.filter((e) => query.sourceIds.includes(e.sourceId) && (!query.literal || (e.text ?? '').includes(query.literal)));
+      return { exportedCount: matched.length, path: query.destinationPath ?? null };
+    },
+    async discoverProcesses(_hostId) { return []; },
+    async controlTask(request) {
+      const task = registry.tasks.find((t) => t.taskId === request.taskId);
+      const host = task ? registry.hosts.find((h) => h.hostId === task.hostId) : undefined;
+      if (!task || !host) return { ok: false, taskId: request.taskId, action: request.action, errorCode: 'TASK_NOT_REGISTERED', message: 'Task not found' };
+      if (host.allowJobControl !== true) {
+        return { ok: false, taskId: request.taskId, action: request.action, errorCode: 'JOB_CONTROL_DISABLED', message: 'Remote job control is disabled for this host' };
+      }
+      if (!request.confirmToken || request.confirmToken.length < 8) {
+        return { ok: false, taskId: request.taskId, action: request.action, errorCode: 'CONFIRMATION_REQUIRED', message: 'Confirmation token required' };
+      }
+      return { ok: true, taskId: request.taskId, action: request.action, pidsSignaled: [], errorCode: null, message: 'Simulated job control action' };
+    },
+    async testWebhook(_webhook) { return { ok: true, statusCode: 200, error: null }; },
   };
 }

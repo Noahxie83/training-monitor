@@ -64,6 +64,14 @@ export function migratePreferences(raw: unknown): Preferences {
   if (bounds) {
     migrated.windowBounds = bounds;
   }
+  if (row.alerts && typeof row.alerts === 'object' && !Array.isArray(row.alerts)) {
+    try {
+      const validated = validatePreferences({ theme, alerts: row.alerts });
+      if (validated.alerts) migrated.alerts = validated.alerts;
+    } catch {
+      // Drop malformed alert section while preserving valid theme/locale/bounds.
+    }
+  }
   return migrated;
 }
 

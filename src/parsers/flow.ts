@@ -1,4 +1,5 @@
 import type { FlowDerivationResult, FlowParams, ParsedTrainingRecord } from './types';
+import { stripAnsi } from './ansi';
 
 export function flow(params: FlowParams): FlowDerivationResult {
   const { b, T, n } = params;
@@ -50,7 +51,8 @@ export function flow(params: FlowParams): FlowDerivationResult {
 }
 
 export function parseFlowRecord(text: string, sourceId: string = ''): ParsedTrainingRecord {
-  if (!text || text.length > 4096) {
+  const clean = stripAnsi(text || '');
+  if (!clean || clean.length > 4096) {
     return {
       algorithm: 'flow',
       sessionCompletedCount: null,
@@ -63,7 +65,7 @@ export function parseFlowRecord(text: string, sourceId: string = ''): ParsedTrai
   }
 
   // Bounded tqdm training format: completed/target [elapsed<remaining, rate]
-  const match = text.match(/(?:^|\s|\|)(\d+)\s*\/\s*(\d+)\s*\[\s*(?:\d+:)?\d+:\d+<(?:\d+:)?\d+:\d+/);
+  const match = clean.match(/(?:^|\s|\|)(\d+)\s*\/\s*(\d+)\s*\[\s*(?:\d+:)?\d+:\d+<(?:\d+:)?\d+:\d+/);
   if (!match) {
     return {
       algorithm: 'flow',
@@ -91,11 +93,11 @@ export function parseFlowRecord(text: string, sourceId: string = ''): ParsedTrai
   }
 
   let rate: number | null = null;
-  const rateMatch = text.match(/([\d.]+)\s*(?:it\/s|iterations\/s)/i);
+  const rateMatch = clean.match(/([\d.]+)\s*(?:it\/s|iterations\/s)/i);
   if (rateMatch) {
     rate = parseFloat(rateMatch[1]);
   } else {
-    const secMatch = text.match(/([\d.]+)\s*s\/it/i);
+    const secMatch = clean.match(/([\d.]+)\s*s\/it/i);
     if (secMatch) {
       const sec = parseFloat(secMatch[1]);
       if (sec > 0) rate = 1 / sec;
@@ -107,8 +109,12 @@ export function parseFlowRecord(text: string, sourceId: string = ''): ParsedTrai
     sessionCompletedCount: completed,
     sessionTargetCount: target,
     rate: rate !== null && Number.isFinite(rate) ? rate : null,
+    rateUnit: 'it/s',
     rawText: text,
     sourceId,
     isTrainingOutput: true,
+    unit: 'step',
+    current: completed,
+    total: target,
   };
 }

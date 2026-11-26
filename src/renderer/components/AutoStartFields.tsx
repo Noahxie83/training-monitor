@@ -5,7 +5,12 @@ import type { AutoStartConfig, HostSnapshot, TaskRegistration } from '../../shar
 export interface AutoStartDraft {
   enabled: boolean;
   retryOnExit?: boolean;
+  maxRetries?: string;
+  retryBackoffSeconds?: string;
   gpuText: string;
+  gpuExcludeText?: string;
+  requiredGpuCount?: string;
+  cudaVisibleDevicesMode?: 'index' | 'uuid';
   idleSeconds: string;
   maxUtilizationPercent: string;
   maxMemoryMiB: string;
@@ -112,7 +117,12 @@ export function createAutoStartDraft(config: AutoStartConfig | null | undefined,
     return {
       enabled: config.enabled,
       retryOnExit: config.retryOnExit ?? false,
+      ...(config.maxRetries !== undefined ? { maxRetries: String(config.maxRetries) } : {}),
+      ...(config.retryBackoffSeconds !== undefined ? { retryBackoffSeconds: String(config.retryBackoffSeconds) } : {}),
       gpuText: config.gpuDeviceIds.map(deviceIdToIndex).join(', '),
+      ...(config.gpuExcludeIds?.length ? { gpuExcludeText: config.gpuExcludeIds.map(deviceIdToIndex).join(', ') } : {}),
+      ...(config.requiredGpuCount !== undefined ? { requiredGpuCount: String(config.requiredGpuCount) } : {}),
+      ...(config.cudaVisibleDevicesMode !== undefined ? { cudaVisibleDevicesMode: config.cudaVisibleDevicesMode } : {}),
       idleSeconds: String(config.idleSeconds),
       maxUtilizationPercent: String(config.maxUtilizationPercent),
       maxMemoryMiB: String(config.maxMemoryMiB),
@@ -121,8 +131,8 @@ export function createAutoStartDraft(config: AutoStartConfig | null | undefined,
       sharingGroup: config.gpuSharing?.groupId ?? '',
       maxDevices: String(config.gpuSharing?.maxDevices ?? 3),
       maxWorkersPerDevice: String(config.gpuSharing?.maxWorkersPerDevice ?? 2),
-      pythonPath: config.launch.pythonPath,
-      entryPath: config.launch.entryPath,
+      pythonPath: config.launch.pythonPath ?? AUTO_START_DEFAULTS.pythonPath,
+      entryPath: config.launch.entryPath ?? context.entryPaths[0] ?? '',
       cwd: config.launch.cwd,
       arguments: config.launch.arguments,
       logSourceId: config.launch.logSourceId,
@@ -180,6 +190,45 @@ export function buildAutoStartPayload(
     return { payload: null, error: '最大显存占用需为 0–1048576 MiB 之间的整数' };
   }
 
+  const parsedGpus = parseGpuTokens(draft.gpuText ?? '');
+  if (parsedGpus.invalid) {
+    return { payload: null, error: 'GPU 白名单格式无效，请使用逗号分隔的数字编号（例如 0, 1）' };
+  }
+  const parsedExcludes = parseGpuTokens(draft.gpuExcludeText ?? '');
+  if (parsedExcludes.invalid) {
+    return { payload: null, error: 'GPU 黑名单格式无效，请使用逗号分隔的数字编号' };
+  }
+
+  let requiredGpuCount: number | undefined;
+  if (draft.requiredGpuCount !== undefined && draft.requiredGpuCount.trim() !== '') {
+    const reqText = draft.requiredGpuCount.trim();
+    const n = Number(reqText);
+    if (!/^\d+$/.test(reqText) || !Number.isSafeInteger(n) || n < 1 || n > 64) {
+      return { payload: null, error: '所需 GPU 数量需为 1–64 之间的整数' };
+    }
+    requiredGpuCount = n;
+  }
+
+  let maxRetries: number | undefined;
+  if (draft.maxRetries !== undefined && draft.maxRetries.trim() !== '') {
+    const mrText = draft.maxRetries.trim();
+    const n = Number(mrText);
+    if (!/^\d+$/.test(mrText) || !Number.isSafeInteger(n) || n < 0 || n > 100) {
+      return { payload: null, error: '最大重试次数需为 0–100 之间的整数' };
+    }
+    maxRetries = n;
+  }
+
+  let retryBackoffSeconds: number | undefined;
+  if (draft.retryBackoffSeconds !== undefined && draft.retryBackoffSeconds.trim() !== '') {
+    const rbText = draft.retryBackoffSeconds.trim();
+    const n = Number(rbText);
+    if (!/^\d+$/.test(rbText) || !Number.isSafeInteger(n) || n < 0 || n > 86400) {
+      return { payload: null, error: '重试退避时长需为 0–86400 秒之间的整数' };
+    }
+    retryBackoffSeconds = n;
+  }
+
   const pythonPath = draft.pythonPath.trim();
   const minFreeMemoryMiB = Number(draft.minFreeMemoryMiB ?? 0);
   const minFreeDiskMiB = Number(draft.minFreeDiskMiB ?? 0);
@@ -187,7 +236,7 @@ export function buildAutoStartPayload(
   const maxDevices = Number(draft.maxDevices ?? 3);
   const maxWorkersPerDevice = Number(draft.maxWorkersPerDevice ?? 2);
   if (![minFreeMemoryMiB, minFreeDiskMiB].every(n => Number.isSafeInteger(n) && n >= 0 && n <= 1048576)) return {payload:null,error:'可用显存和磁盘门槛需为非负整数（MiB）'};
-  if (sharingGroup && (!/^[A-Za-z0-9_-]{1,128}$/.test(sharingGroup) || !minFreeMemoryMiB || !context.hasStatusSource || !Number.isInteger(maxDevices) || maxDevices < 1 || maxDevices > 64 || !Number.isInteger(maxWorkersPerDevice) || maxWorkersPerDevice < 1 || maxWorkersPerDevice > 16)) return {payload:null,error:'共享组需设置可用显存、状态文件、GPU 数量和每卡进程数'};
+  if (sharingGroup && (!/^[A-Za-z0-9_-]{1,128}$/.test(sharingGroup) || !minFreeMemoryMiB || !Number.isInteger(maxDevices) || maxDevices < 1 || maxDevices > 64 || !Number.isInteger(maxWorkersPerDevice) || maxWorkersPerDevice < 1 || maxWorkersPerDevice > 16)) return {payload:null,error:'共享组需设置可用显存、GPU 数量和每卡进程数'};
   if (!pythonPath.startsWith('/')) return { payload: null, error: 'Python 路径需为宿主上的绝对路径，例如 /usr/bin/python3' };
   if (pythonPath.split('/').includes('..')) return { payload: null, error: 'Python 路径不能包含 .. 路径段' };
   const pythonName = pythonPath.split('/').filter(Boolean).pop() ?? '';
@@ -214,12 +263,14 @@ export function buildAutoStartPayload(
   if (!context.logSources.some(source => source.sourceId === draft.logSourceId)) {
     return { payload: null, error: '请选择已登记的日志来源' };
   }
-  if (draft.retryOnExit && !context.hasStatusSource) return { payload: null, error: '请先登记状态 JSON 文件，用于确认任务完成' };
 
   return {
     payload: {
       execution: 'server_tmux',
-      gpuDeviceIds: [],
+      gpuDeviceIds: parsedGpus.ids,
+      ...(parsedExcludes.ids.length > 0 ? { gpuExcludeIds: parsedExcludes.ids } : {}),
+      ...(requiredGpuCount !== undefined ? { requiredGpuCount } : {}),
+      ...(draft.cudaVisibleDevicesMode !== undefined ? { cudaVisibleDevicesMode: draft.cudaVisibleDevicesMode } : {}),
       idleSeconds,
       maxUtilizationPercent,
       maxMemoryMiB,
@@ -227,6 +278,8 @@ export function buildAutoStartPayload(
       ...(minFreeDiskMiB ? { minFreeDiskMiB } : {}),
       ...(sharingGroup ? { gpuSharing: { groupId: sharingGroup, maxDevices, maxWorkersPerDevice } } : {}),
       ...(draft.retryOnExit ? { retryOnExit: true } : {}),
+      ...(maxRetries !== undefined ? { maxRetries } : {}),
+      ...(retryBackoffSeconds !== undefined ? { retryBackoffSeconds } : {}),
       launch: {
         pythonPath,
         entryPath: draft.entryPath,
@@ -241,7 +294,11 @@ export function buildAutoStartPayload(
 
 /** An unchanged configuration keeps its arm id so the running countdown is not restarted. */
 export function sameAutoStartPayload(a: AutoStartPayload, b: AutoStartPayload): boolean {
-  return a.execution === b.execution && a.gpuDeviceIds.join(',') === b.gpuDeviceIds.join(',')
+  return a.execution === b.execution
+    && a.gpuDeviceIds.join(',') === b.gpuDeviceIds.join(',')
+    && (a.gpuExcludeIds ?? []).join(',') === (b.gpuExcludeIds ?? []).join(',')
+    && (a.requiredGpuCount ?? 1) === (b.requiredGpuCount ?? 1)
+    && (a.cudaVisibleDevicesMode ?? 'index') === (b.cudaVisibleDevicesMode ?? 'index')
     && a.idleSeconds === b.idleSeconds
     && a.maxUtilizationPercent === b.maxUtilizationPercent
     && a.maxMemoryMiB === b.maxMemoryMiB
@@ -249,8 +306,13 @@ export function sameAutoStartPayload(a: AutoStartPayload, b: AutoStartPayload): 
     && (a.minFreeDiskMiB ?? 0) === (b.minFreeDiskMiB ?? 0)
     && JSON.stringify(a.gpuSharing) === JSON.stringify(b.gpuSharing)
     && !!a.retryOnExit === !!b.retryOnExit
+    && (a.maxRetries ?? 3) === (b.maxRetries ?? 3)
+    && (a.retryBackoffSeconds ?? 10) === (b.retryBackoffSeconds ?? 10)
+    && a.launch.mode === b.launch.mode
     && a.launch.pythonPath === b.launch.pythonPath
     && a.launch.entryPath === b.launch.entryPath
+    && a.launch.moduleName === b.launch.moduleName
+    && JSON.stringify(a.launch.command ?? null) === JSON.stringify(b.launch.command ?? null)
     && a.launch.cwd === b.launch.cwd
     && a.launch.arguments === b.launch.arguments
     && a.launch.logSourceId === b.launch.logSourceId;
@@ -303,9 +365,9 @@ export function AutoStartFields({ draft, onChange, context, sectionRef, serverSu
     {draft.enabled ? <div className="auto-start-body">
       <p className="task-form-help">监控范围：全部 GPU，任意一张满足条件即可，无需勾选。每张卡独立计时，启动脚本内的 CUDA 编号为 0。</p>
       <label className="auto-start-toggle">
-        <input type="checkbox" checked={!!draft.retryOnExit} disabled={!context.hasStatusSource}
+        <input type="checkbox" checked={!!draft.retryOnExit}
           onChange={event => update({ retryOnExit: event.target.checked })} />
-        任务退出后重新等待全部 GPU，完成后停止
+        任务异常退出后重新等待 GPU（支持最大重试次数与退避）
       </label>
       <div className="auto-start-grid">
         <label className="form-label">最低可用显存（MiB，0 表示沿用占用上限）

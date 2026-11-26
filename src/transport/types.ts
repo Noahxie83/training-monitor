@@ -1,6 +1,11 @@
 import type {
   AcceleratorAvailability,
+  DiscoveredProcess,
+  GpuDeviceDetail,
   HostRegistration,
+  HostSystemHealth,
+  JobControlAction,
+  JobControlResult,
   ProcessKey,
   Registry,
   ResourceMetric,
@@ -52,6 +57,7 @@ export interface HostObservation {
   errorScope?: ErrorScope | null;
   acceleratorAvailability?: AcceleratorAvailability;
   gpu?: HostGpuObservation;
+  system?: HostSystemHealth;
 }
 
 export interface HostGpuObservation {
@@ -60,6 +66,7 @@ export interface HostGpuObservation {
   acceleratorAvailability?: AcceleratorAvailability;
   errorCode: string | null;
   metrics: ResourceMetric[];
+  devices?: GpuDeviceDetail[];
 }
 
 export interface SourceTaskObservation {
@@ -76,21 +83,48 @@ export interface SourceTaskObservation {
   evidenceComplete?: boolean;
   errorScope?: 'source' | null;
   phase: ProbePhase | null;
+  resolvedPath?: string | null;
 }
 
 export interface TaskProcessObservation {
   key: ProcessKey;
   role: 'trainer' | 'queue' | 'worker' | 'unknown';
+  ppid?: number | null;
+  pgid?: number | null;
+  nsPid?: number | null;
   cwd: string | null;
   scriptEntry: string | null;
   launcherEntry?: string | null;
+  exe?: string | null;
+  command?: string | null;
   observedAt: string;
   roleEvidence: 'exact_script_entry' | 'exact_entry_and_direct_writer_fd' | 'none';
   directWriterSourceIds: string[];
   writerSourceEvidence?: Record<string, { fileIdentity: SourceObservation['fileIdentity']; eofBytes: string }>;
   writerEvidenceComplete: boolean;
   evidenceComplete: boolean;
+  fdScanTruncated?: boolean;
+  treeMember?: boolean;
+  rssBytes?: number | null;
+  cpuPercent?: number | null;
   interpreterFlags: string[];
+}
+
+export interface CheckpointScanObservation {
+  scanComplete: boolean;
+  latest: {
+    path: string;
+    name: string;
+    isDirectory: boolean;
+    fileCount: number | null;
+    sizeBytes: string;
+    mtime: string;
+    fileIdentity: { dev: string; inode: string } | null;
+    fileStepIndex: number | null;
+    stepSource: 'filename' | 'metadata' | null;
+    metadata?: Record<string, string | number | boolean | null>;
+  } | null;
+  errorCode: string | null;
 }
 
 export interface TaskObservation {
@@ -106,6 +140,8 @@ export interface TaskObservation {
   errorCode: string | null;
   errorScope?: ErrorScope | null;
   processGpu?: ProcessGpuObservation;
+  checkpointScan?: CheckpointScanObservation | null;
+  fdScanTruncated?: boolean;
 }
 
 export interface ProcessGpuObservation {
@@ -143,6 +179,7 @@ export interface LaunchResult {
   processKey: ProcessKey | null;
   startedAt: string | null;
   errorCode: string | null;
+  exitCode?: number | null;
 }
 
 export interface ServerWaitResult {
@@ -155,9 +192,15 @@ export interface ServerWaitResult {
   startedAt: string | null;
   pid: number | null;
   errorCode: string | null;
+  errorParams?: Record<string, string | number | boolean> | null;
   message: string | null;
   sessionName: string | null;
   selectedDeviceId: string | null;
+  selectedDeviceIds?: string[];
+  retryCount?: number;
+  maxRetries?: number;
+  exitCode?: number | null;
+  backend?: 'tmux' | 'systemd_run' | 'setsid';
 }
 
 export interface Transport {
@@ -166,6 +209,13 @@ export interface Transport {
   cancelServerWait?(task: TaskRegistration, configHash: string, signal: AbortSignal): Promise<ServerWaitResult>;
   checkTaskStopped?(task: TaskRegistration, signal: AbortSignal): Promise<{ scanComplete: boolean; running: boolean; errorCode: string | null }>;
   launchTask?(task: TaskRegistration, armId: string, configHash: string, signal: AbortSignal): Promise<LaunchResult>;
+  discoverProcesses?(signal: AbortSignal): Promise<DiscoveredProcess[]>;
+  signalTask?(
+    task: TaskRegistration,
+    action: JobControlAction,
+    processKeys: ProcessKey[],
+    signal: AbortSignal,
+  ): Promise<JobControlResult>;
   probeHost(signal: AbortSignal): Promise<HostObservation>;
   probeTask(task: TaskRegistration, signal: AbortSignal): Promise<TaskObservation>;
   probeHostAndTasks?(tasks: TaskRegistration[], signal: AbortSignal): Promise<BatchProbeObservation>;

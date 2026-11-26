@@ -1,5 +1,21 @@
-import type { CursorState, LogEvent } from '../shared/contracts';
-import type { LogPage, LogQuery, LogSearchPage, LogSearchRequest, MonitorSnapshot } from '../shared/api';
+import type {
+  CursorState,
+  HostSnapshot,
+  LogEvent,
+  MetricSeriesResponse,
+} from '../shared/contracts';
+import type {
+  ExportLogsQuery,
+  ExportLogsResult,
+  GpuSeriesQuery,
+  GpuSeriesResponse,
+  LogPage,
+  LogQuery,
+  LogSearchPage,
+  LogSearchRequest,
+  MetricSeriesQuery,
+  MonitorSnapshot,
+} from '../shared/api';
 import type { ArchiveReadEvidence, CandidateScan, GenerationDecision, ReadReply, SourceObservation } from '../logs/types';
 import type { PersistedObservation } from './engine';
 
@@ -16,10 +32,42 @@ export type ReconcileRequest = {
   observedAt: string;
 };
 
+export interface MetricSampleRow {
+  taskId: string;
+  runId: string | null;
+  observedAt: string;
+  step: number | null;
+  metricName: string;
+  value: number;
+}
+
+export interface GpuSampleRow {
+  hostId: string;
+  deviceId: string;
+  observedAt: string;
+  utilPct: number | null;
+  memUsedMiB: number | null;
+  memTotalMiB: number | null;
+  tempC: number | null;
+  powerW: number | null;
+}
+
+export interface HostSampleRow {
+  hostId: string;
+  observedAt: string;
+  cpuPct: number | null;
+  ramUsedMiB: number | null;
+  ramTotalMiB: number | null;
+}
+
 export interface StoreClient {
   getCursor(sourceId: string): Promise<CursorState | null>;
   registerSource(sourceId: string, observation: SourceObservation, taskId: string): Promise<CursorState>;
   saveObservation(observation: PersistedObservation): Promise<void>;
+  saveHostSnapshot?(host: HostSnapshot): Promise<void>;
+  saveMetricSamples?(samples: MetricSampleRow[]): Promise<void>;
+  saveGpuSamples?(samples: GpuSampleRow[]): Promise<void>;
+  saveHostSamples?(samples: HostSampleRow[]): Promise<void>;
   commitRead(input: { expected: CursorState; reply: ReadReply; ingestedAt: string }): Promise<CommitReadResult['status']>;
   commitReadWithReceipt(input: { expected: CursorState; reply: ReadReply; ingestedAt: string }): Promise<CommitReadResult>;
   commitArchiveRead(input: { expected: CursorState; evidence: ArchiveReadEvidence; ingestedAt: string }): Promise<'committed' | 'stale' | 'reconciling' | 'storage_error'>;
@@ -27,6 +75,10 @@ export interface StoreClient {
   getSnapshot(): Promise<MonitorSnapshot>;
   getLogs(query: LogQuery): Promise<LogPage>;
   searchLogs(query: LogSearchRequest): Promise<LogSearchPage>;
+  getMetricSeries?(query: MetricSeriesQuery): Promise<MetricSeriesResponse>;
+  getGpuSeries?(query: GpuSeriesQuery): Promise<GpuSeriesResponse>;
+  exportLogs?(query: ExportLogsQuery): Promise<ExportLogsResult>;
+  purgeOrphans?(activeHostIds: string[], activeTaskIds: string[]): Promise<void>;
   cancelRequest(requestId: string): Promise<void>;
   retain(now: string): Promise<{ pausedForDisk: boolean }>;
   close(): Promise<void>;
@@ -36,6 +88,10 @@ export type StoreOperation =
   | { method: 'getCursor'; args: [string] }
   | { method: 'registerSource'; args: [string, SourceObservation, string] }
   | { method: 'saveObservation'; args: [PersistedObservation] }
+  | { method: 'saveHostSnapshot'; args: [HostSnapshot] }
+  | { method: 'saveMetricSamples'; args: [MetricSampleRow[]] }
+  | { method: 'saveGpuSamples'; args: [GpuSampleRow[]] }
+  | { method: 'saveHostSamples'; args: [HostSampleRow[]] }
   | { method: 'commitRead'; args: [Parameters<StoreClient['commitRead']>[0]] }
   | { method: 'commitReadWithReceipt'; args: [Parameters<StoreClient['commitReadWithReceipt']>[0]] }
   | { method: 'commitArchiveRead'; args: [Parameters<StoreClient['commitArchiveRead']>[0]] }
@@ -43,6 +99,10 @@ export type StoreOperation =
   | { method: 'getSnapshot'; args: [] }
   | { method: 'getLogs'; args: [LogQuery, string] }
   | { method: 'searchLogs'; args: [LogSearchRequest, string] }
+  | { method: 'getMetricSeries'; args: [MetricSeriesQuery, string] }
+  | { method: 'getGpuSeries'; args: [GpuSeriesQuery, string] }
+  | { method: 'exportLogs'; args: [ExportLogsQuery, string] }
+  | { method: 'purgeOrphans'; args: [string[], string[]] }
   | { method: 'cancelRequest'; args: [string] }
   | { method: 'retain'; args: [string] }
   | { method: 'diagnostics'; args: [] }

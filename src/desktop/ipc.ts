@@ -1,12 +1,30 @@
 import { BrowserWindow, clipboard, ipcMain, type IpcMainEvent, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { MonitorApi } from '../shared/api';
-import type { Registry } from '../shared/contracts';
+import type { CopyCommandRequest, MonitorApi, OpenSshTerminalRequest } from '../shared/api';
+import type { Registry, SaveRegistryOptions } from '../shared/contracts';
 import { MONITOR_API_KEYS } from '../shared/api';
 import { CHANNELS } from './channels';
 import { discoverSshHosts, discoverWslDistros } from '../transport/discovery';
-import { validateDiscoveredSshHosts, validateDiscoveredWslDistros, validateLogPage, validateLogQuery, validateLogSearchPage, validateLogSearchRequest, validateMonitorSnapshot, validateMonitorUpdate, validatePreferences, validateRegistry } from '../shared/validate';
+import { buildHelperCommand, openLocalSshTerminal } from './notifications';
+import {
+  validateControlTaskRequest,
+  validateDiscoveredProcesses,
+  validateDiscoveredSshHosts,
+  validateDiscoveredWslDistros,
+  validateExportLogsQuery,
+  validateGpuSeriesQuery,
+  validateLogPage,
+  validateLogQuery,
+  validateLogSearchPage,
+  validateLogSearchRequest,
+  validateMetricSeriesQuery,
+  validateMonitorSnapshot,
+  validateMonitorUpdate,
+  validatePreferences,
+  validateRegistry,
+  validateWebhookChannelConfig,
+} from '../shared/validate';
 
 type Subscription = { sessionId: string; subscriptionId: string; contentsId: number; dispose: () => void };
 const subscriptions = new Map<string, Subscription>();
@@ -67,7 +85,22 @@ export function registerMonitorIpc(api: MonitorApi, windows?: { openGpuWindow: (
     [CHANNELS.getRegistry, async (event) => { assertSender(event); return validateRegistry(await api.getRegistry()); }],
     [CHANNELS.saveRegistry, async (event, arg) => {
       assertSender(event);
-      const registry = validateRegistry(await api.saveRegistry(validateRegistry(arg)));
+      let rawRegistry: unknown = arg;
+      let options: SaveRegistryOptions | undefined;
+      if (arg && typeof arg === 'object' && !Array.isArray(arg) && 'registry' in arg && !('version' in arg)) {
+        const wrapped = arg as { registry?: unknown; options?: unknown };
+        if (Object.keys(wrapped).some((k) => k !== 'registry' && k !== 'options')) throw new TypeError('INVALID_REGISTRY');
+        rawRegistry = wrapped.registry;
+        if (wrapped.options !== undefined) {
+          if (!wrapped.options || typeof wrapped.options !== 'object' || Array.isArray(wrapped.options) ||
+              Object.keys(wrapped.options).some((k) => k !== 'forceLocal') ||
+              ((wrapped.options as { forceLocal?: unknown }).forceLocal !== undefined && typeof (wrapped.options as { forceLocal?: unknown }).forceLocal !== 'boolean')) {
+            throw new TypeError('INVALID_SAVE_REGISTRY_OPTIONS');
+          }
+          options = wrapped.options as SaveRegistryOptions;
+        }
+      }
+      const registry = validateRegistry(await api.saveRegistry(validateRegistry(rawRegistry), options));
       for (const window of BrowserWindow.getAllWindows()) {
         if (!window.isDestroyed()) window.webContents.send(CHANNELS.registryChanged, registry);
       }
@@ -82,6 +115,44 @@ export function registerMonitorIpc(api: MonitorApi, windows?: { openGpuWindow: (
       }
       return preferences;
     }],
+    [CHANNELS.metricSeries, async (event, arg) => {
+      assertSender(event);
+      const query = validateMetricSeriesQuery(arg);
+      if (!api.getMetricSeries) return { taskId: query.taskId, series: {} };
+      return api.getMetricSeries(query);
+    }],
+    [CHANNELS.gpuSeries, async (event, arg) => {
+      assertSender(event);
+      const query = validateGpuSeriesQuery(arg);
+      if (!api.getGpuSeries) return { hostId: query.hostId, gpu: [], host: [] };
+      return api.getGpuSeries(query);
+    }],
+    [CHANNELS.exportLogs, async (event, arg) => {
+      assertSender(event);
+      const query = validateExportLogsQuery(arg);
+      if (!api.exportLogs) return { exportedCount: 0, path: null };
+      return api.exportLogs(query);
+    }],
+    [CHANNELS.discoverProcesses, async (event, arg) => {
+      assertSender(event);
+      if (typeof arg !== 'string' || !arg || arg.length > 256) throw new TypeError('INVALID_HOST_ID');
+      if (!api.discoverProcesses) return [];
+      return validateDiscoveredProcesses(await api.discoverProcesses(arg));
+    }],
+    [CHANNELS.controlTask, async (event, arg) => {
+      assertSender(event);
+      const request = validateControlTaskRequest(arg);
+      if (!api.controlTask) {
+        return { ok: false, taskId: request.taskId, action: request.action, errorCode: 'JOB_CONTROL_UNAVAILABLE', message: 'Job control not available' };
+      }
+      return api.controlTask(request);
+    }],
+    [CHANNELS.testWebhook, async (event, arg) => {
+      assertSender(event);
+      const webhook = validateWebhookChannelConfig(arg, 'INVALID_WEBHOOK');
+      if (!api.testWebhook) return { ok: false, statusCode: null, error: 'WEBHOOK_UNAVAILABLE' };
+      return api.testWebhook(webhook);
+    }],
     [CHANNELS.openGpu, async (event, arg) => {
       assertSender(event);
       if (arg !== undefined && (typeof arg !== 'string' || !arg || arg.length > 256)) throw new TypeError('INVALID_HOST_ID');
@@ -92,6 +163,45 @@ export function registerMonitorIpc(api: MonitorApi, windows?: { openGpuWindow: (
     [CHANNELS.copy, async (event, arg) => { assertSender(event); if (!arg || typeof arg !== 'object' || Array.isArray(arg) || Object.keys(arg).some((k) => !['taskId', 'sourceId'].includes(k))) throw new TypeError('INVALID_COPY_REQUEST'); const req = arg as { taskId?: unknown; sourceId?: unknown }; if (typeof req.taskId !== 'string' || (req.sourceId !== undefined && typeof req.sourceId !== 'string')) throw new TypeError('INVALID_COPY_REQUEST'); const reg = validateRegistry(await api.getRegistry()); const task = reg.tasks.find((x) => x.taskId === req.taskId && x.enabled); const source = task?.sources.find((x) => req.sourceId === undefined || x.sourceId === req.sourceId); if (!source) throw new Error('PATH_NOT_REGISTERED'); clipboard.writeText(source.path); }],
     [CHANNELS.discoverSsh, async (event) => { assertSender(event); return validateDiscoveredSshHosts(await discoverSshHosts()); }],
     [CHANNELS.discoverWsl, async (event) => { assertSender(event); return validateDiscoveredWslDistros(await discoverWslDistros()); }],
+    [CHANNELS.openSshTerminal, async (event, arg) => {
+      assertSender(event);
+      if (!arg || typeof arg !== 'object' || Array.isArray(arg) || Object.keys(arg).some((k) => !['hostId', 'command'].includes(k))) {
+        throw new TypeError('INVALID_TERMINAL_REQUEST');
+      }
+      const req = arg as OpenSshTerminalRequest;
+      if (typeof req.hostId !== 'string' || !req.hostId || req.hostId.length > 256 ||
+          (req.command !== undefined && (typeof req.command !== 'string' || req.command.length > 1024 || /[\u0000-\u001f\u007f]/.test(req.command)))) {
+        throw new TypeError('INVALID_TERMINAL_REQUEST');
+      }
+      const reg = validateRegistry(await api.getRegistry());
+      const host = reg.hosts.find((h) => h.hostId === req.hostId);
+      if (!host) throw new Error('HOST_NOT_REGISTERED');
+      return openLocalSshTerminal(host, req.command);
+    }],
+    [CHANNELS.copyCommand, async (event, arg) => {
+      assertSender(event);
+      if (!arg || typeof arg !== 'object' || Array.isArray(arg) || Object.keys(arg).some((k) => !['kind', 'hostId', 'taskId', 'sourceId'].includes(k))) {
+        throw new TypeError('INVALID_COPY_COMMAND_REQUEST');
+      }
+      const req = arg as CopyCommandRequest;
+      if (!['ssh', 'tmux_attach', 'tail_log'].includes(req.kind) || typeof req.hostId !== 'string' || !req.hostId ||
+          (req.taskId !== undefined && typeof req.taskId !== 'string') ||
+          (req.sourceId !== undefined && typeof req.sourceId !== 'string')) {
+        throw new TypeError('INVALID_COPY_COMMAND_REQUEST');
+      }
+      const reg = validateRegistry(await api.getRegistry());
+      const host = reg.hosts.find((h) => h.hostId === req.hostId);
+      if (!host) throw new Error('HOST_NOT_REGISTERED');
+      const task = req.taskId ? reg.tasks.find((t) => t.taskId === req.taskId) : undefined;
+      let sessionName: string | null = null;
+      if (req.kind === 'tmux_attach' && req.taskId) {
+        const snap = await api.getSnapshot();
+        sessionName = snap.tasks.find((t) => t.taskId === req.taskId)?.autoStart?.sessionName ?? null;
+      }
+      const cmd = buildHelperCommand(req.kind, host, task, req.sourceId, sessionName);
+      clipboard.writeText(cmd);
+      return cmd;
+    }],
   ];
   for (const [channel, handler] of handlers) ipcMain.handle(channel, handler);
   return () => { for (const [channel] of handlers) ipcMain.removeHandler(channel); for (const subscription of subscriptions.values()) subscription.dispose(); subscriptions.clear(); activeSessions.clear(); lifecycleHooks.clear(); };

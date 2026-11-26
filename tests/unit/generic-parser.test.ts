@@ -41,15 +41,15 @@ describe('generic training output', () => {
 describe('algorithm names and log formats', () => {
   it('keeps custom names independent from the explicitly selected format', () => {
     expect(taskParser({ algorithm: 'Flow Matching', logFormat: 'generic' })).toBe('generic');
-    expect(taskParser({ algorithm: '任意新算法', logFormat: 'flow' })).toBe('flow');
+    expect(taskParser({ algorithm: '任意新算法', logFormat: 'flow' })).toBe('legacy_flow');
     expect(taskParser({ algorithm: '', logFormat: 'generic' })).toBe('generic');
-    expect(taskParser({ algorithm: 'PPO', logFormat: 'raw' })).toBe('unknown');
+    expect(taskParser({ algorithm: 'PPO', logFormat: 'raw' })).toBe('raw');
     expect(taskAlgorithmName({ algorithm: '自定义算法 / Transformer', logFormat: 'generic' })).toBe('自定义算法 / Transformer');
   });
   it('preserves legacy parser selection without forcing registry migration', () => {
-    expect(taskLogFormat({ algorithm: 'flow' })).toBe('flow');
-    expect(taskLogFormat({ algorithm: 'score' })).toBe('score');
-    expect(taskLogFormat({ algorithm: 'reflow' })).toBe('reflow');
+    expect(taskLogFormat({ algorithm: 'flow' })).toBe('legacy_flow');
+    expect(taskLogFormat({ algorithm: 'score' })).toBe('legacy_score');
+    expect(taskLogFormat({ algorithm: 'reflow' })).toBe('legacy_reflow');
     expect(taskParser({ algorithm: 'unknown' })).toBe('unknown');
     expect(taskAlgorithmName({ algorithm: 'flow' })).toBe('Flow Matching');
     expect(taskParser({ algorithm: 'Transformer' })).toBe('generic');

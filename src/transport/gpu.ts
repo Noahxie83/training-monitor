@@ -1,4 +1,4 @@
-import type { ProcessKey, ResourceMetric, TaskRegistration } from '../shared/contracts';
+import type { GpuActiveProcess, GpuDeviceDetail, ProcessKey, ResourceMetric, TaskRegistration } from '../shared/contracts';
 import type { HostGpuObservation, ProcessGpuObservation, TaskProcessObservation } from './types';
 import { areProcessKeysEqual, isRegisteredProcessEntry, processEntry, isStrongProcessKey } from '../domain/identity';
 
@@ -16,7 +16,9 @@ export function isValidGpuUuid(uuid: string | undefined): uuid is string {
 }
 
 export function isRegisteredGpuProcess(task: TaskRegistration, process: TaskProcessObservation): boolean {
-  return process.evidenceComplete && !!processEntry(process) && isRegisteredProcessEntry(task, process) &&
+  if (!process.evidenceComplete) return false;
+  if (process.treeMember) return true;
+  return !!processEntry(process) && isRegisteredProcessEntry(task, process) &&
     (process.roleEvidence === 'exact_script_entry' || process.roleEvidence === 'exact_entry_and_direct_writer_fd');
 }
 
@@ -46,7 +48,7 @@ export function gpuDeviceMap(csv: string): { uuid: string; index: number }[] {
   return result;
 }
 
-/** Only samples of this task's stable process instances can become process metrics. */
+/** Only samples of this task's stable process instances (or verified tree members) can become process metrics. */
 export function projectProcessGpu(value: unknown, allowedKeys: ProcessKey[], devices: { index: number; uuid: string }[], receivedAt: string): ProcessGpuObservation {
   const unavailable = (code: string | null): ProcessGpuObservation => ({ observedAt: null, state: 'unavailable', errorCode: code, metrics: [], processKeys: [] });
   if (!value || typeof value !== 'object' || Array.isArray(value)) return unavailable('PROCESS_GPU_UNAVAILABLE');
@@ -75,9 +77,66 @@ export function projectProcessGpu(value: unknown, allowedKeys: ProcessKey[], dev
   return { observedAt: receivedAt, state: 'available', errorCode: null, processKeys, metrics };
 }
 
-/** Parse the fixed, process-free nvidia-smi CSV query shared by SSH, local, and Windows. */
-export function projectGpuCsv(csv: string, observedAt: string): HostGpuObservation {
-  if (typeof csv !== 'string' || csv.length > 16_384 || !Number.isFinite(Date.parse(observedAt))) {
+function finiteOrNull(value: unknown, min = 0, max = Number.POSITIVE_INFINITY): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max ? value : null;
+}
+
+function parseActiveProcesses(raw: unknown): GpuActiveProcess[] {
+  if (!Array.isArray(raw)) return [];
+  const result: GpuActiveProcess[] = [];
+  for (const item of raw.slice(0, 64)) {
+    if (!item || typeof item !== 'object') continue;
+    const row = item as Record<string, unknown>;
+    if (typeof row.pid !== 'number' || !Number.isSafeInteger(row.pid) || row.pid <= 0) continue;
+    const command = typeof row.command === 'string' ? row.command.slice(0, 512) : '';
+    const memoryMiB = finiteOrNull(row.memoryMiB, 0, 10_000_000) ?? 0;
+    const proc: GpuActiveProcess = {
+      pid: row.pid,
+      command,
+      memoryMiB,
+      ...(typeof row.user === 'string' && row.user ? { user: row.user.slice(0, 128) } : {}),
+      ...(finiteOrNull(row.smUtilPct, 0, 100) !== null ? { smUtilPct: finiteOrNull(row.smUtilPct, 0, 100) } : {}),
+    };
+    result.push(proc);
+  }
+  return result;
+}
+
+export function projectGpuDevices(rawDevices: unknown): GpuDeviceDetail[] {
+  if (!Array.isArray(rawDevices)) return [];
+  const result: GpuDeviceDetail[] = [];
+  for (const item of rawDevices.slice(0, 64)) {
+    if (!item || typeof item !== 'object') continue;
+    const row = item as Record<string, unknown>;
+    const index = typeof row.index === 'number' && Number.isSafeInteger(row.index) && row.index >= 0 ? row.index : null;
+    if (index === null) continue;
+    const deviceId = typeof row.deviceId === 'string' && row.deviceId ? row.deviceId : `GPU ${index}`;
+    const uuid = typeof row.uuid === 'string' ? row.uuid : '';
+    const name = typeof row.name === 'string' && row.name ? row.name.slice(0, 256) : `GPU ${index}`;
+    result.push({
+      index,
+      deviceId,
+      uuid,
+      name,
+      utilizationPct: finiteOrNull(row.utilizationPct, 0, 100),
+      memoryUsedMiB: finiteOrNull(row.memoryUsedMiB, 0, 10_000_000),
+      memoryTotalMiB: finiteOrNull(row.memoryTotalMiB, 0, 10_000_000),
+      temperatureC: finiteOrNull(row.temperatureC, 0, 200),
+      powerDrawW: finiteOrNull(row.powerDrawW, 0, 5000),
+      powerLimitW: finiteOrNull(row.powerLimitW, 0, 5000),
+      fanSpeedPct: finiteOrNull(row.fanSpeedPct, 0, 100),
+      pciBusId: typeof row.pciBusId === 'string' && row.pciBusId ? row.pciBusId.slice(0, 64) : null,
+      computeMode: typeof row.computeMode === 'string' && row.computeMode ? row.computeMode.slice(0, 64) : null,
+      eccErrors: finiteOrNull(row.eccErrors, 0, Number.MAX_SAFE_INTEGER),
+      activeProcesses: parseActiveProcesses(row.activeProcesses),
+    });
+  }
+  return result;
+}
+
+/** Parse the nvidia-smi CSV query (plus optional rich device details from readonly_probe.py). */
+export function projectGpuCsv(csv: string, observedAt: string, rawDevices?: unknown): HostGpuObservation {
+  if (typeof csv !== 'string' || csv.length > 32_768 || !Number.isFinite(Date.parse(observedAt))) {
     return { observedAt: null, state: 'unavailable', acceleratorAvailability: 'unavailable', errorCode: 'GPU_RESPONSE_INVALID', metrics: [] };
   }
 
@@ -112,7 +171,15 @@ export function projectGpuCsv(csv: string, observedAt: string): HostGpuObservati
     add('gpu_memory_total', 'bytes', totalMiB === null ? null : totalMiB * MEBIBYTE);
   }
 
+  const devices = projectGpuDevices(rawDevices);
   return metrics.length > 0
-    ? { observedAt, state: 'available', acceleratorAvailability: 'available', errorCode: null, metrics }
+    ? {
+        observedAt,
+        state: 'available',
+        acceleratorAvailability: 'available',
+        errorCode: null,
+        metrics,
+        ...(devices.length > 0 ? { devices } : {}),
+      }
     : { observedAt: null, state: 'unavailable', acceleratorAvailability: 'unavailable', errorCode: 'GPU_DATA_UNAVAILABLE', metrics: [] };
 }

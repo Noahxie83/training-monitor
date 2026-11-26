@@ -211,9 +211,11 @@ class ServerAgentTests(unittest.TestCase):
             )
         command = run.call_args.args[0]
         self.assertFalse(run.call_args.kwargs["shell"])
+        expected_socket = os.path.join(agent._runtime_socket_dir(1000), "tmux.sock")
         self.assertEqual(command[:5], [
-            "/usr/bin/tmux", "-S", os.path.join("/state", "tmux.sock"), "-f", "/dev/null",
+            "/usr/bin/tmux", "-S", expected_socket, "-f", "/dev/null",
         ])
+        self.assertNotEqual(command[2], os.path.join("/state", "tmux.sock"))
         self.assertIn("--", command)
         self.assertEqual(command[command.index("--") + 1:], [
             agent._python_executable(),

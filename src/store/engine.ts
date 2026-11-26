@@ -1,19 +1,48 @@
 import { DatabaseSync } from 'node:sqlite';
-import { statfs, stat } from 'node:fs/promises';
+import { statfs, stat, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import type { CursorState, HostSnapshot, LogEvent, LogSourceSnapshot, TaskRegistration, TaskSnapshot } from '../shared/contracts';
-import type { LogPage, LogQuery, LogSearchPage, LogSearchRequest, MonitorSnapshot } from '../shared/api';
+import type {
+  CursorState,
+  GpuSeriesPoint,
+  HostSeriesPoint,
+  HostSnapshot,
+  LogEvent,
+  LogSourceSnapshot,
+  MetricSeriesPoint,
+  MetricSeriesResponse,
+  TaskRegistration,
+  TaskSnapshot,
+} from '../shared/contracts';
+import type {
+  ExportLogsQuery,
+  ExportLogsResult,
+  GpuSeriesQuery,
+  GpuSeriesResponse,
+  LogPage,
+  LogQuery,
+  LogSearchPage,
+  LogSearchRequest,
+  MetricSeriesQuery,
+  MonitorSnapshot,
+} from '../shared/api';
 import type { HostObservation, TaskObservation } from '../transport/types';
 import { createEmptyProgress } from '../domain/progress';
-import { PAGE_EVENT_LIMIT, PAGE_TEXT_BUDGET_BYTES, EVENT_PREVIEW_BYTES } from '../shared/budgets';
+import { PAGE_EVENT_LIMIT, PAGE_TEXT_BUDGET_BYTES } from '../shared/budgets';
+import { isSafeRegexPattern } from '../shared/validate';
 import { prepareArchiveRead, prepareRead } from '../logs/bytes';
 import { nextCursorAnchors } from '../logs/continuity';
 import { initialCursor, decideGenerationTransition } from '../logs/generation';
 import type { ArchiveReadEvidence, GapState, GenerationDecision, PreparedRead, ReadReply, SourceObservation } from '../logs/types';
 import { initializeSchema } from './schema';
-import type { CommitReadResult, ReconcileRequest, StoreDiagnostics } from './protocol';
+import type {
+  CommitReadResult,
+  GpuSampleRow,
+  HostSampleRow,
+  MetricSampleRow,
+  ReconcileRequest,
+  StoreDiagnostics,
+} from './protocol';
 
 const MiB = 1024n * 1024n;
 const GiB = 1024n * MiB;
@@ -21,17 +50,16 @@ const RAW_GLOBAL_LIMIT = GiB;
 const RAW_TASK_LIMIT = 256n * MiB;
 const TARGET_PERCENT = 80n;
 const MAX_CACHE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const FINE_SERIES_AGE_MS = 24 * 60 * 60 * 1000;
 const MIN_FREE_BYTES = 128n * MiB;
-// Reserve a conservative SQLite/WAL multiplier plus fixed per-batch metadata
-// overhead. This is admission accounting, not a promise of physical write size.
 const BATCH_STORAGE_MULTIPLIER = 4n;
 const BATCH_STORAGE_FIXED = 64n * 1024n;
 const SEARCH_BATCH = 128;
 const SEARCH_RESULT_LIMIT = 500;
-const MAX_PREVIEW_BYTES = 64 * 1024;
 const CLEANUP_ROW_LIMIT = 64;
 const CLEANUP_BYTE_LIMIT = 4n * MiB;
 const EPOCH = 0;
+const DEFAULT_MAX_SERIES_POINTS = 240;
 
 type EngineHooks = {
   beforeCursorWrite?: () => void;
@@ -46,11 +74,33 @@ type EngineHooks = {
 };
 type SourceRow = { source_id: string; task_id: string; recovery_json: string | null };
 type CursorRow = { cursor_json: string };
-type EventRow = { seq: number; event_id: string; source_id: string; task_id: string; generation: string; start_offset: string | null; end_offset: string | null; ingested_at: string; text: string | null; event_json: string };
+type EventRow = {
+  seq: number;
+  event_id: string;
+  source_id: string;
+  task_id: string;
+  generation: string;
+  start_offset: string | null;
+  end_offset: string | null;
+  ingested_at: string;
+  text: string | null;
+  raw_ansi: string | null;
+  event_json: string;
+};
 type RawRow = { chunk_id: number; source_id: string; generation: string; start_offset: string; end_offset: string; bytes?: Uint8Array; ingested_at: string };
 type SizedRawRow = RawRow & { byte_length: number };
 type SupportRow = { support_id: number; start_offset: string; end_offset: string; start_key: string; end_key: string; ingested_at: string };
-type SearchToken = { v: 1; sourceIds: string[]; literal: string; highWater: number; beforeSeq: number; epochs: Record<string, number> };
+type SearchToken = {
+  v: 1;
+  sourceIds: string[];
+  literal: string;
+  mode: 'literal' | 'regex';
+  caseSensitive: boolean;
+  level: string | null;
+  highWater: number;
+  beforeSeq: number;
+  epochs: Record<string, number>;
+};
 type PageToken = { v: 1; sourceId: string; highWater: number; beforeSeq: number; epoch: number };
 type PersistedSourceState = Pick<LogSourceSnapshot, 'observedAt' | 'freshness' | 'state' | 'errorCode'>;
 
@@ -81,7 +131,6 @@ function decodeToken<T>(value: string): T {
 }
 
 function textBytes(event: LogEvent): number { return Buffer.byteLength(event.text ?? '', 'utf8'); }
-function cloneEvent(value: LogEvent): LogEvent { return JSON.parse(JSON.stringify(value)) as LogEvent; }
 
 function offsetKey(value: string): string {
   const digits = BigInt(value).toString();
@@ -92,31 +141,109 @@ function emptyParserState(cursor: CursorState): CursorState['parserState'] {
   return { ...cursor.parserState, recordStartOffset: cursor.committedOffset, utf8CarryBase64: '', pendingCR: false, recordInvalidUtf8: false, boundedPreview: '', displayTruncated: true, prefixIncomplete: true };
 }
 
-function rangeCovered(raw: RawRow[], startOffset: string, endOffset: string, cutoffMs: number): boolean {
-  const start = BigInt(startOffset); const end = BigInt(endOffset);
-  if (end <= start) return true;
-  const rows = raw.filter((chunk) => isoMillis(chunk.ingested_at) > cutoffMs && BigInt(chunk.end_offset) > start && BigInt(chunk.start_offset) < end)
-    .sort((a, b) => BigInt(a.start_offset) < BigInt(b.start_offset) ? -1 : 1);
-  let position = start;
-  for (const chunk of rows) {
-    const chunkStart = BigInt(chunk.start_offset); const chunkEnd = BigInt(chunk.end_offset);
-    if (chunkStart > position) return false;
-    if (chunkEnd > position) position = chunkEnd;
-    if (position >= end) return true;
-  }
-  return false;
+/** Serialize LogEvent metadata WITHOUT duplicating `text` or `rawAnsi` into `event_json`. */
+function encodeEventMeta(event: LogEvent): string {
+  const { text: _text, rawAnsi: _rawAnsi, ...meta } = event;
+  return JSON.stringify(meta);
 }
 
-function eventFromRow(row: EventRow): LogEvent { return JSON.parse(row.event_json) as LogEvent; }
+function eventFromRow(row: EventRow): LogEvent {
+  const meta = JSON.parse(row.event_json) as Partial<LogEvent>;
+  return {
+    version: 1,
+    eventId: meta.eventId ?? row.event_id,
+    taskId: meta.taskId ?? row.task_id,
+    sourceId: meta.sourceId ?? row.source_id,
+    generation: meta.generation ?? row.generation,
+    kind: meta.kind ?? 'line',
+    startOffset: meta.startOffset !== undefined ? meta.startOffset : row.start_offset,
+    endOffset: meta.endOffset !== undefined ? meta.endOffset : row.end_offset,
+    ingestedAt: meta.ingestedAt ?? row.ingested_at,
+    text: row.text,
+    ...(row.raw_ansi ? { rawAnsi: row.raw_ansi } : {}),
+    reason: meta.reason ?? null,
+    displayTruncated: meta.displayTruncated ?? false,
+    recordComplete: meta.recordComplete ?? null,
+    prefixIncomplete: meta.prefixIncomplete ?? null,
+    runId: meta.runId ?? null,
+    bindingId: meta.bindingId ?? null,
+  };
+}
+
+const LEVEL_PATTERNS: Record<string, RegExp> = {
+  error: /\b(?:ERROR|CRITICAL|FATAL|EXCEPTION|TRACEBACK|OOM|OUT OF MEMORY)\b/i,
+  warn: /\b(?:WARN|WARNING)\b/i,
+  info: /\bINFO\b/i,
+  debug: /\bDEBUG\b/i,
+};
+
+function matchesLogLevel(text: string, level: string | null | undefined): boolean {
+  if (!level || level === 'all') return true;
+  const re = LEVEL_PATTERNS[level];
+  return re ? re.test(text) : true;
+}
+
+/** Largest-Triangle-Three-Buckets downsampling preserving visual extrema and endpoints. */
+export function downsampleLttb<T>(
+  points: T[],
+  maxPoints: number,
+  xOf: (point: T) => number,
+  yOf: (point: T) => number,
+): T[] {
+  if (maxPoints < 3 || points.length <= maxPoints) return points;
+  const sampled: T[] = [points[0]!];
+  const bucketSize = (points.length - 2) / (maxPoints - 2);
+  let a = 0;
+  for (let i = 0; i < maxPoints - 2; i++) {
+    const avgRangeStart = Math.floor((i + 1) * bucketSize) + 1;
+    const avgRangeEnd = Math.min(Math.floor((i + 2) * bucketSize) + 1, points.length);
+    let avgX = 0;
+    let avgY = 0;
+    const avgLen = Math.max(1, avgRangeEnd - avgRangeStart);
+    for (let j = avgRangeStart; j < avgRangeEnd; j++) {
+      avgX += xOf(points[j]!);
+      avgY += yOf(points[j]!);
+    }
+    avgX /= avgLen;
+    avgY /= avgLen;
+
+    const rangeOffs = Math.floor(i * bucketSize) + 1;
+    const rangeTo = Math.min(Math.floor((i + 1) * bucketSize) + 1, points.length - 1);
+    const pointAX = xOf(points[a]!);
+    const pointAY = yOf(points[a]!);
+    let maxArea = -1;
+    let nextA = rangeOffs;
+    for (let j = rangeOffs; j < rangeTo; j++) {
+      const area = Math.abs(
+        (pointAX - avgX) * (yOf(points[j]!) - pointAY) -
+        (pointAX - xOf(points[j]!)) * (avgY - pointAY),
+      ) * 0.5;
+      if (area > maxArea) {
+        maxArea = area;
+        nextA = j;
+      }
+    }
+    sampled.push(points[nextA]!);
+    a = nextA;
+  }
+  sampled.push(points[points.length - 1]!);
+  return sampled;
+}
 
 export class StoreEngine {
   private readonly db: DatabaseSync;
+  private readonly readDb: DatabaseSync;
+  private readonly separateReadDb: boolean;
+  private readonly stmtFindEvent: ReturnType<DatabaseSync['prepare']>;
+  private readonly stmtInsertEvent: ReturnType<DatabaseSync['prepare']>;
+  private readonly stmtEnsureEpoch: ReturnType<DatabaseSync['prepare']>;
   private readonly databasePath: string;
   private readonly hooks: EngineHooks;
   private readonly now: () => number;
   private readonly canceled = new Set<string>();
   private readonly searchRequests = new Set<string>();
   private readonly freshObservationTasks = new Set<string>();
+  private readonly freshHostSnapshots = new Set<string>();
   private closed = false;
 
   constructor(databasePath: string, now: () => number, hooks: EngineHooks = {}) {
@@ -125,40 +252,57 @@ export class StoreEngine {
     this.hooks = hooks;
     this.db = new DatabaseSync(databasePath);
     initializeSchema(this.db);
+    this.stmtFindEvent = this.db.prepare('SELECT seq, text, raw_ansi, event_json FROM log_events WHERE event_id = ?');
+    this.stmtInsertEvent = this.db.prepare(
+      'INSERT INTO log_events(event_id,source_id,task_id,generation,start_offset,end_offset,ingested_at,text,raw_ansi,event_json,start_key,end_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+    );
+    this.stmtEnsureEpoch = this.db.prepare('INSERT INTO source_epochs(source_id,content_epoch) VALUES(?,0) ON CONFLICT(source_id) DO NOTHING');
+    if (databasePath !== ':memory:') {
+      this.readDb = new DatabaseSync(databasePath, { readOnly: true });
+      this.readDb.exec('PRAGMA busy_timeout=5000; PRAGMA query_only=ON;');
+      this.separateReadDb = true;
+    } else {
+      this.readDb = this.db;
+      this.separateReadDb = false;
+    }
     if (hooks.workProbe) {
       this.db.function('t3_support_probe', () => { hooks.workProbe!('support'); return 1; });
       this.db.function('t3_cleanup_probe', () => { hooks.workProbe!('cleanup'); return 1; });
+      if (this.separateReadDb) {
+        this.readDb.function('t3_support_probe', () => { hooks.workProbe!('support'); return 1; });
+        this.readDb.function('t3_cleanup_probe', () => { hooks.workProbe!('cleanup'); return 1; });
+      }
     }
   }
 
   private assertOpen(): void { if (this.closed) throw new Error('STORE_CLOSED'); }
-  runtimeInfo(): { sqlite: string } { return { sqlite: String((this.db.prepare('SELECT sqlite_version() AS version').get() as { version: string }).version) }; }
+  runtimeInfo(): { sqlite: string } { return { sqlite: String((this.readDb.prepare('SELECT sqlite_version() AS version').get() as { version: string }).version) }; }
   private begin(): void { this.assertOpen(); this.db.exec('BEGIN IMMEDIATE'); }
   private commit(): void { this.db.exec('COMMIT'); }
   private rollback(): void { try { this.db.exec('ROLLBACK'); } catch { /* A failed BEGIN has no transaction to roll back. */ } }
 
-  private cursor(sourceId: string): CursorState | null {
-    const row = this.db.prepare('SELECT cursor_json FROM source_cursors WHERE source_id = ?').get(sourceId) as CursorRow | undefined;
+  private cursor(sourceId: string, conn: DatabaseSync = this.db): CursorState | null {
+    const row = conn.prepare('SELECT cursor_json FROM source_cursors WHERE source_id = ?').get(sourceId) as CursorRow | undefined;
     return row ? JSON.parse(row.cursor_json) as CursorState : null;
   }
 
-  private source(sourceId: string): SourceRow | null {
-    return (this.db.prepare('SELECT source_id, task_id, recovery_json FROM source_registry WHERE source_id = ?').get(sourceId) as SourceRow | undefined) ?? null;
+  private source(sourceId: string, conn: DatabaseSync = this.db): SourceRow | null {
+    return (conn.prepare('SELECT source_id, task_id, recovery_json FROM source_registry WHERE source_id = ?').get(sourceId) as SourceRow | undefined) ?? null;
   }
 
-  private epoch(sourceId: string): number {
-    const row = this.db.prepare('SELECT content_epoch FROM source_epochs WHERE source_id = ?').get(sourceId) as { content_epoch: number } | undefined;
+  private epoch(sourceId: string, conn: DatabaseSync = this.readDb): number {
+    const row = conn.prepare('SELECT content_epoch FROM source_epochs WHERE source_id = ?').get(sourceId) as { content_epoch: number } | undefined;
     return row?.content_epoch ?? EPOCH;
   }
 
   private markContentChange(sourceId: string, seq: number): void {
     this.db.prepare('INSERT INTO source_epochs(source_id,content_epoch) VALUES(?,0) ON CONFLICT(source_id) DO NOTHING').run(sourceId);
     this.db.prepare('UPDATE source_epochs SET content_epoch=content_epoch+1 WHERE source_id=?').run(sourceId);
-    this.db.prepare('INSERT OR REPLACE INTO content_changes(source_id,content_epoch,event_seq) VALUES(?,?,?)').run(sourceId, this.epoch(sourceId), seq);
+    this.db.prepare('INSERT OR REPLACE INTO content_changes(source_id,content_epoch,event_seq) VALUES(?,?,?)').run(sourceId, this.epoch(sourceId, this.db), seq);
   }
 
   private changedInCapturedRange(sourceId: string, epoch: number, highWater: number): boolean {
-    return Boolean(this.db.prepare('SELECT 1 AS changed FROM content_changes WHERE source_id=? AND content_epoch>? AND event_seq<=? LIMIT 1').get(sourceId, epoch, highWater));
+    return Boolean(this.readDb.prepare('SELECT 1 AS changed FROM content_changes WHERE source_id=? AND content_epoch>? AND event_seq<=? LIMIT 1').get(sourceId, epoch, highWater));
   }
 
   private setCursor(cursor: CursorState): void {
@@ -173,23 +317,47 @@ export class StoreEngine {
 
   private async diskFree(): Promise<bigint> {
     if (this.hooks.freeBytes) return this.hooks.freeBytes();
+    if (this.databasePath === ':memory:') return 10n * GiB;
     const usage = await statfs(path.dirname(this.databasePath));
     return BigInt(usage.bavail) * BigInt(usage.bsize);
   }
 
   private addEvent(event: LogEvent): void {
-    const previous = this.db.prepare('SELECT seq,event_json FROM log_events WHERE event_id = ?').get(event.eventId) as { seq: number; event_json: string } | undefined;
-    const encoded = JSON.stringify(event);
+    const previous = this.stmtFindEvent.get(event.eventId) as {
+      seq: number; text: string | null; raw_ansi: string | null; event_json: string;
+    } | undefined;
+    const encoded = encodeEventMeta(event);
+    const rawAnsi = event.rawAnsi ?? null;
     if (!previous) {
-      this.db.prepare('INSERT INTO log_events(event_id,source_id,task_id,generation,start_offset,end_offset,ingested_at,text,event_json,start_key,end_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
-        .run(event.eventId, event.sourceId, event.taskId, event.generation, event.startOffset, event.endOffset, event.ingestedAt, event.text, encoded, event.startOffset === null ? null : offsetKey(event.startOffset), event.endOffset === null ? null : offsetKey(event.endOffset));
-      this.db.prepare('INSERT INTO source_epochs(source_id,content_epoch) VALUES(?,0) ON CONFLICT(source_id) DO NOTHING').run(event.sourceId);
+      this.stmtInsertEvent.run(
+        event.eventId, event.sourceId, event.taskId, event.generation,
+        event.startOffset, event.endOffset, event.ingestedAt, event.text, rawAnsi, encoded,
+        event.startOffset === null ? null : offsetKey(event.startOffset),
+        event.endOffset === null ? null : offsetKey(event.endOffset),
+      );
+      this.stmtEnsureEpoch.run(event.sourceId);
       return;
     }
-    if (previous.event_json !== encoded) {
-      this.db.prepare('UPDATE log_events SET task_id=?,generation=?,start_offset=?,end_offset=?,ingested_at=?,text=?,event_json=?,start_key=?,end_key=? WHERE event_id=?')
-        .run(event.taskId, event.generation, event.startOffset, event.endOffset, event.ingestedAt, event.text, encoded, event.startOffset === null ? null : offsetKey(event.startOffset), event.endOffset === null ? null : offsetKey(event.endOffset), event.eventId);
-      this.markContentChange(event.sourceId, previous.seq);
+    if (previous.text !== event.text || previous.raw_ansi !== rawAnsi || previous.event_json !== encoded) {
+      let prevKind: string | undefined;
+      try { prevKind = (JSON.parse(previous.event_json) as { kind?: string }).kind; } catch { /* ignore */ }
+      const maxRow = this.db.prepare('SELECT COALESCE(MAX(seq),0) AS max_seq FROM log_events WHERE source_id=?').get(event.sourceId) as { max_seq: number };
+      const isTailInPlaceRedraw = previous.seq === maxRow.max_seq && (event.kind === 'redraw' || prevKind === 'redraw');
+
+      this.db.prepare(
+        'UPDATE log_events SET task_id=?,generation=?,start_offset=?,end_offset=?,ingested_at=?,text=?,raw_ansi=?,event_json=?,start_key=?,end_key=? WHERE event_id=?',
+      ).run(
+        event.taskId, event.generation, event.startOffset, event.endOffset, event.ingestedAt,
+        event.text, rawAnsi, encoded,
+        event.startOffset === null ? null : offsetKey(event.startOffset),
+        event.endOffset === null ? null : offsetKey(event.endOffset),
+        event.eventId,
+      );
+      // Tail CR redraws updating the active tail line in-place do NOT invalidate historical pagination cursors,
+      // eliminating the STALE_CONTINUATION storm while keeping eviction/historical edits strict.
+      if (!isTailInPlaceRedraw) {
+        this.markContentChange(event.sourceId, previous.seq);
+      }
     }
   }
 
@@ -231,7 +399,7 @@ export class StoreEngine {
       .run(sourceId, generation, mergedStart, mergedEnd, offsetKey(mergedStart), offsetKey(mergedEnd), ingestedAt);
   }
 
-  async getCursor(sourceId: string): Promise<CursorState | null> { this.assertOpen(); return this.cursor(sourceId); }
+  async getCursor(sourceId: string): Promise<CursorState | null> { this.assertOpen(); return this.cursor(sourceId, this.readDb); }
 
   async registerSource(sourceId: string, observation: SourceObservation, taskId: string): Promise<CursorState> {
     this.assertOpen();
@@ -268,6 +436,271 @@ export class StoreEngine {
         .run(task.taskId, JSON.stringify(observation));
       this.commit();
       this.freshObservationTasks.add(task.taskId);
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  async saveHostSnapshot(host: HostSnapshot): Promise<void> {
+    this.assertOpen();
+    if (!host || !host.hostId) throw new TypeError('INVALID_HOST_SNAPSHOT');
+    const updatedAt = host.observedAt ?? new Date(this.now()).toISOString();
+    this.begin();
+    try {
+      this.db.prepare(
+        'INSERT INTO host_snapshots(host_id, snapshot_json, updated_at) VALUES(?, ?, ?) ON CONFLICT(host_id) DO UPDATE SET snapshot_json=excluded.snapshot_json, updated_at=excluded.updated_at',
+      ).run(host.hostId, JSON.stringify(host), updatedAt);
+      this.commit();
+      this.freshHostSnapshots.add(host.hostId);
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  async saveMetricSamples(samples: MetricSampleRow[]): Promise<void> {
+    this.assertOpen();
+    if (!Array.isArray(samples) || samples.length === 0) return;
+    this.begin();
+    try {
+      const stmt = this.db.prepare(
+        'INSERT INTO metric_samples(task_id, run_id, observed_at, step, metric_name, value) VALUES(?, ?, ?, ?, ?, ?)',
+      );
+      for (const s of samples) {
+        if (!s.taskId || !s.metricName || !Number.isFinite(s.value)) continue;
+        stmt.run(s.taskId, s.runId ?? null, s.observedAt, s.step ?? null, s.metricName, s.value);
+      }
+      this.commit();
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  async saveGpuSamples(samples: GpuSampleRow[]): Promise<void> {
+    this.assertOpen();
+    if (!Array.isArray(samples) || samples.length === 0) return;
+    this.begin();
+    try {
+      const stmt = this.db.prepare(
+        'INSERT INTO gpu_samples(host_id, device_id, observed_at, util_pct, mem_used_mib, mem_total_mib, temp_c, power_w) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
+      );
+      for (const s of samples) {
+        if (!s.hostId || !s.deviceId) continue;
+        stmt.run(s.hostId, s.deviceId, s.observedAt, s.utilPct, s.memUsedMiB, s.memTotalMiB, s.tempC, s.powerW);
+      }
+      this.commit();
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  async saveHostSamples(samples: HostSampleRow[]): Promise<void> {
+    this.assertOpen();
+    if (!Array.isArray(samples) || samples.length === 0) return;
+    this.begin();
+    try {
+      const stmt = this.db.prepare(
+        'INSERT INTO host_samples(host_id, observed_at, cpu_pct, ram_used_mib, ram_total_mib) VALUES(?, ?, ?, ?, ?)',
+      );
+      for (const s of samples) {
+        if (!s.hostId) continue;
+        stmt.run(s.hostId, s.observedAt, s.cpuPct, s.ramUsedMiB, s.ramTotalMiB);
+      }
+      this.commit();
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+  }
+
+  async getMetricSeries(query: MetricSeriesQuery, now = new Date(this.now()).toISOString()): Promise<MetricSeriesResponse> {
+    this.assertOpen();
+    const nowMs = isoMillis(now);
+    const rangeMs = Math.max(1000, Math.min(30 * 24 * 60 * 60 * 1000, query.rangeMs || 3600_000));
+    const maxPoints = Math.max(10, Math.min(2000, query.maxPoints ?? DEFAULT_MAX_SERIES_POINTS));
+    const sinceIso = new Date(nowMs - rangeMs).toISOString();
+
+    const metricNames = query.metrics && query.metrics.length > 0
+      ? query.metrics
+      : (this.readDb.prepare('SELECT DISTINCT metric_name FROM metric_samples WHERE task_id = ? AND observed_at >= ? ORDER BY metric_name')
+          .all(query.taskId, sinceIso) as { metric_name: string }[]).map((r) => r.metric_name);
+
+    const series: Record<string, MetricSeriesPoint[]> = {};
+    const stmt = this.readDb.prepare(
+      'SELECT observed_at, step, value FROM metric_samples WHERE task_id = ? AND metric_name = ? AND observed_at >= ? ORDER BY observed_at ASC, id ASC',
+    );
+    for (const metricName of metricNames) {
+      const rows = stmt.all(query.taskId, metricName, sinceIso) as { observed_at: string; step: number | null; value: number }[];
+      const points: MetricSeriesPoint[] = rows.map((row) => ({
+        observedAt: row.observed_at,
+        step: row.step,
+        value: row.value,
+      }));
+      series[metricName] = downsampleLttb(
+        points,
+        maxPoints,
+        (pt) => Date.parse(pt.observedAt),
+        (pt) => pt.value,
+      );
+    }
+    return { taskId: query.taskId, series };
+  }
+
+  async getGpuSeries(query: GpuSeriesQuery, now = new Date(this.now()).toISOString()): Promise<GpuSeriesResponse> {
+    this.assertOpen();
+    const nowMs = isoMillis(now);
+    const rangeMs = Math.max(1000, Math.min(30 * 24 * 60 * 60 * 1000, query.rangeMs || 3600_000));
+    const maxPoints = Math.max(10, Math.min(2000, query.maxPoints ?? DEFAULT_MAX_SERIES_POINTS));
+    const sinceIso = new Date(nowMs - rangeMs).toISOString();
+
+    const deviceIds = query.deviceId
+      ? [query.deviceId]
+      : (this.readDb.prepare('SELECT DISTINCT device_id FROM gpu_samples WHERE host_id = ? AND observed_at >= ? ORDER BY device_id')
+          .all(query.hostId, sinceIso) as { device_id: string }[]).map((r) => r.device_id);
+
+    const gpuPoints: GpuSeriesPoint[] = [];
+    const gpuStmt = this.readDb.prepare(
+      'SELECT observed_at, util_pct, mem_used_mib, mem_total_mib, temp_c, power_w FROM gpu_samples WHERE host_id = ? AND device_id = ? AND observed_at >= ? ORDER BY observed_at ASC, id ASC',
+    );
+    for (const deviceId of deviceIds) {
+      const rows = gpuStmt.all(query.hostId, deviceId, sinceIso) as {
+        observed_at: string;
+        util_pct: number | null;
+        mem_used_mib: number | null;
+        mem_total_mib: number | null;
+        temp_c: number | null;
+        power_w: number | null;
+      }[];
+      const points: GpuSeriesPoint[] = rows.map((row) => ({
+        observedAt: row.observed_at,
+        deviceId,
+        utilPct: row.util_pct,
+        memUsedMiB: row.mem_used_mib,
+        memTotalMiB: row.mem_total_mib,
+        tempC: row.temp_c,
+        powerW: row.power_w,
+      }));
+      gpuPoints.push(
+        ...downsampleLttb(
+          points,
+          maxPoints,
+          (pt) => Date.parse(pt.observedAt),
+          (pt) => pt.utilPct ?? pt.memUsedMiB ?? 0,
+        ),
+      );
+    }
+
+    const hostRows = this.readDb.prepare(
+      'SELECT observed_at, cpu_pct, ram_used_mib, ram_total_mib FROM host_samples WHERE host_id = ? AND observed_at >= ? ORDER BY observed_at ASC, id ASC',
+    ).all(query.hostId, sinceIso) as {
+      observed_at: string;
+      cpu_pct: number | null;
+      ram_used_mib: number | null;
+      ram_total_mib: number | null;
+    }[];
+    const hostPoints: HostSeriesPoint[] = downsampleLttb(
+      hostRows.map((row) => ({
+        observedAt: row.observed_at,
+        cpuPct: row.cpu_pct,
+        ramUsedMiB: row.ram_used_mib,
+        ramTotalMiB: row.ram_total_mib,
+      })),
+      maxPoints,
+      (pt) => Date.parse(pt.observedAt),
+      (pt) => pt.cpuPct ?? 0,
+    );
+
+    return { hostId: query.hostId, gpu: gpuPoints, host: hostPoints };
+  }
+
+  async exportLogs(query: ExportLogsQuery, now = new Date(this.now()).toISOString()): Promise<ExportLogsResult> {
+    this.assertOpen();
+    const maxLines = 50_000;
+    const cutoff = isoMillis(now) - MAX_CACHE_AGE_MS;
+    if (!query.sourceIds.length) {
+      return { exportedCount: 0, path: query.destinationPath ?? null };
+    }
+    const mode = query.mode ?? 'literal';
+    const caseSensitive = query.caseSensitive ?? false;
+    const pattern = query.literal ?? '';
+    let regex: RegExp | null = null;
+    if (pattern && mode === 'regex') {
+      if (!isSafeRegexPattern(pattern)) throw new Error('UNSAFE_REGEX_PATTERN');
+      regex = new RegExp(pattern, caseSensitive ? '' : 'i');
+    }
+    const literalLower = pattern && !caseSensitive ? pattern.toLowerCase() : null;
+
+    const placeholders = query.sourceIds.map(() => '?').join(',');
+    const rows = this.readDb.prepare(
+      `SELECT seq,event_id,source_id,task_id,generation,start_offset,end_offset,ingested_at,text,raw_ansi,event_json FROM log_events WHERE source_id IN (${placeholders}) AND text IS NOT NULL ORDER BY seq ASC LIMIT ?`,
+    ).all(...query.sourceIds, maxLines * 2) as EventRow[];
+
+    const lines: string[] = [];
+    for (const row of rows) {
+      if (lines.length >= maxLines) break;
+      const event = eventFromRow(row);
+      if (event.text === null) continue;
+      if (!await this.visible(event, row.source_id, cutoff)) continue;
+      if (!matchesLogLevel(event.text, query.level)) continue;
+      if (pattern) {
+        if (regex) {
+          if (!regex.test(event.text)) continue;
+        } else if (literalLower !== null) {
+          if (!event.text.toLowerCase().includes(literalLower)) continue;
+        } else {
+          if (!event.text.includes(pattern)) continue;
+        }
+      }
+      lines.push(event.text);
+    }
+
+    const content = lines.length > 0 ? `${lines.join('\n')}\n` : '';
+    if (query.destinationPath) {
+      await mkdir(path.dirname(query.destinationPath), { recursive: true });
+      await writeFile(query.destinationPath, content, 'utf8');
+      return { exportedCount: lines.length, path: query.destinationPath };
+    }
+    return { exportedCount: lines.length, path: null };
+  }
+
+  async purgeOrphans(activeHostIds: string[], activeTaskIds: string[]): Promise<void> {
+    this.assertOpen();
+    this.begin();
+    try {
+      const hostSet = new Set(activeHostIds);
+      const taskSet = new Set(activeTaskIds);
+
+      const obsTasks = (this.db.prepare('SELECT task_id FROM observation_snapshot').all() as { task_id: string }[]).map((r) => r.task_id);
+      for (const taskId of obsTasks) {
+        if (!taskSet.has(taskId)) {
+          this.db.prepare('DELETE FROM observation_snapshot WHERE task_id=?').run(taskId);
+          this.db.prepare('DELETE FROM metric_samples WHERE task_id=?').run(taskId);
+          this.freshObservationTasks.delete(taskId);
+        }
+      }
+
+      const persistedHosts = (this.db.prepare('SELECT host_id FROM host_snapshots').all() as { host_id: string }[]).map((r) => r.host_id);
+      for (const hostId of persistedHosts) {
+        if (!hostSet.has(hostId)) {
+          this.db.prepare('DELETE FROM host_snapshots WHERE host_id=?').run(hostId);
+          this.db.prepare('DELETE FROM gpu_samples WHERE host_id=?').run(hostId);
+          this.db.prepare('DELETE FROM host_samples WHERE host_id=?').run(hostId);
+          this.freshHostSnapshots.delete(hostId);
+        }
+      }
+
+      const sampleHosts = (this.db.prepare('SELECT DISTINCT host_id FROM gpu_samples').all() as { host_id: string }[]).map((r) => r.host_id);
+      for (const hostId of sampleHosts) {
+        if (!hostSet.has(hostId)) {
+          this.db.prepare('DELETE FROM gpu_samples WHERE host_id=?').run(hostId);
+          this.db.prepare('DELETE FROM host_samples WHERE host_id=?').run(hostId);
+        }
+      }
+
+      this.commit();
     } catch (error) {
       this.rollback();
       throw error;
@@ -354,12 +787,13 @@ export class StoreEngine {
       errorCode: connected ? latest.hostObservation.errorCode : latest.hostObservation.errorCode ?? 'CACHED_OFFLINE',
       observedAt: latest.hostObservation.observedAt,
       freshness: connected ? 'fresh' : latest.hostObservation.observedAt ? 'stale' : 'unobserved',
+      ...(latest.hostObservation.system ? { system: structuredClone(latest.hostObservation.system) } : {}),
     };
   }
 
   private cachedSourceSnapshots(observation: PersistedObservation, fresh: boolean): LogSourceSnapshot[] {
     return observation.task.sources.map((registered) => {
-      const cursor = this.cursor(registered.sourceId);
+      const cursor = this.cursor(registered.sourceId, this.readDb);
       const persistedState = observation.sourceStates[registered.sourceId];
       const observedSource = observation.taskObservation.sources.find((item) => item.sourceId === registered.sourceId);
       const active = fresh && observation.hostObservation.connection === 'connected' && observation.taskObservation.freshness === 'fresh';
@@ -410,10 +844,6 @@ export class StoreEngine {
     const sourceId = input.expected.sourceId;
     const source = this.source(sourceId);
     if (!source) return { status: 'stale', events: [] };
-    // The first observation has a verified identity and size but no historical
-    // anchors. Once a bounded current-file read returns, derive its anchors from
-    // the exact returned bytes. This is first-observation evidence only; any
-    // prefix before generationStartOffset remains explicitly incomplete.
     const sameObservedIdentity = input.reply.before.fileIdentity?.dev === input.reply.after.fileIdentity?.dev &&
       input.reply.before.fileIdentity?.inode === input.reply.after.fileIdentity?.inode;
     const effectiveReply = sameObservedIdentity &&
@@ -422,21 +852,11 @@ export class StoreEngine {
       input.expected.anchors.length === 0 &&
       input.reply.after.sizeBytes !== '0'
       ? (() => {
-        const anchors = nextCursorAnchors(
-          [],
-          BigInt(input.reply.startOffset),
-          input.reply.bytes,
-        );
+        const anchors = nextCursorAnchors([], BigInt(input.reply.startOffset), input.reply.bytes);
         return {
-        ...input.reply,
-        before: {
-          ...input.reply.before,
-          anchors,
-        },
-        after: {
-          ...input.reply.after,
-          anchors,
-        },
+          ...input.reply,
+          before: { ...input.reply.before, anchors },
+          after: { ...input.reply.after, anchors },
         };
       })()
       : input.reply;
@@ -567,8 +987,6 @@ export class StoreEngine {
       if (gap) this.addEvent(gap);
       const old = this.db.prepare('SELECT cursor_json FROM source_generations WHERE source_id=? AND generation=?').get(request.sourceId, decision.oldGeneration.generation) as CursorRow | undefined;
       const oldCursor = old ? JSON.parse(old.cursor_json) as CursorState : reconciling;
-      // Historical cursor JSON keeps offsets and parser identity, never the
-      // raw-backed plaintext preview after its generation is sealed.
       const sealedOld = { ...oldCursor, state: 'reconciling' as const, parserState: emptyParserState(oldCursor) };
       this.db.prepare("UPDATE source_generations SET state='sealed',cursor_json=? WHERE source_id=? AND generation=?").run(JSON.stringify(sealedOld), request.sourceId, decision.oldGeneration.generation);
       const newCursor = decision.newCursor;
@@ -583,7 +1001,7 @@ export class StoreEngine {
 
   async getSnapshot(): Promise<MonitorSnapshot> {
     this.assertOpen();
-    const rows = this.db.prepare('SELECT snapshot_json FROM observation_snapshot ORDER BY task_id').all() as ObservationRow[];
+    const rows = this.readDb.prepare('SELECT snapshot_json FROM observation_snapshot ORDER BY task_id').all() as ObservationRow[];
     const observations = rows.flatMap((row) => {
       try {
         const parsed = JSON.parse(row.snapshot_json) as PersistedObservation;
@@ -594,14 +1012,43 @@ export class StoreEngine {
     });
     const tasks = observations.map((observation) =>
       this.cachedTaskSnapshot(observation, this.freshObservationTasks.has(observation.task.taskId)));
+    const hostMap = new Map<string, HostSnapshot>();
+
+    // First hydrate persisted 0-task (and any other) host snapshots
+    const hostRows = this.readDb.prepare('SELECT host_id, snapshot_json FROM host_snapshots ORDER BY host_id').all() as { host_id: string; snapshot_json: string }[];
+    for (const row of hostRows) {
+      try {
+        const parsed = JSON.parse(row.snapshot_json) as HostSnapshot;
+        if (!parsed || typeof parsed.hostId !== 'string') continue;
+        const fresh = this.freshHostSnapshots.has(parsed.hostId);
+        if (fresh) {
+          hostMap.set(parsed.hostId, parsed);
+        } else {
+          const wasConnected = parsed.connection === 'connected';
+          hostMap.set(parsed.hostId, {
+            ...parsed,
+            connection: wasConnected ? 'disconnected' : parsed.connection,
+            freshness: parsed.observedAt ? 'stale' : parsed.freshness,
+            scanComplete: false,
+            errorCode: wasConnected ? (parsed.errorCode ?? 'CACHED_OFFLINE') : parsed.errorCode,
+          });
+        }
+      } catch {
+        // Ignore malformed host snapshot
+      }
+    }
+
+    // Merge host snapshots derived from task observations
     const hostIds = [...new Set(observations.map((observation) => observation.task.hostId))];
-    const hosts = hostIds.flatMap((hostId) => {
+    for (const hostId of hostIds) {
       const hostObservations = observations.filter((observation) => observation.task.hostId === hostId);
-      const probe = hostObservations[0];
-      if (!probe) return [];
       const host = this.cachedHostSnapshot(hostObservations, this.freshObservationTasks);
-      return host ? [host] : [];
-    });
+      if (host && (!hostMap.has(hostId) || !this.freshHostSnapshots.has(hostId))) {
+        hostMap.set(hostId, host);
+      }
+    }
+
+    const hosts = [...hostMap.values()].sort((a, b) => a.hostId.localeCompare(b.hostId));
     const sources = observations.flatMap((observation) =>
       this.cachedSourceSnapshots(observation, this.freshObservationTasks.has(observation.task.taskId)));
     return { version: 1, demo: false, hosts, tasks, sources };
@@ -622,11 +1069,11 @@ export class StoreEngine {
 
   async getLogs(query: LogQuery, now = new Date(this.now()).toISOString()): Promise<LogPage> {
     this.assertOpen();
-    const latest = this.db.prepare('SELECT COALESCE(MAX(seq),0) AS max_seq FROM log_events').get() as { max_seq: number };
+    const latest = this.readDb.prepare('SELECT COALESCE(MAX(seq),0) AS max_seq FROM log_events').get() as { max_seq: number };
     const token = this.decodePageToken(query.sourceId, query.before, latest.max_seq);
-    const source = this.source(query.sourceId);
+    const source = this.source(query.sourceId, this.readDb);
     if (!source) return { events: [], nextBefore: null, truncatedByBudget: false };
-    const rows = this.db.prepare('SELECT seq,event_id,source_id,task_id,generation,start_offset,end_offset,ingested_at,text,event_json FROM log_events WHERE source_id=? AND seq<=? AND seq<? ORDER BY seq DESC LIMIT ?')
+    const rows = this.readDb.prepare('SELECT seq,event_id,source_id,task_id,generation,start_offset,end_offset,ingested_at,text,raw_ansi,event_json FROM log_events WHERE source_id=? AND seq<=? AND seq<? ORDER BY seq DESC LIMIT ?')
       .all(query.sourceId, token.highWater, token.beforeSeq, Math.min(query.limit, PAGE_EVENT_LIMIT) + 1) as EventRow[];
     const cutoff = isoMillis(now) - MAX_CACHE_AGE_MS;
     const events: LogEvent[] = [];
@@ -646,10 +1093,32 @@ export class StoreEngine {
 
   private searchToken(query: LogSearchRequest): SearchToken {
     const sourceIds = [...query.sourceIds].sort();
-    const latest = this.db.prepare('SELECT COALESCE(MAX(seq),0) AS max_seq FROM log_events').get() as { max_seq: number };
-    if (!query.continuation) return { v: 1, sourceIds, literal: query.literal, highWater: latest.max_seq, beforeSeq: latest.max_seq + 1, epochs: Object.fromEntries(sourceIds.map((id) => [id, this.epoch(id)])) };
+    const mode = query.mode ?? 'literal';
+    const caseSensitive = query.caseSensitive ?? true;
+    const level = query.level ?? null;
+    const latest = this.readDb.prepare('SELECT COALESCE(MAX(seq),0) AS max_seq FROM log_events').get() as { max_seq: number };
+    if (!query.continuation) {
+      return {
+        v: 1,
+        sourceIds,
+        literal: query.literal,
+        mode,
+        caseSensitive,
+        level,
+        highWater: latest.max_seq,
+        beforeSeq: latest.max_seq + 1,
+        epochs: Object.fromEntries(sourceIds.map((id) => [id, this.epoch(id)])),
+      };
+    }
     const token = decodeToken<SearchToken>(query.continuation);
-    if (token.v !== 1 || token.literal !== query.literal || JSON.stringify(token.sourceIds) !== JSON.stringify(sourceIds)) throw new Error('STALE_CONTINUATION');
+    if (
+      token.v !== 1 ||
+      token.literal !== query.literal ||
+      (token.mode ?? 'literal') !== mode ||
+      (token.caseSensitive ?? true) !== caseSensitive ||
+      (token.level ?? null) !== level ||
+      JSON.stringify(token.sourceIds) !== JSON.stringify(sourceIds)
+    ) throw new Error('STALE_CONTINUATION');
     for (const id of sourceIds) if (this.changedInCapturedRange(id, token.epochs[id] ?? -1, token.highWater)) throw new Error('STALE_CONTINUATION');
     return token;
   }
@@ -658,37 +1127,77 @@ export class StoreEngine {
     this.assertOpen();
     this.searchRequests.add(query.requestId);
     try {
-    const token = this.searchToken(query);
-    const events: LogEvent[] = [];
-    const cutoff = isoMillis(now) - MAX_CACHE_AGE_MS;
-    let used = 0; let beforeSeq = token.beforeSeq; let scannedExhausted = false; let truncated = false;
-    let lastEmittedSeq: number | null = null;
-    while (events.length < SEARCH_RESULT_LIMIT && !scannedExhausted) {
-      if (this.canceled.has(query.requestId)) { this.canceled.delete(query.requestId); return { events: [], continuation: null, scope: 'retained_local', cancelled: true }; }
-      const sourceClause = token.sourceIds.length ? `source_id IN (${token.sourceIds.map(() => '?').join(',')})` : '0';
-      const rows = this.db.prepare(`SELECT seq,event_id,source_id,task_id,generation,start_offset,end_offset,ingested_at,text,event_json FROM log_events WHERE ${sourceClause} AND seq<=? AND seq<? ORDER BY seq DESC LIMIT ?`)
-        .all(...token.sourceIds, token.highWater, beforeSeq, SEARCH_BATCH) as EventRow[];
-      if (rows.length === 0) { scannedExhausted = true; break; }
-      for (const row of rows) {
-        beforeSeq = row.seq;
-        const event = eventFromRow(row);
-        if (event.text === null || !event.text.includes(query.literal) || !await this.visible(event, row.source_id, cutoff, query.requestId)) continue;
-        const bytes = textBytes(event);
-        if (used + bytes > PAGE_TEXT_BUDGET_BYTES) { truncated = true; break; }
-        events.push(event); used += bytes;
-        lastEmittedSeq = row.seq;
-        if (events.length >= SEARCH_RESULT_LIMIT) break;
+      const token = this.searchToken(query);
+      const mode = token.mode;
+      const caseSensitive = token.caseSensitive;
+      let regex: RegExp | null = null;
+      if (mode === 'regex') {
+        if (!isSafeRegexPattern(query.literal)) throw new Error('UNSAFE_REGEX_PATTERN');
+        try {
+          regex = new RegExp(query.literal, caseSensitive ? '' : 'i');
+        } catch {
+          throw new Error('INVALID_REGEX_PATTERN');
+        }
       }
-      if (rows.length < SEARCH_BATCH && !truncated && events.length < SEARCH_RESULT_LIMIT) scannedExhausted = true;
-      if (this.hooks.yieldSearch) await this.hooks.yieldSearch();
-      else await new Promise<void>((resolve) => setImmediate(resolve));
-      if (this.canceled.has(query.requestId)) { this.canceled.delete(query.requestId); return { events: [], continuation: null, scope: 'retained_local', cancelled: true }; }
-      if (truncated || events.length >= SEARCH_RESULT_LIMIT) break;
-    }
-    if ((truncated || events.length >= SEARCH_RESULT_LIMIT) && lastEmittedSeq !== null) beforeSeq = lastEmittedSeq;
-    const continuation = !scannedExhausted && (events.length >= SEARCH_RESULT_LIMIT || truncated)
-      ? encodeToken({ ...token, beforeSeq }) : null;
-    return { events, continuation, scope: 'retained_local', cancelled: false };
+      const literalLower = !caseSensitive ? query.literal.toLowerCase() : null;
+      // FTS5 trigram accelerates any literal substring query >= 3 characters without false negatives!
+      const useFts = mode === 'literal' && query.literal.length >= 3 && query.literal.length <= 256 && !/[\u0000]/.test(query.literal);
+      const ftsQuery = useFts ? `"${query.literal.replace(/"/g, '""')}"` : null;
+
+      const events: LogEvent[] = [];
+      const cutoff = isoMillis(now) - MAX_CACHE_AGE_MS;
+      let used = 0; let beforeSeq = token.beforeSeq; let scannedExhausted = false; let truncated = false;
+      let lastEmittedSeq: number | null = null;
+
+      while (events.length < SEARCH_RESULT_LIMIT && !scannedExhausted) {
+        if (this.canceled.has(query.requestId)) { this.canceled.delete(query.requestId); return { events: [], continuation: null, scope: 'retained_local', cancelled: true }; }
+        const sourceClause = token.sourceIds.length ? `e.source_id IN (${token.sourceIds.map(() => '?').join(',')})` : '0';
+        let rows: EventRow[];
+        if (ftsQuery !== null && token.sourceIds.length > 0) {
+          rows = this.readDb.prepare(
+            `SELECT e.seq,e.event_id,e.source_id,e.task_id,e.generation,e.start_offset,e.end_offset,e.ingested_at,e.text,e.raw_ansi,e.event_json
+             FROM log_events_fts f
+             CROSS JOIN log_events e ON e.seq = f.rowid
+             WHERE log_events_fts MATCH ? AND ${sourceClause} AND e.seq<=? AND e.seq<?
+             ORDER BY e.seq DESC LIMIT ?`,
+          ).all(ftsQuery, ...token.sourceIds, token.highWater, beforeSeq, SEARCH_BATCH) as EventRow[];
+        } else {
+          rows = this.readDb.prepare(
+            `SELECT e.seq,e.event_id,e.source_id,e.task_id,e.generation,e.start_offset,e.end_offset,e.ingested_at,e.text,e.raw_ansi,e.event_json
+             FROM log_events e
+             WHERE ${sourceClause} AND e.seq<=? AND e.seq<?
+             ORDER BY e.seq DESC LIMIT ?`,
+          ).all(...token.sourceIds, token.highWater, beforeSeq, SEARCH_BATCH) as EventRow[];
+        }
+        if (rows.length === 0) { scannedExhausted = true; break; }
+        for (const row of rows) {
+          beforeSeq = row.seq;
+          const event = eventFromRow(row);
+          if (event.text === null) continue;
+          if (!matchesLogLevel(event.text, token.level)) continue;
+          const matched = regex
+            ? regex.test(event.text)
+            : literalLower !== null
+              ? event.text.toLowerCase().includes(literalLower)
+              : event.text.includes(query.literal);
+          if (!matched) continue;
+          if (!await this.visible(event, row.source_id, cutoff, query.requestId)) continue;
+          const bytes = textBytes(event);
+          if (used + bytes > PAGE_TEXT_BUDGET_BYTES) { truncated = true; break; }
+          events.push(event); used += bytes;
+          lastEmittedSeq = row.seq;
+          if (events.length >= SEARCH_RESULT_LIMIT) break;
+        }
+        if (rows.length < SEARCH_BATCH && !truncated && events.length < SEARCH_RESULT_LIMIT) scannedExhausted = true;
+        if (this.hooks.yieldSearch) await this.hooks.yieldSearch();
+        else await new Promise<void>((resolve) => setImmediate(resolve));
+        if (this.canceled.has(query.requestId)) { this.canceled.delete(query.requestId); return { events: [], continuation: null, scope: 'retained_local', cancelled: true }; }
+        if (truncated || events.length >= SEARCH_RESULT_LIMIT) break;
+      }
+      if ((truncated || events.length >= SEARCH_RESULT_LIMIT) && lastEmittedSeq !== null) beforeSeq = lastEmittedSeq;
+      const continuation = !scannedExhausted && (events.length >= SEARCH_RESULT_LIMIT || truncated)
+        ? encodeToken({ ...token, beforeSeq }) : null;
+      return { events, continuation, scope: 'retained_local', cancelled: false };
     } finally {
       this.searchRequests.delete(query.requestId);
       this.canceled.delete(query.requestId);
@@ -701,7 +1210,7 @@ export class StoreEngine {
   private async hasDiskHeadroom(pendingBytes: number, events: LogEvent[]): Promise<boolean> {
     try {
       const free = await this.diskFree();
-      const eventBytes = BigInt(events.reduce((sum, event) => sum + Buffer.byteLength(JSON.stringify(event), 'utf8'), 0));
+      const eventBytes = BigInt(events.reduce((sum, event) => sum + Buffer.byteLength(event.text ?? '', 'utf8') + Buffer.byteLength(encodeEventMeta(event), 'utf8'), 0));
       const projected = BigInt(pendingBytes) * BATCH_STORAGE_MULTIPLIER + eventBytes * 2n + BATCH_STORAGE_FIXED;
       return free >= MIN_FREE_BYTES + projected;
     } catch { return false; }
@@ -717,9 +1226,9 @@ export class StoreEngine {
   }
 
   async diagnostics(): Promise<StoreDiagnostics> {
-    const raw = this.db.prepare('SELECT COALESCE(SUM(length(bytes)),0) AS bytes FROM raw_chunks').get() as { bytes: number };
-    const dbInfo = await stat(this.databasePath).catch(() => ({ size: 0 } as Awaited<ReturnType<typeof stat>>));
-    const walInfo = await stat(`${this.databasePath}-wal`).catch(() => ({ size: 0 } as Awaited<ReturnType<typeof stat>>));
+    const raw = this.readDb.prepare('SELECT COALESCE(SUM(length(bytes)),0) AS bytes FROM raw_chunks').get() as { bytes: number };
+    const dbInfo = this.databasePath === ':memory:' ? { size: 0 } : await stat(this.databasePath).catch(() => ({ size: 0 } as Awaited<ReturnType<typeof stat>>));
+    const walInfo = this.databasePath === ':memory:' ? { size: 0 } : await stat(`${this.databasePath}-wal`).catch(() => ({ size: 0 } as Awaited<ReturnType<typeof stat>>));
     return { databaseBytes: Number(dbInfo.size), walBytes: Number(walInfo.size), rawBytes: raw.bytes, sqliteVersion: this.runtimeInfo().sqlite };
   }
 
@@ -767,9 +1276,8 @@ export class StoreEngine {
   private async isSupported(sourceId: string, generation: string, startOffset: string, endOffset: string, cutoffMs: number, requestId?: string): Promise<boolean> {
     const start = BigInt(startOffset); const end = BigInt(endOffset);
     if (end <= start) return true;
-    const cutoff = new Date(cutoffMs).toISOString();
     const probe = this.hooks.workProbe ? ' AND t3_support_probe()=1' : '';
-    const predecessor = this.db.prepare(`SELECT start_offset,end_offset,ingested_at FROM raw_support WHERE source_id=? AND generation=? AND start_key<=?${probe} ORDER BY start_key DESC LIMIT 1`);
+    const predecessor = this.readDb.prepare(`SELECT start_offset,end_offset,ingested_at FROM raw_support WHERE source_id=? AND generation=? AND start_key<=?${probe} ORDER BY start_key DESC LIMIT 1`);
     const first = predecessor.get(sourceId, generation, offsetKey(start.toString())) as { start_offset: string; end_offset: string; ingested_at: string } | undefined;
     this.hooks.workBlock?.('support');
     let position = start;
@@ -780,10 +1288,10 @@ export class StoreEngine {
     if (position >= end) return true;
     let afterKey: string | null = null;
     let checked = 0;
-    const successors = this.db.prepare(`SELECT start_offset,end_offset,start_key,ingested_at FROM raw_support
+    const successors = this.readDb.prepare(`SELECT start_offset,end_offset,start_key,ingested_at FROM raw_support
       WHERE source_id=? AND generation=? AND start_key>=? AND start_key<?${probe}
       ORDER BY start_key LIMIT 64`);
-    const successorsAfter = this.db.prepare(`SELECT start_offset,end_offset,start_key,ingested_at FROM raw_support
+    const successorsAfter = this.readDb.prepare(`SELECT start_offset,end_offset,start_key,ingested_at FROM raw_support
       WHERE source_id=? AND generation=? AND start_key>? AND start_key<?${probe}
       ORDER BY start_key LIMIT 64`);
     while (position < end) {
@@ -871,6 +1379,50 @@ export class StoreEngine {
     } else this.db.prepare('DELETE FROM cache_evictions WHERE eviction_id=?').run(queue.eviction_id);
   }
 
+  private pruneSeriesAndContentChanges(nowMs: number): void {
+    const expiredIso = new Date(nowMs - MAX_CACHE_AGE_MS).toISOString();
+    const fineCutoffIso = new Date(nowMs - FINE_SERIES_AGE_MS).toISOString();
+
+    // Rolling deletion beyond 7 days
+    this.db.prepare('DELETE FROM metric_samples WHERE observed_at <= ?').run(expiredIso);
+    this.db.prepare('DELETE FROM gpu_samples WHERE observed_at <= ?').run(expiredIso);
+    this.db.prepare('DELETE FROM host_samples WHERE observed_at <= ?').run(expiredIso);
+
+    // Downsample older-than-24h series into 5-minute buckets (keeping latest sample per bucket)
+    this.db.prepare(`
+      DELETE FROM gpu_samples
+      WHERE observed_at <= ? AND id NOT IN (
+        SELECT MAX(id) FROM gpu_samples
+        WHERE observed_at <= ?
+        GROUP BY host_id, device_id, substr(observed_at, 1, 15)
+      )
+    `).run(fineCutoffIso, fineCutoffIso);
+    this.db.prepare(`
+      DELETE FROM host_samples
+      WHERE observed_at <= ? AND id NOT IN (
+        SELECT MAX(id) FROM host_samples
+        WHERE observed_at <= ?
+        GROUP BY host_id, substr(observed_at, 1, 15)
+      )
+    `).run(fineCutoffIso, fineCutoffIso);
+    this.db.prepare(`
+      DELETE FROM metric_samples
+      WHERE observed_at <= ? AND id NOT IN (
+        SELECT MAX(id) FROM metric_samples
+        WHERE observed_at <= ?
+        GROUP BY task_id, metric_name, substr(observed_at, 1, 15)
+      )
+    `).run(fineCutoffIso, fineCutoffIso);
+
+    // Keep content_changes bounded to latest 128 epochs per source
+    const epochRows = this.db.prepare('SELECT source_id, content_epoch FROM source_epochs').all() as { source_id: string; content_epoch: number }[];
+    for (const row of epochRows) {
+      if (row.content_epoch > 128) {
+        this.db.prepare('DELETE FROM content_changes WHERE source_id=? AND content_epoch < ?').run(row.source_id, row.content_epoch - 128);
+      }
+    }
+  }
+
   async retain(now: string, pending?: { taskId: string; bytes: number }): Promise<{ pausedForDisk: boolean }> {
     this.assertOpen();
     const nowMs = isoMillis(now); const cutoffMs = nowMs - MAX_CACHE_AGE_MS;
@@ -920,6 +1472,7 @@ export class StoreEngine {
         }
       }
       this.processEventCleanup();
+      this.pruneSeriesAndContentChanges(nowMs);
       this.db.exec('PRAGMA incremental_vacuum(128)');
       this.commit();
       await new Promise<void>((resolve) => setImmediate(resolve));
@@ -927,8 +1480,6 @@ export class StoreEngine {
       if (diag.walBytes > (this.hooks.walCheckpointThreshold?.() ?? 64 * 1024 * 1024)) {
         try {
           const checkpoint = this.db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get() as { busy?: number; log?: number; checkpointed?: number };
-          // SQLITE_BUSY is a measurement outcome, not a failed retain; committed
-          // cleanup remains durable and the next pass can retry the checkpoint.
           void checkpoint;
         } catch { /* The committed store stays usable; retry during a later retain. */ }
       }
@@ -938,8 +1489,13 @@ export class StoreEngine {
 
   async close(): Promise<void> {
     if (this.closed) return;
+    if (this.separateReadDb) {
+      try { this.readDb.close(); } catch { /* ignore */ }
+    }
     try { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* Keep close bounded even if a checkpoint is unavailable. */ }
-    this.db.close(); this.closed = true; this.canceled.clear();
+    this.db.close();
+    this.closed = true;
+    this.canceled.clear();
   }
 }
 

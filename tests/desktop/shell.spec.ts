@@ -31,7 +31,9 @@ test('opens a local demo window with only the frozen preload API', async () => {
   expect(await page.evaluate(() => typeof window.require)).toBe('undefined');
   expect(await page.evaluate(() => 'ipcRenderer' in window)).toBe(false);
   expect(await page.evaluate(() => Object.keys(window.monitor).sort())).toEqual([
-    'cancelRequest', 'copyRegisteredPath', 'getLogs', 'getPreferences', 'getRegistry', 'getSnapshot', 'requestRefresh', 'savePreferences', 'saveRegistry', 'searchLogs', 'subscribe',
+    'cancelRequest', 'controlTask', 'copyRegisteredPath', 'discoverProcesses', 'exportLogs',
+    'getGpuSeries', 'getLogs', 'getMetricSeries', 'getPreferences', 'getRegistry', 'getSnapshot',
+    'requestRefresh', 'savePreferences', 'saveRegistry', 'searchLogs', 'subscribe', 'testWebhook',
   ]);
   expect(await page.evaluate(() => window.monitor.getSnapshot().then((s) => s.demo))).toBe(true);
   expect(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.getMinimumSize())).toEqual([960, 600]);

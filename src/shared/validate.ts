@@ -1,11 +1,18 @@
 import { validateAutoStartConfig, validateAutoStartStatus } from './auto-start';
 import type {
+  AlertEvent,
+  AlertEventKind,
+  AlertPreferences,
   Bytes,
+  CustomPatternConfig,
+  DiscoveredProcess,
   DiscoveredSshHost,
   DiscoveredWslDistro,
   Freshness,
+  GpuDeviceDetail,
   HostGpuSnapshot,
   HostSnapshot,
+  HostSystemHealth,
   HostTarget,
   LogEvent,
   LogSourceSnapshot,
@@ -14,9 +21,21 @@ import type {
   ResourceMetric,
   Stamp,
   TaskSnapshot,
+  WebhookChannelConfig,
   WindowBounds,
 } from './contracts';
-import type { LogPage, LogQuery, LogSearchPage, LogSearchRequest, MonitorSnapshot, MonitorUpdate } from './api';
+import type {
+  ControlTaskRequest,
+  ExportLogsQuery,
+  GpuSeriesQuery,
+  LogPage,
+  LogQuery,
+  LogSearchPage,
+  LogSearchRequest,
+  MetricSeriesQuery,
+  MonitorSnapshot,
+  MonitorUpdate,
+} from './api';
 import {
   EVENT_PREVIEW_BYTES,
   PAGE_EVENT_LIMIT,
@@ -28,6 +47,46 @@ import {
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 const WHITESPACE_OR_CONTROL = /[\s\u0000-\u001f\u007f]/;
 const WINDOWS_DRIVE_ABS = /^[A-Za-z]:[\\/]/;
+
+const PROGRESS_UNITS = ['step', 'epoch', 'token', 'sample', 'percent', 'completed_iterations', 'unknown'] as const;
+const LIFECYCLES = ['running', 'queued', 'ready_not_training', 'completed', 'failed', 'stopped_unconfirmed', 'unconfirmed', 'not_observed', 'unknown'] as const;
+const ATTRIBUTION_CONFIDENCES = ['confirmed_process', 'inferred_tree', 'log_only', 'none'] as const;
+const LOG_FORMATS = ['generic', 'legacy_flow', 'legacy_score', 'legacy_reflow', 'flow', 'score', 'reflow', 'raw'] as const;
+const ALERT_KINDS: readonly AlertEventKind[] = [
+  'cuda_oom',
+  'process_crashed',
+  'loss_nan_inf',
+  'training_stalled',
+  'training_completed',
+  'host_disconnected',
+];
+
+/**
+ * Guards user-supplied regexes against excessive length, control characters,
+ * backreferences, and nested quantifiers that can trigger ReDoS.
+ */
+export function isSafeRegexPattern(pattern: unknown, maxLength = 256): pattern is string {
+  if (typeof pattern !== 'string' || pattern.length === 0 || pattern.length > maxLength || CONTROL_CHARS.test(pattern)) {
+    return false;
+  }
+  // Reject backreferences (\1..\9) and lookbehind assertions
+  if (/\\[1-9]/.test(pattern) || /\(\?<[=!]/.test(pattern)) return false;
+  // Reject obvious nested quantifiers like (a+)+, (.*)*, (a{1,5})+, ([a-z]+){2,}
+  if (/\([^()]*[+*][^()]*\)\s*(?:[+*?]|\{\d+)/.test(pattern)) return false;
+  if (/\([^()]*\{\d+,\d*\}[^()]*\)\s*(?:[+*]|\{\d+)/.test(pattern)) return false;
+  // Reject consecutive quantifiers like ++, **, *+, +*
+  if (/(?<!\\)[+*]\s*[+*]/.test(pattern)) return false;
+  // Limit total grouping / alternation complexity
+  const parens = (pattern.match(/\(/g) ?? []).length;
+  const alternations = (pattern.match(/\|/g) ?? []).length;
+  if (parens > 12 || alternations > 16) return false;
+  try {
+    new RegExp(pattern);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function parseBytes(value: Bytes): bigint {
   if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) throw new TypeError('INVALID_BYTES');
@@ -151,6 +210,41 @@ export function validateMetric(value: unknown): ResourceMetric {
   throw new TypeError('INVALID_METRIC');
 }
 
+function validateCustomPatterns(value: unknown): CustomPatternConfig {
+  const cp = object(value, 'INVALID_REGISTRY');
+  exact(cp, ['progressRegex', 'metricRegexes', 'jsonFields'], 'INVALID_REGISTRY');
+  const result: CustomPatternConfig = {};
+  if (cp.progressRegex !== undefined) {
+    if (!isSafeRegexPattern(cp.progressRegex)) throw new TypeError('INVALID_REGISTRY');
+    result.progressRegex = cp.progressRegex;
+  }
+  if (cp.metricRegexes !== undefined) {
+    const map = object(cp.metricRegexes, 'INVALID_REGISTRY');
+    const entries = Object.entries(map);
+    if (entries.length > 32) throw new TypeError('INVALID_REGISTRY');
+    const validated: Record<string, string> = {};
+    for (const [k, v] of entries) {
+      if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(k) || !isSafeRegexPattern(v)) throw new TypeError('INVALID_REGISTRY');
+      validated[k] = v;
+    }
+    result.metricRegexes = validated;
+  }
+  if (cp.jsonFields !== undefined) {
+    const map = object(cp.jsonFields, 'INVALID_REGISTRY');
+    const entries = Object.entries(map);
+    if (entries.length > 32) throw new TypeError('INVALID_REGISTRY');
+    const validated: Record<string, string> = {};
+    for (const [k, v] of entries) {
+      if (!/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/.test(k) || typeof v !== 'string' || !v || v.length > 128 || CONTROL_CHARS.test(v)) {
+        throw new TypeError('INVALID_REGISTRY');
+      }
+      validated[k] = v;
+    }
+    result.jsonFields = validated;
+  }
+  return result;
+}
+
 export function validateRegistry(value: unknown): Registry {
   const root = object(value, 'INVALID_REGISTRY');
   exact(root, ['version', 'revision', 'hosts', 'tasks'], 'INVALID_REGISTRY');
@@ -191,10 +285,25 @@ export function validateRegistry(value: unknown): Registry {
   const seenSourceIds = new Set<string>();
   const tasks = root.tasks.map((entry) => {
     const task = object(entry, 'INVALID_REGISTRY');
-    exact(task, ['taskId', 'hostId', 'label', 'enabled', 'algorithm', 'logFormat', 'autoStart', 'allowedDirectories', 'entryPaths', 'sources', 'checkpointDirectories'], 'INVALID_REGISTRY');
-    if (typeof task.taskId !== 'string' || !task.taskId || typeof task.hostId !== 'string' || !hostMap.has(task.hostId) || typeof task.label !== 'string' || typeof task.enabled !== 'boolean' ||
-        typeof task.algorithm !== 'string' || task.algorithm.length > 120 || CONTROL_CHARS.test(task.algorithm) ||
-        (task.logFormat !== undefined && !enumIs(task.logFormat, ['generic', 'flow', 'score', 'reflow', 'raw']))) throw new TypeError('INVALID_REGISTRY');
+    exact(task, [
+      'taskId', 'hostId', 'label', 'enabled', 'algorithm', 'logFormat',
+      'customPatterns', 'attributionMode', 'allowCrossUidScan', 'autoStart',
+      'allowedDirectories', 'entryPaths', 'sources', 'checkpointDirectories',
+    ], 'INVALID_REGISTRY');
+    if (
+      typeof task.taskId !== 'string' || !task.taskId ||
+      typeof task.hostId !== 'string' || !hostMap.has(task.hostId) ||
+      typeof task.label !== 'string' || typeof task.enabled !== 'boolean' ||
+      typeof task.algorithm !== 'string' || task.algorithm.length > 120 || CONTROL_CHARS.test(task.algorithm) ||
+      (task.logFormat !== undefined && !enumIs(task.logFormat, LOG_FORMATS)) ||
+      (task.attributionMode !== undefined && !enumIs(task.attributionMode, ['auto', 'log_only'])) ||
+      (task.allowCrossUidScan !== undefined && typeof task.allowCrossUidScan !== 'boolean')
+    ) {
+      throw new TypeError('INVALID_REGISTRY');
+    }
+    if (task.customPatterns !== undefined) {
+      validateCustomPatterns(task.customPatterns);
+    }
     if (seenTaskIds.has(task.taskId)) throw new TypeError('DUPLICATE_ID'); seenTaskIds.add(task.taskId);
     const parentHost = hostMap.get(task.hostId)!;
     const allowWin = parentHost.target.kind === 'local';
@@ -205,8 +314,15 @@ export function validateRegistry(value: unknown): Registry {
     if (!Array.isArray(task.sources)) throw new TypeError('INVALID_REGISTRY');
     for (const source of task.sources) {
       const src = object(source, 'INVALID_REGISTRY');
-      exact(src, ['sourceId', 'path', 'kind'], 'INVALID_REGISTRY');
-      if (typeof src.sourceId !== 'string' || !src.sourceId || !isValidAbsolutePath(src.path, allowWin) || !enumIs(src.kind, ['log', 'status_json', 'queue_lock'])) throw new TypeError('INVALID_REGISTRY');
+      exact(src, ['sourceId', 'path', 'kind', 'pathMode'], 'INVALID_REGISTRY');
+      if (
+        typeof src.sourceId !== 'string' || !src.sourceId ||
+        !isValidAbsolutePath(src.path, allowWin) ||
+        !enumIs(src.kind, ['log', 'status_json', 'queue_lock']) ||
+        (src.pathMode !== undefined && !enumIs(src.pathMode, ['exact', 'glob_latest', 'dir_latest']))
+      ) {
+        throw new TypeError('INVALID_REGISTRY');
+      }
       if (seenSourceIds.has(src.sourceId)) throw new TypeError('DUPLICATE_ID'); seenSourceIds.add(src.sourceId);
     }
     if (task.autoStart !== undefined) {
@@ -238,8 +354,76 @@ function processKey(value: unknown): boolean {
 }
 function validateProcess(value: unknown): void {
   const p = object(value, 'INVALID_PROCESS');
-  exact(p, ['key', 'pid', 'parentKey', 'cwd', 'scriptEntry', 'launcherEntry', 'role', 'observedAt'], 'INVALID_PROCESS');
-  if (!processKey(p.key) || !Number.isSafeInteger(p.pid) || typeof p.pid !== 'number' || p.pid <= 0 || !processKey(p.parentKey) || !nullableString(p.cwd) || !nullableString(p.scriptEntry) || (p.launcherEntry !== undefined && !nullableString(p.launcherEntry)) || !enumIs(p.role, ['trainer', 'queue', 'worker', 'unknown']) || !validTime(p.observedAt) || p.observedAt === null) throw new TypeError('INVALID_PROCESS');
+  exact(p, ['key', 'pid', 'ppid', 'pgid', 'nsPid', 'parentKey', 'cwd', 'scriptEntry', 'launcherEntry', 'exe', 'command', 'role', 'observedAt'], 'INVALID_PROCESS');
+  if (
+    !processKey(p.key) ||
+    !Number.isSafeInteger(p.pid) || typeof p.pid !== 'number' || p.pid <= 0 ||
+    (p.ppid !== undefined && !integerOrNull(p.ppid)) ||
+    (p.pgid !== undefined && !integerOrNull(p.pgid)) ||
+    (p.nsPid !== undefined && !integerOrNull(p.nsPid)) ||
+    !processKey(p.parentKey) ||
+    !nullableString(p.cwd) ||
+    !nullableString(p.scriptEntry) ||
+    (p.launcherEntry !== undefined && !nullableString(p.launcherEntry)) ||
+    (p.exe !== undefined && !nullableString(p.exe)) ||
+    (p.command !== undefined && !nullableString(p.command)) ||
+    !enumIs(p.role, ['trainer', 'queue', 'worker', 'unknown']) ||
+    !validTime(p.observedAt) || p.observedAt === null
+  ) {
+    throw new TypeError('INVALID_PROCESS');
+  }
+}
+
+function validateGpuDeviceDetail(value: unknown): GpuDeviceDetail {
+  const d = object(value, 'INVALID_HOST_GPU_SNAPSHOT');
+  exact(d, [
+    'deviceId', 'index', 'uuid', 'name', 'utilizationPct', 'memoryUsedMiB',
+    'memoryTotalMiB', 'memoryFreeMiB', 'temperatureC', 'powerDrawW', 'powerLimitW',
+    'fanSpeedPct', 'pciBusId', 'computeMode', 'eccErrors', 'activeProcesses',
+  ], 'INVALID_HOST_GPU_SNAPSHOT');
+  if (!string(d.deviceId) || !Number.isSafeInteger(d.index) || (d.index as number) < 0 || !string(d.uuid)) {
+    throw new TypeError('INVALID_HOST_GPU_SNAPSHOT');
+  }
+  if (d.name !== undefined && !nullableString(d.name)) throw new TypeError('INVALID_HOST_GPU_SNAPSHOT');
+  for (const numField of ['utilizationPct', 'memoryUsedMiB', 'memoryTotalMiB', 'memoryFreeMiB', 'temperatureC', 'powerDrawW', 'powerLimitW', 'fanSpeedPct', 'eccErrors'] as const) {
+    if (d[numField] !== undefined && !finiteOrNull(d[numField])) throw new TypeError('INVALID_HOST_GPU_SNAPSHOT');
+  }
+  for (const strField of ['pciBusId', 'computeMode'] as const) {
+    if (d[strField] !== undefined && !nullableString(d[strField])) throw new TypeError('INVALID_HOST_GPU_SNAPSHOT');
+  }
+  if (d.activeProcesses !== undefined) {
+    if (!Array.isArray(d.activeProcesses) || d.activeProcesses.length > 128) throw new TypeError('INVALID_HOST_GPU_SNAPSHOT');
+    for (const proc of d.activeProcesses) {
+      const p = object(proc, 'INVALID_HOST_GPU_SNAPSHOT');
+      exact(p, ['pid', 'command', 'user', 'memoryMiB', 'smUtilPct'], 'INVALID_HOST_GPU_SNAPSHOT');
+      if (!Number.isSafeInteger(p.pid) || (p.pid as number) <= 0 || typeof p.command !== 'string' ||
+          (p.user !== undefined && !nullableString(p.user)) || !finiteOrNull(p.memoryMiB) ||
+          (p.smUtilPct !== undefined && !finiteOrNull(p.smUtilPct))) {
+        throw new TypeError('INVALID_HOST_GPU_SNAPSHOT');
+      }
+    }
+  }
+  return d as unknown as GpuDeviceDetail;
+}
+
+function validateHostSystemHealth(value: unknown): HostSystemHealth {
+  const s = object(value, 'INVALID_HOST_SNAPSHOT');
+  exact(s, ['observedAt', 'freshness', 'cpuUtilizationPct', 'memoryUsedBytes', 'memoryTotalBytes', 'disks'], 'INVALID_HOST_SNAPSHOT');
+  stamp({ observedAt: s.observedAt, freshness: s.freshness });
+  if (!finiteOrNull(s.cpuUtilizationPct) || !Array.isArray(s.disks) || s.disks.length > 64) {
+    throw new TypeError('INVALID_HOST_SNAPSHOT');
+  }
+  if (s.memoryUsedBytes !== null) parseBytes(s.memoryUsedBytes as string);
+  if (s.memoryTotalBytes !== null) parseBytes(s.memoryTotalBytes as string);
+  for (const disk of s.disks) {
+    const d = object(disk, 'INVALID_HOST_SNAPSHOT');
+    exact(d, ['path', 'usedBytes', 'availableBytes', 'totalBytes'], 'INVALID_HOST_SNAPSHOT');
+    if (!string(d.path)) throw new TypeError('INVALID_HOST_SNAPSHOT');
+    parseBytes(d.usedBytes as string);
+    parseBytes(d.availableBytes as string);
+    parseBytes(d.totalBytes as string);
+  }
+  return s as unknown as HostSystemHealth;
 }
 
 export function validateHostSnapshot(value: unknown): HostSnapshot {
@@ -247,7 +431,7 @@ export function validateHostSnapshot(value: unknown): HostSnapshot {
   exact(h, [
     'observedAt', 'freshness', 'version', 'hostId', 'kind', 'connection',
     'lastSuccessAt', 'lastProbeDurationMs', 'scanComplete', 'errorCode',
-    'nextRetryAt', 'consecutiveFailures', 'acceleratorAvailability', 'gpu',
+    'nextRetryAt', 'consecutiveFailures', 'acceleratorAvailability', 'gpu', 'system',
   ], 'INVALID_HOST_SNAPSHOT');
   stamp({ observedAt: h.observedAt, freshness: h.freshness });
   if (
@@ -271,12 +455,13 @@ export function validateHostSnapshot(value: unknown): HostSnapshot {
     throw new TypeError('INVALID_HOST_SNAPSHOT');
   }
   if (Object.prototype.hasOwnProperty.call(h, 'gpu') && h.gpu !== undefined) validateHostGpuSnapshot(h.gpu);
+  if (Object.prototype.hasOwnProperty.call(h, 'system') && h.system !== undefined) validateHostSystemHealth(h.system);
   return h as unknown as HostSnapshot;
 }
 
 function validateHostGpuSnapshot(value: unknown): HostGpuSnapshot {
   const gpu = object(value, 'INVALID_HOST_GPU_SNAPSHOT');
-  exact(gpu, ['observedAt', 'state', 'acceleratorAvailability', 'errorCode', 'metrics'], 'INVALID_HOST_GPU_SNAPSHOT');
+  exact(gpu, ['observedAt', 'state', 'acceleratorAvailability', 'errorCode', 'metrics', 'devices'], 'INVALID_HOST_GPU_SNAPSHOT');
   if (!validTime(gpu.observedAt) || !enumIs(gpu.state, ['available', 'unavailable']) ||
       (gpu.acceleratorAvailability !== undefined && !enumIs(gpu.acceleratorAvailability, ['available', 'none', 'unavailable'])) ||
       !nullableString(gpu.errorCode) ||
@@ -286,80 +471,331 @@ function validateHostGpuSnapshot(value: unknown): HostGpuSnapshot {
     const expectedUnit = metric.name === 'gpu_utilization' ? 'percent_device' : 'bytes';
     if (metric.scope !== 'device' || metric.processKey !== null ||
         !['gpu_utilization', 'gpu_memory_used', 'gpu_memory_total'].includes(metric.name) || metric.unit !== expectedUnit ||
-        (metric.value !== null && (metric.value < 0 || metric.name === 'gpu_utilization' && metric.value > 100))) {
+        (metric.value !== null && (metric.value < 0 || (metric.name === 'gpu_utilization' && metric.value > 100)))) {
       throw new TypeError('INVALID_HOST_GPU_SNAPSHOT');
     }
+  }
+  if (gpu.devices !== undefined) {
+    if (!Array.isArray(gpu.devices) || gpu.devices.length > 64) throw new TypeError('INVALID_HOST_GPU_SNAPSHOT');
+    gpu.devices.forEach(validateGpuDeviceDetail);
   }
   return gpu as unknown as HostGpuSnapshot;
 }
 
+function validateCountView(value: unknown): void {
+  const c = object(value, 'INVALID_TASK_SNAPSHOT');
+  exact(c, ['completedCount', 'targetCount', 'fraction', 'unit', 'verified', 'sourceId'], 'INVALID_TASK_SNAPSHOT');
+  if (!finiteOrNull(c.completedCount) || !finiteOrNull(c.targetCount) || !finiteOrNull(c.fraction) ||
+      !enumIs(c.unit, PROGRESS_UNITS) || typeof c.verified !== 'boolean' || !nullableString(c.sourceId)) {
+    throw new TypeError('INVALID_TASK_SNAPSHOT');
+  }
+}
+
 export function validateTaskSnapshot(value: unknown): TaskSnapshot {
   const t = object(value, 'INVALID_TASK_SNAPSHOT');
-  exact(t, ['version', 'taskId', 'hostId', 'lifecycle', 'freshness', 'statusObservedAt', 'confidence', 'reason', 'evidence', 'currentRun', 'processes', 'queueLock', 'progress', 'checkpoint', 'resources', 'gpuUsage', 'autoStart'], 'INVALID_TASK_SNAPSHOT');
-  if (t.version !== 1 || !string(t.taskId) || !string(t.hostId) || !enumIs(t.lifecycle, ['running', 'queued', 'ready_not_training', 'completed', 'failed', 'unconfirmed', 'not_observed', 'unknown']) || !isFreshness(t.freshness) || !validTime(t.statusObservedAt) || !enumIs(t.confidence, ['high', 'medium', 'low', 'none']) || !string(t.reason, true) || !Array.isArray(t.evidence)) throw new TypeError('INVALID_TASK_SNAPSHOT');
-  for (const e of t.evidence) { const item = object(e, 'INVALID_TASK_SNAPSHOT'); exact(item, ['kind', 'sourceId', 'observedAt', 'confidence', 'summary'], 'INVALID_TASK_SNAPSHOT'); if (!string(item.kind) || !nullableString(item.sourceId) || !validTime(item.observedAt) || item.observedAt === null || !enumIs(item.confidence, ['high', 'medium', 'low', 'none']) || !string(item.summary, true)) throw new TypeError('INVALID_TASK_SNAPSHOT'); }
-  if (t.currentRun !== null) { const run = object(t.currentRun, 'INVALID_TASK_SNAPSHOT'); exact(run, ['runId', 'mainProcessKey'], 'INVALID_TASK_SNAPSHOT'); if (!string(run.runId) || !processKey(run.mainProcessKey) || run.mainProcessKey === null) throw new TypeError('INVALID_TASK_SNAPSHOT'); }
+  exact(t, [
+    'version', 'taskId', 'hostId', 'lifecycle', 'freshness', 'statusObservedAt',
+    'confidence', 'attributionConfidence', 'exitCode', 'terminalSummary', 'reason',
+    'evidence', 'currentRun', 'processes', 'queueLock', 'progress', 'checkpoint',
+    'resources', 'gpuUsage', 'autoStart',
+  ], 'INVALID_TASK_SNAPSHOT');
+  if (
+    t.version !== 1 || !string(t.taskId) || !string(t.hostId) ||
+    !enumIs(t.lifecycle, LIFECYCLES) || !isFreshness(t.freshness) || !validTime(t.statusObservedAt) ||
+    !enumIs(t.confidence, ['high', 'medium', 'low', 'none']) ||
+    (t.attributionConfidence !== undefined && !enumIs(t.attributionConfidence, ATTRIBUTION_CONFIDENCES)) ||
+    (t.exitCode !== undefined && !integerOrNull(t.exitCode)) ||
+    (t.terminalSummary !== undefined && !nullableString(t.terminalSummary)) ||
+    !string(t.reason, true) || !Array.isArray(t.evidence)
+  ) {
+    throw new TypeError('INVALID_TASK_SNAPSHOT');
+  }
+  for (const e of t.evidence) {
+    const item = object(e, 'INVALID_TASK_SNAPSHOT');
+    exact(item, ['kind', 'sourceId', 'observedAt', 'confidence', 'summary'], 'INVALID_TASK_SNAPSHOT');
+    if (!string(item.kind) || !nullableString(item.sourceId) || !validTime(item.observedAt) || item.observedAt === null || !enumIs(item.confidence, ['high', 'medium', 'low', 'none']) || !string(item.summary, true)) {
+      throw new TypeError('INVALID_TASK_SNAPSHOT');
+    }
+  }
+  if (t.currentRun !== null) {
+    const run = object(t.currentRun, 'INVALID_TASK_SNAPSHOT');
+    exact(run, ['runId', 'mainProcessKey'], 'INVALID_TASK_SNAPSHOT');
+    if (!string(run.runId) || !processKey(run.mainProcessKey) || run.mainProcessKey === null) throw new TypeError('INVALID_TASK_SNAPSHOT');
+  }
   if (t.autoStart !== undefined) validateAutoStartStatus(t.autoStart);
   if (t.gpuUsage !== undefined) {
     const gpu = object(t.gpuUsage, 'INVALID_TASK_GPU');
     exact(gpu, ['observedAt', 'freshness', 'state', 'errorCode', 'processKeys'], 'INVALID_TASK_GPU');
     stamp({ observedAt: gpu.observedAt, freshness: gpu.freshness });
-    if (!enumIs(gpu.state, ['available', 'unavailable']) || !nullableString(gpu.errorCode) || !Array.isArray(gpu.processKeys) || gpu.processKeys.length > 64 || gpu.processKeys.some(key => !key || !processKey(key))) throw new TypeError('INVALID_TASK_GPU');
+    if (!enumIs(gpu.state, ['available', 'unavailable']) || !nullableString(gpu.errorCode) || !Array.isArray(gpu.processKeys) || gpu.processKeys.length > 64 || gpu.processKeys.some(key => !key || !processKey(key))) {
+      throw new TypeError('INVALID_TASK_GPU');
+    }
   }
-  const processes = object(t.processes, 'INVALID_TASK_SNAPSHOT'); exact(processes, ['main', 'queue', 'workers'], 'INVALID_TASK_SNAPSHOT');
+  const processes = object(t.processes, 'INVALID_TASK_SNAPSHOT');
+  exact(processes, ['main', 'queue', 'workers'], 'INVALID_TASK_SNAPSHOT');
   for (const k of ['main', 'queue'] as const) if (processes[k] !== null) validateProcess(processes[k]);
-  if (!Array.isArray(processes.workers)) throw new TypeError('INVALID_TASK_SNAPSHOT'); processes.workers.forEach(validateProcess);
-  const q = object(t.queueLock, 'INVALID_TASK_SNAPSHOT'); exact(q, ['observedAt', 'freshness', 'source', 'exists', 'heldByRegisteredProcess'], 'INVALID_TASK_SNAPSHOT'); stamp({ observedAt: q.observedAt, freshness: q.freshness }); if (!nullableString(q.source) || (q.exists !== null && typeof q.exists !== 'boolean') || (q.heldByRegisteredProcess !== null && typeof q.heldByRegisteredProcess !== 'boolean')) throw new TypeError('INVALID_TASK_SNAPSHOT');
+  if (!Array.isArray(processes.workers)) throw new TypeError('INVALID_TASK_SNAPSHOT');
+  processes.workers.forEach(validateProcess);
+  const q = object(t.queueLock, 'INVALID_TASK_SNAPSHOT');
+  exact(q, ['observedAt', 'freshness', 'source', 'exists', 'heldByRegisteredProcess'], 'INVALID_TASK_SNAPSHOT');
+  stamp({ observedAt: q.observedAt, freshness: q.freshness });
+  if (!nullableString(q.source) || (q.exists !== null && typeof q.exists !== 'boolean') || (q.heldByRegisteredProcess !== null && typeof q.heldByRegisteredProcess !== 'boolean')) {
+    throw new TypeError('INVALID_TASK_SNAPSHOT');
+  }
   const p = object(t.progress, 'INVALID_TASK_SNAPSHOT');
-  exact(p, ['observedAt', 'freshness', 'runId', 'lastStepIndex', 'bindingIds', 'baselineEvidenceId', 'resumeCheckpointIndex', 'firstLoopIndex', 'global', 'session', 'configuredTarget', 'iterationsPerSecond', 'etaSeconds'], 'INVALID_TASK_SNAPSHOT'); stamp({ observedAt: p.observedAt, freshness: p.freshness });
-  if (!nullableString(p.runId) || !integerOrNull(p.lastStepIndex) || !Array.isArray(p.bindingIds) || p.bindingIds.some((x) => !string(x)) || !nullableString(p.baselineEvidenceId) || !integerOrNull(p.resumeCheckpointIndex) || !integerOrNull(p.firstLoopIndex) || !finiteOrNull(p.iterationsPerSecond) || !finiteOrNull(p.etaSeconds)) throw new TypeError('INVALID_TASK_SNAPSHOT');
-  for (const name of ['global', 'session'] as const) { const c = object(p[name], 'INVALID_TASK_SNAPSHOT'); exact(c, ['completedCount', 'targetCount', 'fraction', 'unit', 'verified', 'sourceId'], 'INVALID_TASK_SNAPSHOT'); if (!integerOrNull(c.completedCount) || !integerOrNull(c.targetCount) || !finiteOrNull(c.fraction) || !enumIs(c.unit, ['completed_iterations', 'unknown']) || typeof c.verified !== 'boolean' || !nullableString(c.sourceId)) throw new TypeError('INVALID_TASK_SNAPSHOT'); }
-  if (p.configuredTarget !== null) { const c = object(p.configuredTarget, 'INVALID_TASK_SNAPSHOT'); exact(c, ['value', 'meaning'], 'INVALID_TASK_SNAPSHOT'); if (typeof c.value !== 'number' || !Number.isFinite(c.value) || !enumIs(c.meaning, ['exclusive_index', 'count', 'unknown'])) throw new TypeError('INVALID_TASK_SNAPSHOT'); }
-  const c = object(t.checkpoint, 'INVALID_TASK_SNAPSHOT'); exact(c, ['observedAt', 'freshness', 'path', 'fileStepIndex', 'stepSource', 'sizeBytes', 'mtime', 'evidence', 'scanComplete'], 'INVALID_TASK_SNAPSHOT'); stamp({ observedAt: c.observedAt, freshness: c.freshness }); if (!nullableString(c.path) || !integerOrNull(c.fileStepIndex) || (c.stepSource !== null && c.stepSource !== 'filename') || !validTime(c.mtime) || (c.sizeBytes !== null && typeof c.sizeBytes !== 'string') || !enumIs(c.evidence, ['none', 'file_found', 'file_stable_observed']) || typeof c.scanComplete !== 'boolean') throw new TypeError('INVALID_TASK_SNAPSHOT'); if (c.sizeBytes !== null) parseBytes(c.sizeBytes as string);
-  if (!Array.isArray(t.resources)) throw new TypeError('INVALID_TASK_SNAPSHOT'); t.resources.forEach(validateMetric);
+  exact(p, [
+    'observedAt', 'freshness', 'runId', 'lastStepIndex', 'bindingIds',
+    'baselineEvidenceId', 'resumeCheckpointIndex', 'firstLoopIndex',
+    'global', 'session', 'resumedSession', 'unit', 'current', 'total',
+    'scalars', 'progressFreshness', 'configuredTarget', 'iterationsPerSecond', 'etaSeconds',
+  ], 'INVALID_TASK_SNAPSHOT');
+  stamp({ observedAt: p.observedAt, freshness: p.freshness });
+  if (
+    !nullableString(p.runId) || !integerOrNull(p.lastStepIndex) ||
+    !Array.isArray(p.bindingIds) || p.bindingIds.some((x) => !string(x)) ||
+    !nullableString(p.baselineEvidenceId) || !integerOrNull(p.resumeCheckpointIndex) ||
+    !integerOrNull(p.firstLoopIndex) || !finiteOrNull(p.iterationsPerSecond) || !finiteOrNull(p.etaSeconds) ||
+    (p.unit !== undefined && !enumIs(p.unit, PROGRESS_UNITS)) ||
+    (p.current !== undefined && !finiteOrNull(p.current)) ||
+    (p.total !== undefined && !finiteOrNull(p.total)) ||
+    (p.progressFreshness !== undefined && !isFreshness(p.progressFreshness))
+  ) {
+    throw new TypeError('INVALID_TASK_SNAPSHOT');
+  }
+  if (p.scalars !== undefined) {
+    const scalars = object(p.scalars, 'INVALID_TASK_SNAPSHOT');
+    for (const [k, v] of Object.entries(scalars)) {
+      if (!string(k) || typeof v !== 'number' || !Number.isFinite(v)) throw new TypeError('INVALID_TASK_SNAPSHOT');
+    }
+  }
+  validateCountView(p.global);
+  validateCountView(p.session);
+  if (p.resumedSession !== undefined && p.resumedSession !== null) validateCountView(p.resumedSession);
+  if (p.configuredTarget !== null) {
+    const c = object(p.configuredTarget, 'INVALID_TASK_SNAPSHOT');
+    exact(c, ['value', 'meaning'], 'INVALID_TASK_SNAPSHOT');
+    if (typeof c.value !== 'number' || !Number.isFinite(c.value) || !enumIs(c.meaning, ['exclusive_index', 'count', 'unknown'])) {
+      throw new TypeError('INVALID_TASK_SNAPSHOT');
+    }
+  }
+  const c = object(t.checkpoint, 'INVALID_TASK_SNAPSHOT');
+  exact(c, ['observedAt', 'freshness', 'path', 'fileStepIndex', 'stepSource', 'sizeBytes', 'mtime', 'evidence', 'scanComplete', 'isDirectory', 'fileCount', 'name', 'metadata'], 'INVALID_TASK_SNAPSHOT');
+  stamp({ observedAt: c.observedAt, freshness: c.freshness });
+  if (
+    !nullableString(c.path) || !integerOrNull(c.fileStepIndex) ||
+    (c.stepSource !== null && c.stepSource !== 'filename' && c.stepSource !== 'metadata') ||
+    !validTime(c.mtime) || (c.sizeBytes !== null && typeof c.sizeBytes !== 'string') ||
+    !enumIs(c.evidence, ['none', 'file_found', 'file_stable_observed']) ||
+    typeof c.scanComplete !== 'boolean' ||
+    (c.isDirectory !== undefined && typeof c.isDirectory !== 'boolean') ||
+    (c.fileCount !== undefined && !integerOrNull(c.fileCount)) ||
+    (c.name !== undefined && !nullableString(c.name))
+  ) {
+    throw new TypeError('INVALID_TASK_SNAPSHOT');
+  }
+  if (c.sizeBytes !== null) parseBytes(c.sizeBytes as string);
+  if (c.metadata !== undefined && c.metadata !== null) {
+    const meta = object(c.metadata, 'INVALID_TASK_SNAPSHOT');
+    for (const [k, v] of Object.entries(meta)) {
+      if (!string(k) || (v !== null && typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean')) throw new TypeError('INVALID_TASK_SNAPSHOT');
+    }
+  }
+  if (!Array.isArray(t.resources)) throw new TypeError('INVALID_TASK_SNAPSHOT');
+  t.resources.forEach(validateMetric);
   return t as unknown as TaskSnapshot;
 }
 
 export function validateLogSourceSnapshot(value: unknown): LogSourceSnapshot {
-  const s = object(value, 'INVALID_LOG_SOURCE'); exact(s, ['observedAt', 'freshness', 'sourceId', 'taskId', 'state', 'generation', 'committedOffset', 'generationStartOffset', 'maxObservedOffset', 'continuityState', 'catchupBytesRead', 'catchupBytesTotal', 'errorCode'], 'INVALID_LOG_SOURCE'); stamp({ observedAt: s.observedAt, freshness: s.freshness });
-  if (!string(s.sourceId) || !string(s.taskId) || !enumIs(s.state, ['unobserved', 'ready', 'missing', 'permission_error', 'reading', 'catching_up', 'reconciling', 'paused_budget', 'cache_full', 'storage_error', 'read_error']) || !nullableString(s.generation) || (s.continuityState !== null && !enumIs(s.continuityState, ['tracking', 'reconciling'])) || !nullableString(s.errorCode)) throw new TypeError('INVALID_LOG_SOURCE');
-  for (const key of ['committedOffset', 'generationStartOffset', 'maxObservedOffset', 'catchupBytesRead', 'catchupBytesTotal'] as const) if (s[key] !== null) parseBytes(s[key] as string);
+  const s = object(value, 'INVALID_LOG_SOURCE');
+  exact(s, [
+    'observedAt', 'freshness', 'sourceId', 'taskId', 'state', 'generation',
+    'committedOffset', 'generationStartOffset', 'maxObservedOffset',
+    'continuityState', 'catchupBytesRead', 'catchupBytesTotal', 'errorCode', 'resolvedPath',
+  ], 'INVALID_LOG_SOURCE');
+  stamp({ observedAt: s.observedAt, freshness: s.freshness });
+  if (
+    !string(s.sourceId) || !string(s.taskId) ||
+    !enumIs(s.state, ['unobserved', 'ready', 'missing', 'permission_error', 'reading', 'catching_up', 'reconciling', 'paused_budget', 'cache_full', 'storage_error', 'read_error']) ||
+    !nullableString(s.generation) ||
+    (s.continuityState !== null && !enumIs(s.continuityState, ['tracking', 'reconciling'])) ||
+    !nullableString(s.errorCode) ||
+    (s.resolvedPath !== undefined && !nullableString(s.resolvedPath))
+  ) {
+    throw new TypeError('INVALID_LOG_SOURCE');
+  }
+  for (const key of ['committedOffset', 'generationStartOffset', 'maxObservedOffset', 'catchupBytesRead', 'catchupBytesTotal'] as const) {
+    if (s[key] !== null) parseBytes(s[key] as string);
+  }
   return s as unknown as LogSourceSnapshot;
 }
 
 export function validateMonitorSnapshot(value: unknown): MonitorSnapshot {
-  const s = object(value, 'INVALID_SNAPSHOT'); exact(s, ['version', 'demo', 'hosts', 'tasks', 'sources'], 'INVALID_SNAPSHOT');
+  const s = object(value, 'INVALID_SNAPSHOT');
+  exact(s, ['version', 'demo', 'hosts', 'tasks', 'sources'], 'INVALID_SNAPSHOT');
   if (s.version !== 1 || typeof s.demo !== 'boolean' || !Array.isArray(s.hosts) || !Array.isArray(s.tasks) || !Array.isArray(s.sources)) throw new TypeError('INVALID_SNAPSHOT');
-  const result = { version: 1 as const, demo: s.demo, hosts: s.hosts.map(validateHostSnapshot), tasks: s.tasks.map(validateTaskSnapshot), sources: s.sources.map(validateLogSourceSnapshot) };
-  return result;
+  return { version: 1 as const, demo: s.demo, hosts: s.hosts.map(validateHostSnapshot), tasks: s.tasks.map(validateTaskSnapshot), sources: s.sources.map(validateLogSourceSnapshot) };
 }
 
 export function validateLogEvent(value: unknown): LogEvent {
-  const e = object(value, 'INVALID_LOG_EVENT'); exact(e, ['version', 'eventId', 'taskId', 'sourceId', 'generation', 'kind', 'startOffset', 'endOffset', 'ingestedAt', 'text', 'reason', 'displayTruncated', 'recordComplete', 'prefixIncomplete', 'runId', 'bindingId'], 'INVALID_LOG_EVENT');
-  if (e.version !== 1 || !string(e.eventId) || !string(e.taskId) || !string(e.sourceId) || !string(e.generation) || !enumIs(e.kind, ['line', 'redraw', 'import_boundary', 'generation_started', 'gap_confirmed', 'gap_unknown', 'cache_evicted']) || !validTime(e.ingestedAt) || e.ingestedAt === null || !isBoundedPreview(e.text) || !nullableString(e.reason) || typeof e.displayTruncated !== 'boolean' || (e.recordComplete !== null && typeof e.recordComplete !== 'boolean') || (e.prefixIncomplete !== null && typeof e.prefixIncomplete !== 'boolean') || !nullableString(e.runId) || !nullableString(e.bindingId)) throw new TypeError('INVALID_LOG_EVENT');
+  const e = object(value, 'INVALID_LOG_EVENT');
+  exact(e, [
+    'version', 'eventId', 'taskId', 'sourceId', 'generation', 'kind',
+    'startOffset', 'endOffset', 'ingestedAt', 'text', 'rawAnsi', 'reason',
+    'displayTruncated', 'recordComplete', 'prefixIncomplete', 'runId', 'bindingId',
+  ], 'INVALID_LOG_EVENT');
+  if (
+    e.version !== 1 || !string(e.eventId) || !string(e.taskId) || !string(e.sourceId) || !string(e.generation) ||
+    !enumIs(e.kind, ['line', 'redraw', 'import_boundary', 'generation_started', 'gap_confirmed', 'gap_unknown', 'cache_evicted']) ||
+    !validTime(e.ingestedAt) || e.ingestedAt === null || !isBoundedPreview(e.text) ||
+    (e.rawAnsi !== undefined && !isBoundedPreview(e.rawAnsi)) ||
+    !nullableString(e.reason) || typeof e.displayTruncated !== 'boolean' ||
+    (e.recordComplete !== null && typeof e.recordComplete !== 'boolean') ||
+    (e.prefixIncomplete !== null && typeof e.prefixIncomplete !== 'boolean') ||
+    !nullableString(e.runId) || !nullableString(e.bindingId)
+  ) {
+    throw new TypeError('INVALID_LOG_EVENT');
+  }
   for (const k of ['startOffset', 'endOffset'] as const) if (e[k] !== null) parseBytes(e[k] as string);
   return e as unknown as LogEvent;
 }
 
 export function validateLogQuery(value: unknown): LogQuery {
-  const q = object(value, 'INVALID_LOG_QUERY'); exact(q, ['requestId', 'sourceId', 'before', 'limit'], 'INVALID_LOG_QUERY');
-  if (!string(q.requestId) || !string(q.sourceId) || !nullableString(q.before) || (q.before !== null && q.before.length > 1024) || !Number.isSafeInteger(q.limit) || typeof q.limit !== 'number' || q.limit < 1 || q.limit > PAGE_EVENT_LIMIT) throw new TypeError('INVALID_LOG_QUERY'); return q as unknown as LogQuery;
+  const q = object(value, 'INVALID_LOG_QUERY');
+  exact(q, ['requestId', 'sourceId', 'before', 'limit'], 'INVALID_LOG_QUERY');
+  if (!string(q.requestId) || !string(q.sourceId) || !nullableString(q.before) || (q.before !== null && q.before.length > 1024) || !Number.isSafeInteger(q.limit) || typeof q.limit !== 'number' || q.limit < 1 || q.limit > PAGE_EVENT_LIMIT) throw new TypeError('INVALID_LOG_QUERY');
+  return q as unknown as LogQuery;
 }
+
 export function validateLogPage(value: unknown): LogPage {
-  const p = object(value, 'INVALID_LOG_PAGE'); exact(p, ['events', 'nextBefore', 'truncatedByBudget'], 'INVALID_LOG_PAGE'); if (!Array.isArray(p.events) || p.events.length > PAGE_EVENT_LIMIT || !nullableString(p.nextBefore) || typeof p.truncatedByBudget !== 'boolean') throw new TypeError('INVALID_LOG_PAGE');
-  const events = p.events.map(validateLogEvent); const textBytes = events.reduce((n, e) => n + new TextEncoder().encode(e.text ?? '').length, 0); if (textBytes > PAGE_TEXT_BUDGET_BYTES) throw new TypeError('INVALID_LOG_PAGE'); return { events, nextBefore: p.nextBefore, truncatedByBudget: p.truncatedByBudget };
+  const p = object(value, 'INVALID_LOG_PAGE');
+  exact(p, ['events', 'nextBefore', 'truncatedByBudget'], 'INVALID_LOG_PAGE');
+  if (!Array.isArray(p.events) || p.events.length > PAGE_EVENT_LIMIT || !nullableString(p.nextBefore) || typeof p.truncatedByBudget !== 'boolean') throw new TypeError('INVALID_LOG_PAGE');
+  const events = p.events.map(validateLogEvent);
+  const textBytes = events.reduce((n, e) => n + new TextEncoder().encode(e.text ?? '').length, 0);
+  if (textBytes > PAGE_TEXT_BUDGET_BYTES) throw new TypeError('INVALID_LOG_PAGE');
+  return { events, nextBefore: p.nextBefore, truncatedByBudget: p.truncatedByBudget };
 }
+
 export function validateLogSearchRequest(value: unknown): LogSearchRequest {
-  const q = object(value, 'INVALID_SEARCH'); exact(q, ['requestId', 'sourceIds', 'literal', 'continuation'], 'INVALID_SEARCH'); if (!string(q.requestId) || !Array.isArray(q.sourceIds) || q.sourceIds.length > 1000 || q.sourceIds.some((s) => !string(s)) || !string(q.literal, true) || q.literal.length > SEARCH_LITERAL_LIMIT || !nullableString(q.continuation)) throw new TypeError('INVALID_SEARCH'); return q as unknown as LogSearchRequest;
+  const q = object(value, 'INVALID_SEARCH');
+  exact(q, ['requestId', 'sourceIds', 'literal', 'continuation', 'mode', 'caseSensitive', 'level'], 'INVALID_SEARCH');
+  if (
+    !string(q.requestId) || !Array.isArray(q.sourceIds) || q.sourceIds.length > 1000 ||
+    q.sourceIds.some((s) => !string(s)) || !string(q.literal, true) ||
+    q.literal.length > SEARCH_LITERAL_LIMIT || !nullableString(q.continuation) ||
+    (q.mode !== undefined && !enumIs(q.mode, ['literal', 'regex'])) ||
+    (q.caseSensitive !== undefined && typeof q.caseSensitive !== 'boolean') ||
+    (q.level !== undefined && q.level !== null && !enumIs(q.level, ['error', 'warn', 'info', 'debug']))
+  ) {
+    throw new TypeError('INVALID_SEARCH');
+  }
+  if (q.mode === 'regex' && q.literal.length > 0 && !isSafeRegexPattern(q.literal)) {
+    throw new TypeError('INVALID_SEARCH_REGEX');
+  }
+  return q as unknown as LogSearchRequest;
 }
+
 export function validateLogSearchPage(value: unknown): LogSearchPage {
-  const p = object(value, 'INVALID_SEARCH_PAGE'); exact(p, ['events', 'continuation', 'scope', 'cancelled'], 'INVALID_SEARCH_PAGE'); if (!Array.isArray(p.events) || p.events.length > PAGE_EVENT_LIMIT || !nullableString(p.continuation) || p.scope !== 'retained_local' || typeof p.cancelled !== 'boolean') throw new TypeError('INVALID_SEARCH_PAGE'); const events = p.events.map(validateLogEvent); const textBytes = events.reduce((n, e) => n + new TextEncoder().encode(e.text ?? '').length, 0); if (textBytes > PAGE_TEXT_BUDGET_BYTES) throw new TypeError('INVALID_SEARCH_PAGE'); return { events, continuation: p.continuation, scope: 'retained_local', cancelled: p.cancelled };
+  const p = object(value, 'INVALID_SEARCH_PAGE');
+  exact(p, ['events', 'continuation', 'scope', 'cancelled'], 'INVALID_SEARCH_PAGE');
+  if (!Array.isArray(p.events) || p.events.length > PAGE_EVENT_LIMIT || !nullableString(p.continuation) || p.scope !== 'retained_local' || typeof p.cancelled !== 'boolean') throw new TypeError('INVALID_SEARCH_PAGE');
+  const events = p.events.map(validateLogEvent);
+  const textBytes = events.reduce((n, e) => n + new TextEncoder().encode(e.text ?? '').length, 0);
+  if (textBytes > PAGE_TEXT_BUDGET_BYTES) throw new TypeError('INVALID_SEARCH_PAGE');
+  return { events, continuation: p.continuation, scope: 'retained_local', cancelled: p.cancelled };
 }
+
+export function validateAlertEvent(value: unknown): AlertEvent {
+  const a = object(value, 'INVALID_ALERT');
+  exact(a, ['alertId', 'kind', 'taskId', 'hostId', 'severity', 'title', 'message', 'observedAt', 'details'], 'INVALID_ALERT');
+  if (
+    !string(a.alertId) || !enumIs(a.kind, ALERT_KINDS) || !nullableString(a.taskId) ||
+    !string(a.hostId) || !enumIs(a.severity, ['info', 'warning', 'critical']) ||
+    !string(a.title) || !string(a.message) || !validTime(a.observedAt) || a.observedAt === null
+  ) {
+    throw new TypeError('INVALID_ALERT');
+  }
+  if (a.details !== undefined) {
+    const details = object(a.details, 'INVALID_ALERT');
+    for (const [k, v] of Object.entries(details)) {
+      if (!string(k) || (v !== null && typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean')) {
+        throw new TypeError('INVALID_ALERT');
+      }
+    }
+  }
+  return a as unknown as AlertEvent;
+}
+
 export function validateMonitorUpdate(value: unknown): MonitorUpdate {
   const u = object(value, 'INVALID_UPDATE');
   if (u.kind === 'snapshot') { exact(u, ['kind', 'snapshot'], 'INVALID_UPDATE'); return { kind: 'snapshot', snapshot: validateMonitorSnapshot(u.snapshot) }; }
-  if (u.kind === 'logs') { exact(u, ['kind', 'sourceId', 'events'], 'INVALID_UPDATE'); if (!string(u.sourceId) || !Array.isArray(u.events) || u.events.length > PAGE_EVENT_LIMIT) throw new TypeError('INVALID_UPDATE'); const events = u.events.map(validateLogEvent); const textBytes = events.reduce((n, event) => n + new TextEncoder().encode(event.text ?? '').byteLength, 0); if (textBytes > SUBSCRIPTION_TEXT_BUDGET_BYTES) throw new TypeError('INVALID_UPDATE'); return { kind: 'logs', sourceId: u.sourceId, events }; }
+  if (u.kind === 'logs') {
+    exact(u, ['kind', 'sourceId', 'events'], 'INVALID_UPDATE');
+    if (!string(u.sourceId) || !Array.isArray(u.events) || u.events.length > PAGE_EVENT_LIMIT) throw new TypeError('INVALID_UPDATE');
+    const events = u.events.map(validateLogEvent);
+    const textBytes = events.reduce((n, event) => n + new TextEncoder().encode(event.text ?? '').byteLength, 0);
+    if (textBytes > SUBSCRIPTION_TEXT_BUDGET_BYTES) throw new TypeError('INVALID_UPDATE');
+    return { kind: 'logs', sourceId: u.sourceId, events };
+  }
+  if (u.kind === 'alert') {
+    exact(u, ['kind', 'alert'], 'INVALID_UPDATE');
+    return { kind: 'alert', alert: validateAlertEvent(u.alert) };
+  }
   throw new TypeError('INVALID_UPDATE');
+}
+
+export function validateWebhookChannelConfig(value: unknown, code = 'INVALID_PREFERENCES'): WebhookChannelConfig {
+  const w = object(value, code);
+  exact(w, ['enabled', 'kind', 'url', 'label'], code);
+  if (typeof w.enabled !== 'boolean' || !enumIs(w.kind, ['feishu', 'slack', 'discord', 'generic']) || typeof w.url !== 'string' || w.url.length === 0 || w.url.length > 2048 || CONTROL_CHARS.test(w.url)) {
+    throw new TypeError(code);
+  }
+  let parsedUrl: URL;
+  try { parsedUrl = new URL(w.url); } catch { throw new TypeError(code); }
+  if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') throw new TypeError(code);
+  if (w.label !== undefined && (typeof w.label !== 'string' || w.label.length > 120 || CONTROL_CHARS.test(w.label))) {
+    throw new TypeError(code);
+  }
+  return structuredClone(w) as unknown as WebhookChannelConfig;
+}
+
+function validateAlertPreferences(value: unknown): AlertPreferences {
+  const a = object(value, 'INVALID_PREFERENCES');
+  exact(a, ['desktopNotifications', 'stallThresholdMinutes', 'hostDisconnectThresholdSeconds', 'cooldownSeconds', 'enabledKinds', 'webhooks'], 'INVALID_PREFERENCES');
+  const result: AlertPreferences = {};
+  if (a.desktopNotifications !== undefined) {
+    if (typeof a.desktopNotifications !== 'boolean') throw new TypeError('INVALID_PREFERENCES');
+    result.desktopNotifications = a.desktopNotifications;
+  }
+  if (a.stallThresholdMinutes !== undefined) {
+    if (typeof a.stallThresholdMinutes !== 'number' || !Number.isFinite(a.stallThresholdMinutes) || a.stallThresholdMinutes < 1 || a.stallThresholdMinutes > 1440) {
+      throw new TypeError('INVALID_PREFERENCES');
+    }
+    result.stallThresholdMinutes = a.stallThresholdMinutes;
+  }
+  if (a.hostDisconnectThresholdSeconds !== undefined) {
+    if (typeof a.hostDisconnectThresholdSeconds !== 'number' || !Number.isFinite(a.hostDisconnectThresholdSeconds) || a.hostDisconnectThresholdSeconds < 5 || a.hostDisconnectThresholdSeconds > 86400) {
+      throw new TypeError('INVALID_PREFERENCES');
+    }
+    result.hostDisconnectThresholdSeconds = a.hostDisconnectThresholdSeconds;
+  }
+  if (a.cooldownSeconds !== undefined) {
+    if (typeof a.cooldownSeconds !== 'number' || !Number.isFinite(a.cooldownSeconds) || a.cooldownSeconds < 0 || a.cooldownSeconds > 86400) {
+      throw new TypeError('INVALID_PREFERENCES');
+    }
+    result.cooldownSeconds = a.cooldownSeconds;
+  }
+  if (a.enabledKinds !== undefined) {
+    if (!Array.isArray(a.enabledKinds) || a.enabledKinds.some((k) => !enumIs(k, ALERT_KINDS))) {
+      throw new TypeError('INVALID_PREFERENCES');
+    }
+    result.enabledKinds = [...new Set(a.enabledKinds as AlertEventKind[])];
+  }
+  if (a.webhooks !== undefined) {
+    if (!Array.isArray(a.webhooks) || a.webhooks.length > 16) throw new TypeError('INVALID_PREFERENCES');
+    result.webhooks = a.webhooks.map((w) => validateWebhookChannelConfig(w, 'INVALID_PREFERENCES'));
+  }
+  return result;
 }
 
 function validateWindowBounds(value: unknown): WindowBounds {
@@ -385,7 +821,7 @@ function validateWindowBounds(value: unknown): WindowBounds {
 
 export function validatePreferences(value: unknown): Preferences {
   const p = object(value, 'INVALID_PREFERENCES');
-  exact(p, ['theme', 'locale', 'minimizeToTrayOnClose', 'launchAtLogin', 'windowBounds'], 'INVALID_PREFERENCES');
+  exact(p, ['theme', 'locale', 'minimizeToTrayOnClose', 'launchAtLogin', 'windowBounds', 'alerts'], 'INVALID_PREFERENCES');
   if (!enumIs(p.theme, ['system', 'light', 'dark'])) throw new TypeError('INVALID_PREFERENCES');
   if (p.locale !== undefined && !enumIs(p.locale, ['zh-CN', 'en-US'])) throw new TypeError('INVALID_PREFERENCES');
   if (p.minimizeToTrayOnClose !== undefined && typeof p.minimizeToTrayOnClose !== 'boolean') throw new TypeError('INVALID_PREFERENCES');
@@ -395,13 +831,89 @@ export function validatePreferences(value: unknown): Preferences {
   if (p.minimizeToTrayOnClose !== undefined) result.minimizeToTrayOnClose = p.minimizeToTrayOnClose;
   if (p.launchAtLogin !== undefined) result.launchAtLogin = p.launchAtLogin;
   if (p.windowBounds !== undefined) result.windowBounds = validateWindowBounds(p.windowBounds);
+  if (p.alerts !== undefined) result.alerts = validateAlertPreferences(p.alerts);
   return result;
 }
 
 export function validateRefreshScope(value: unknown): { hostId?: string; taskId?: string } {
-  const s = object(value, 'INVALID_SCOPE'); exact(s, ['hostId', 'taskId'], 'INVALID_SCOPE');
+  const s = object(value, 'INVALID_SCOPE');
+  exact(s, ['hostId', 'taskId'], 'INVALID_SCOPE');
   if ((s.hostId !== undefined && !string(s.hostId)) || (s.taskId !== undefined && !string(s.taskId))) throw new TypeError('INVALID_SCOPE');
   return s as { hostId?: string; taskId?: string };
+}
+
+export function validateMetricSeriesQuery(value: unknown): MetricSeriesQuery {
+  const q = object(value, 'INVALID_METRIC_QUERY');
+  exact(q, ['taskId', 'metrics', 'rangeMs', 'maxPoints'], 'INVALID_METRIC_QUERY');
+  if (!string(q.taskId)) throw new TypeError('INVALID_METRIC_QUERY');
+  if (q.metrics !== undefined && (!Array.isArray(q.metrics) || q.metrics.length > 32 || q.metrics.some((m) => !string(m) || m.length > 64))) {
+    throw new TypeError('INVALID_METRIC_QUERY');
+  }
+  if (q.rangeMs !== undefined && (typeof q.rangeMs !== 'number' || !Number.isFinite(q.rangeMs) || q.rangeMs <= 0)) {
+    throw new TypeError('INVALID_METRIC_QUERY');
+  }
+  if (q.maxPoints !== undefined && (!Number.isSafeInteger(q.maxPoints) || (q.maxPoints as number) < 2 || (q.maxPoints as number) > 2000)) {
+    throw new TypeError('INVALID_METRIC_QUERY');
+  }
+  return q as unknown as MetricSeriesQuery;
+}
+
+export function validateGpuSeriesQuery(value: unknown): GpuSeriesQuery {
+  const q = object(value, 'INVALID_GPU_SERIES_QUERY');
+  exact(q, ['hostId', 'deviceId', 'rangeMs', 'maxPoints'], 'INVALID_GPU_SERIES_QUERY');
+  if (!string(q.hostId)) throw new TypeError('INVALID_GPU_SERIES_QUERY');
+  if (q.deviceId !== undefined && !string(q.deviceId)) throw new TypeError('INVALID_GPU_SERIES_QUERY');
+  if (q.rangeMs !== undefined && (typeof q.rangeMs !== 'number' || !Number.isFinite(q.rangeMs) || q.rangeMs <= 0)) {
+    throw new TypeError('INVALID_GPU_SERIES_QUERY');
+  }
+  if (q.maxPoints !== undefined && (!Number.isSafeInteger(q.maxPoints) || (q.maxPoints as number) < 2 || (q.maxPoints as number) > 2000)) {
+    throw new TypeError('INVALID_GPU_SERIES_QUERY');
+  }
+  return q as unknown as GpuSeriesQuery;
+}
+
+export function validateExportLogsQuery(value: unknown): ExportLogsQuery {
+  const q = object(value, 'INVALID_EXPORT_QUERY');
+  exact(q, ['sourceIds', 'literal', 'mode', 'caseSensitive', 'level', 'destinationPath'], 'INVALID_EXPORT_QUERY');
+  if (!Array.isArray(q.sourceIds) || q.sourceIds.length === 0 || q.sourceIds.length > 100 || q.sourceIds.some((s) => !string(s))) {
+    throw new TypeError('INVALID_EXPORT_QUERY');
+  }
+  if (q.literal !== undefined && (!string(q.literal, true) || q.literal.length > SEARCH_LITERAL_LIMIT)) throw new TypeError('INVALID_EXPORT_QUERY');
+  if (q.mode !== undefined && !enumIs(q.mode, ['literal', 'regex'])) throw new TypeError('INVALID_EXPORT_QUERY');
+  if (q.mode === 'regex' && q.literal && !isSafeRegexPattern(q.literal)) throw new TypeError('INVALID_SEARCH_REGEX');
+  if (q.caseSensitive !== undefined && typeof q.caseSensitive !== 'boolean') throw new TypeError('INVALID_EXPORT_QUERY');
+  if (q.level !== undefined && q.level !== null && !enumIs(q.level, ['error', 'warn', 'info', 'debug'])) throw new TypeError('INVALID_EXPORT_QUERY');
+  if (q.destinationPath !== undefined && (!string(q.destinationPath) || CONTROL_CHARS.test(q.destinationPath))) throw new TypeError('INVALID_EXPORT_QUERY');
+  return q as unknown as ExportLogsQuery;
+}
+
+export function validateControlTaskRequest(value: unknown): ControlTaskRequest {
+  const r = object(value, 'INVALID_JOB_CONTROL');
+  exact(r, ['taskId', 'action', 'confirmToken'], 'INVALID_JOB_CONTROL');
+  if (!string(r.taskId) || !enumIs(r.action, ['stop', 'kill', 'restart']) || !string(r.confirmToken) || r.confirmToken.length < 8 || r.confirmToken.length > 128) {
+    throw new TypeError('INVALID_JOB_CONTROL');
+  }
+  return r as unknown as ControlTaskRequest;
+}
+
+export function validateDiscoveredProcesses(value: unknown): DiscoveredProcess[] {
+  if (!Array.isArray(value) || value.length > 256) throw new TypeError('INVALID_DISCOVERED_PROCESSES');
+  return value.map((item) => {
+    const p = object(item, 'INVALID_DISCOVERED_PROCESSES');
+    exact(p, ['pid', 'pgid', 'command', 'cwd', 'gpuIndices', 'gpuMemoryMiB', 'openLogPaths', 'suggestedName', 'suggestedEntry'], 'INVALID_DISCOVERED_PROCESSES');
+    if (
+      !Number.isSafeInteger(p.pid) || (p.pid as number) <= 0 ||
+      !integerOrNull(p.pgid) ||
+      typeof p.command !== 'string' || !nullableString(p.cwd) ||
+      !Array.isArray(p.gpuIndices) || p.gpuIndices.some((i) => !Number.isSafeInteger(i) || (i as number) < 0) ||
+      !finiteOrNull(p.gpuMemoryMiB) ||
+      !Array.isArray(p.openLogPaths) || p.openLogPaths.some((l) => typeof l !== 'string') ||
+      typeof p.suggestedName !== 'string' || !nullableString(p.suggestedEntry)
+    ) {
+      throw new TypeError('INVALID_DISCOVERED_PROCESSES');
+    }
+    return p as unknown as DiscoveredProcess;
+  });
 }
 
 export function validateDiscoveredSshHosts(value: unknown): DiscoveredSshHost[] {

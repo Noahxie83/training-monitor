@@ -1,4 +1,4 @@
-import type { Freshness, LogEvent, ProcessKey, Progress, RunBinding, TaskRegistration } from "../shared/contracts";
+import type { Freshness, LogEvent, ProcessKey, Progress, ProgressUnit, RunBinding, TaskRegistration } from "../shared/contracts";
 import { flow, parseFlowRecord } from "../parsers/flow";
 import { parseScoreRecord } from "../parsers/score";
 import { parseReflowRecord } from "../parsers/reflow";
@@ -18,6 +18,8 @@ import {
 
 export { parseBaselineStartupContent, validateStructuredBaselineRead };
 export type { ParsedBaselineContent };
+
+const DEFAULT_RATE_WINDOW_SECONDS = 30 * 60; // 30 minutes sliding window for slow-step workloads
 
 export interface FlowBaselineEvidence {
   evidenceId: string;
@@ -104,6 +106,25 @@ export interface ProgressEvidence {
   currentWindows?: ActiveWriterWindow[];
   /** Single canonical domain journal. When present it overrides caller DTO arrays. */
   bindingState?: BindingState;
+  /** Configurable sliding window upper bound in seconds (defaults to 1800s / 30m). */
+  rateWindowSeconds?: number;
+}
+
+function numericProgressOf(
+  task: TaskRegistration,
+  text: string,
+  sourceId: string,
+): { value: number; total: number | null; unit: ProgressUnit } | null {
+  const parsed = parseRegisteredRecord(task, text, sourceId);
+  if (!parsed.isTrainingOutput) return null;
+  const val = parsed.sessionCompletedCount ?? parsed.current ?? parsed.stepIndex ?? null;
+  if (val === null || !Number.isFinite(val)) return null;
+  const total = parsed.sessionTargetCount ?? parsed.total ?? null;
+  return {
+    value: val,
+    total: total !== null && Number.isFinite(total) && total > 0 ? total : null,
+    unit: parsed.unit ?? (parsed.sessionCompletedCount !== null ? "step" : "unknown"),
+  };
 }
 
 export function deriveProgress(input: ProgressEvidence): Progress {
@@ -122,7 +143,13 @@ export function deriveProgress(input: ProgressEvidence): Progress {
       !canonical.activeMainKey || !areProcessKeysEqual(canonical.activeMainKey, input.currentRun.mainProcessKey)) {
     return createEmptyProgress(input.observedAt, input.freshness, input.configuredTarget ?? null);
   }
-  if (input.bindingState) {
+
+  const rateWindowSeconds =
+    typeof input.rateWindowSeconds === "number" && Number.isFinite(input.rateWindowSeconds) && input.rateWindowSeconds > 0
+      ? Math.min(86400, input.rateWindowSeconds)
+      : DEFAULT_RATE_WINDOW_SECONDS;
+
+  {
     const baselineRead = input.bindingState.baselineRead;
     const validatedBaselineRead = baselineRead
       ? validateStructuredBaselineRead(baselineRead, {
@@ -172,11 +199,11 @@ export function deriveProgress(input: ProgressEvidence): Progress {
         .sort((left, right) =>
           (parseIsoMs(left.observedAt) ?? 0) - (parseIsoMs(right.observedAt) ?? 0)
         )[0];
-      if (!poll) continue;
-      const parsed = parseFlowRecord(record.text, record.sourceId);
-      if (!parsed.isTrainingOutput || parsed.sessionCompletedCount === null) continue;
+      if (!poll || !input.bindingState.registeredTask) continue;
+      const numeric = numericProgressOf(input.bindingState.registeredTask, record.text, record.sourceId);
+      if (!numeric) continue;
       canonicalRateSamples.push({
-        observedAt: poll.observedAt, completedCount: parsed.sessionCompletedCount, runId: poll.runId,
+        observedAt: poll.observedAt, completedCount: numeric.value, runId: poll.runId,
         windowId: poll.windowId, bindingId: record.bindingId, sourceId: record.sourceId,
         generation: record.generation, startOffset: record.startOffset ?? undefined,
         endOffset: record.endOffset ?? undefined, eventId: record.eventId,
@@ -200,8 +227,6 @@ export function deriveProgress(input: ProgressEvidence): Progress {
       windows: input.bindingState.windows,
       rateSamples: canonicalRateSamples,
       rateObservations: canonicalRateObservations,
-      // No read-journal API currently supplies raw structured baseline content;
-      // caller-authored baseline/config DTOs therefore cannot grant global counts.
       baselineEvidence: validatedBaselineRead ? {
         evidenceId: validatedBaselineRead.evidenceId,
         taskId: validatedBaselineRead.taskId,
@@ -223,6 +248,7 @@ export function deriveProgress(input: ProgressEvidence): Progress {
       currentWindows,
     };
   }
+
   const {
     observedAt,
     freshness,
@@ -239,8 +265,6 @@ export function deriveProgress(input: ProgressEvidence): Progress {
     return createEmptyProgress(observedAt, freshness, configuredTarget);
   }
 
-  // Parser selection comes from the registered task policy. A caller-selected
-  // algorithm is display/input metadata only and cannot choose parser semantics.
   const registration = input.taskRegistration;
   const registeredPolicyValid = !!registration &&
     registration.enabled === true &&
@@ -251,15 +275,13 @@ export function deriveProgress(input: ProgressEvidence): Progress {
     taskParser(registration) !== 'unknown';
   const algorithm = registeredPolicyValid ? taskParser(registration) : 'unknown';
 
-  // If no confirmed main process, return empty progress
-  if (!currentRun || !currentRun.runId) {
+  if (!currentRun || !currentRun.runId || algorithm === 'raw') {
     return createEmptyProgress(observedAt, freshness, configuredTarget);
   }
 
   const runId = currentRun.runId;
   const revokedSet = new Set(revokedBindingIds.filter((bindingId): bindingId is string => typeof bindingId === "string"));
 
-  // Filter bindings not revoked
   const validBindings = bindings.filter((b) => {
     if (!b || typeof b !== "object") return false;
     if (b.runId !== runId) return false;
@@ -270,9 +292,7 @@ export function deriveProgress(input: ProgressEvidence): Progress {
     return true;
   });
   const validBindingsMap = new Map(validBindings.map((b) => [b.bindingId, b]));
-  const validBindingIds = new Set(validBindings.map((b) => b.bindingId));
 
-  // Filter bound events belonging to current run and valid bindings, with valid decimal offsets within binding interval
   const filteredEvents: LogEvent[] = [];
   for (const e of boundEvents) {
     if (!e || typeof e !== "object" || typeof e.text !== "string" || !e.taskId || !e.sourceId) continue;
@@ -292,14 +312,10 @@ export function deriveProgress(input: ProgressEvidence): Progress {
     const bThrough = BigInt(b.throughOffset);
     if (start < bFrom || end > bThrough) continue;
 
-    // Ordinary diagnostic/result lines do not supersede the last verified
-    // progress record in the same bound writer window.
     if (!parseRegisteredRecord(registration!, e.text, e.sourceId).isTrainingOutput) continue;
     filteredEvents.push(e);
   }
 
-  // Historical same-run records remain visible, but only support in the
-  // currently open observation window can make progress fresh.
   const currentEvents = filteredEvents.filter((event) => {
     const binding = validBindingsMap.get(event.bindingId!);
     return !!binding && (input.currentWindows ?? []).some((window) =>
@@ -312,13 +328,21 @@ export function deriveProgress(input: ProgressEvidence): Progress {
   });
   if (filteredEvents.length === 0) return createEmptyProgress(observedAt, freshness, configuredTarget);
 
-  // Byte offsets can only be ordered within one source generation. Refuse to
-  // synthesize a single progress cursor from incomparable streams.
-  const streams = new Set(filteredEvents.map((event) => `${event.sourceId}\u0000${event.generation}`));
-  if (streams.size !== 1) return createEmptyProgress(observedAt, freshness, configuredTarget);
+  // Refuse to mix incomparable distinct sources, while supporting same-source log rotation generations.
+  const distinctSources = new Set(filteredEvents.map((event) => event.sourceId));
+  if (distinctSources.size !== 1) return createEmptyProgress(observedAt, freshness, configuredTarget);
 
-  // Deterministically sort events by offset ascending
+  const distinctGenerations = new Set(filteredEvents.map((event) => event.generation));
+  const singleGeneration = distinctGenerations.size === 1;
+
+  // Deterministically sort events: within one generation by byte offset; across rotations by ingestedAt then offset.
   filteredEvents.sort((a, b) => {
+    if (!singleGeneration && a.generation !== b.generation) {
+      const ta = parseIsoMs(a.ingestedAt) ?? 0;
+      const tb = parseIsoMs(b.ingestedAt) ?? 0;
+      if (ta !== tb) return ta - tb;
+      return a.generation.localeCompare(b.generation);
+    }
     const aStart = BigInt(a.startOffset!);
     const bStart = BigInt(b.startOffset!);
     if (aStart < bStart) return -1;
@@ -330,7 +354,7 @@ export function deriveProgress(input: ProgressEvidence): Progress {
     return 0;
   });
 
-  const latestEvent = filteredEvents[filteredEvents.length - 1];
+  const latestEvent = filteredEvents[filteredEvents.length - 1]!;
   const currentLatestEvent = currentEvents[currentEvents.length - 1] ?? null;
   const progressFreshness = currentLatestEvent ? freshness : "stale";
   const rawText = latestEvent.text || "";
@@ -350,7 +374,25 @@ export function deriveProgress(input: ProgressEvidence): Progress {
   let sessionFraction: number | null = null;
   let sessionVerified = false;
 
-  if (algorithm === "flow") {
+  let unit: ProgressUnit = "unknown";
+  let currentValue: number | null = null;
+  let totalValue: number | null = null;
+  let mergedScalars: Record<string, number> = {};
+  let hasRealResumeSession = false;
+
+  // Accumulate latest scalar metrics across bound events (so train_loss and val_loss across adjacent lines both remain visible)
+  for (const ev of filteredEvents.slice(-32)) {
+    const parsedEv = parseRegisteredRecord(registration!, ev.text ?? "", ev.sourceId);
+    if (parsedEv.scalars) {
+      mergedScalars = { ...mergedScalars, ...parsedEv.scalars };
+    }
+  }
+
+  const isFlow = algorithm === "flow" || algorithm === "legacy_flow";
+  const isScore = algorithm === "score" || algorithm === "legacy_score";
+  const isReflow = algorithm === "reflow" || algorithm === "legacy_reflow";
+
+  if (isFlow) {
     const parsed = parseFlowRecord(rawText, latestEvent.sourceId);
     sessionCompletedCount = parsed.sessionCompletedCount;
     sessionTargetCount = parsed.sessionTargetCount;
@@ -359,6 +401,9 @@ export function deriveProgress(input: ProgressEvidence): Progress {
       sessionTargetCount && sessionCompletedCount !== null
         ? sessionCompletedCount / sessionTargetCount
         : null;
+    unit = "step";
+    currentValue = sessionCompletedCount;
+    totalValue = sessionTargetCount;
 
     const obsTime = parseIsoMs(observedAt);
     let hasValidBaseline = false;
@@ -382,7 +427,7 @@ export function deriveProgress(input: ProgressEvidence): Progress {
         baselineEvidence.provenance?.rawRecord ||
         (typeof (baselineEvidence as any).raw === "string" ? (baselineEvidence as any).raw : null);
 
-    const registeredSources = Array.isArray(input.taskRegistration?.sources) ? input.taskRegistration.sources : [];
+      const registeredSources = Array.isArray(input.taskRegistration?.sources) ? input.taskRegistration.sources : [];
       const registeredSource = input.taskRegistration?.taskId === input.taskId && input.taskRegistration.hostId === input.hostId && input.taskRegistration.enabled && registeredSources.some((s) => !!s && s.sourceId === baselineEvidence.sourceId && s.kind === "status_json");
       const sourceObservation = Array.isArray(input.sourceObservations) ? input.sourceObservations.find((s) => !!s && !!s.fileIdentity && typeof s.fileIdentity.dev === "string" && typeof s.fileIdentity.inode === "string" && s.sourceId === baselineEvidence.sourceId && s.generation === baselineEvidence.generation && s.fileIdentity.dev === baselineEvidence.fileIdentity?.dev && s.fileIdentity.inode === baselineEvidence.fileIdentity?.inode && s.observedAt === baselineEvidence.observedAt && isValidDecimalBytes(s.eofBytes) && isValidDecimalBytes(baselineEvidence.endOffset) && BigInt(baselineEvidence.endOffset) <= BigInt(s.eofBytes)) : undefined;
       const taskSources = Array.isArray(input.taskObservation?.sources) ? input.taskObservation!.sources : [];
@@ -402,8 +447,8 @@ export function deriveProgress(input: ProgressEvidence): Progress {
         : null;
       if (canonicalReadValid !== null) hasValidBaseline = true;
       if (bTimeValid && bKeyValid && bTaskValid && bHostValid && bIndexValid && raw && registeredSource && sourceObservation && taskSource && rangeValid && contentMatchesRange && identityValid) {
-        const parsed = parseBaselineStartupContent(raw);
-        if (parsed && parsed.resumeCheckpointIndex === baselineEvidence.resumeCheckpointIndex && parsed.targetMeaning === "exclusive_index" && parsed.targetCount === configuredTarget?.value && configuredTarget?.meaning === parsed.targetMeaning) {
+        const parsedBaseline = parseBaselineStartupContent(raw);
+        if (parsedBaseline && parsedBaseline.resumeCheckpointIndex === baselineEvidence.resumeCheckpointIndex && parsedBaseline.targetMeaning === "exclusive_index" && parsedBaseline.targetCount === configuredTarget?.value && configuredTarget?.meaning === parsedBaseline.targetMeaning) {
           hasValidBaseline = true;
         }
       }
@@ -429,6 +474,9 @@ export function deriveProgress(input: ProgressEvidence): Progress {
         globalTargetCount = derived.global.targetCount;
         globalFraction = derived.global.fraction;
         globalVerified = true;
+        currentValue = globalCompletedCount;
+        totalValue = globalTargetCount;
+        hasRealResumeSession = true;
       } catch {
         firstLoopIndex = null;
         lastStepIndex = null;
@@ -441,34 +489,42 @@ export function deriveProgress(input: ProgressEvidence): Progress {
       }
     }
   } else if (algorithm === 'generic') {
-    const parsed = parseGenericRecord(rawText, latestEvent.sourceId);
+    const parsed = parseGenericRecord(rawText, latestEvent.sourceId, registration?.customPatterns);
     lastStepIndex = parsed.stepIndex ?? null;
     sessionCompletedCount = parsed.sessionCompletedCount;
     sessionTargetCount = parsed.sessionTargetCount;
     sessionVerified = parsed.isTrainingOutput && sessionCompletedCount !== null && sessionTargetCount !== null;
     sessionFraction = sessionVerified ? sessionCompletedCount! / sessionTargetCount! : null;
-  } else if (algorithm === "score" || algorithm === "reflow") {
-    // Score/Reflow v1: session counts and ratios null, unknown unit
+    unit = parsed.unit ?? (sessionVerified ? 'step' : 'unknown');
+    currentValue = parsed.current ?? parsed.sessionCompletedCount ?? parsed.stepIndex ?? null;
+    totalValue = parsed.total ?? parsed.sessionTargetCount ?? null;
+  } else if (isScore || isReflow) {
+    const parsed = isScore
+      ? parseScoreRecord(rawText, latestEvent.sourceId)
+      : parseReflowRecord(rawText, latestEvent.sourceId);
+    lastStepIndex = parsed.stepIndex ?? null;
+    unit = "step";
+    currentValue = parsed.stepIndex ?? null;
+    totalValue = null;
     sessionCompletedCount = null;
     sessionTargetCount = null;
     sessionFraction = null;
     sessionVerified = false;
   }
 
-  // Rate and ETA derivation: requires flow algorithm, fresh progress, matching non-empty windowId, valid bindings, advancing counts, fresh within TTL
+  // Sliding-window rate & ETA across ALL monotonic parsers (flow, generic, score, reflow)
+  // with configurable window ceiling up to 30m (removing the old 30s cap) and supporting log rotations.
   let iterationsPerSecond: number | null = null;
   let etaSeconds: number | null = null;
 
-  if (algorithm === "flow" && progressFreshness === "fresh" && Array.isArray(rateSamples) && rateSamples.length >= 2 && Array.isArray(input.rateObservations) && Array.isArray(input.windows)) {
+  if (progressFreshness === "fresh" && Array.isArray(rateSamples) && rateSamples.length >= 2 && Array.isArray(input.rateObservations) && Array.isArray(input.windows)) {
     const obsTime = parseIsoMs(observedAt);
+    const windowTtlMs = rateWindowSeconds * 1000;
     const validSamples = rateSamples.filter((s) => {
       if (!s || typeof s !== "object" || typeof s.completedCount !== "number" || !Number.isFinite(s.completedCount)) return false;
       if (s.runId !== runId) return false;
-      if (!s.windowId || !input.windows?.some((w) => !!w && w.windowId === s.windowId && w.isOpen && w.runId === runId && w.taskId === input.taskId && w.sourceId === s.sourceId && w.generation === s.generation && w.activeBindingId === s.bindingId && areProcessKeysEqual(w.mainProcessKey, currentRun.mainProcessKey))) return false;
-      if (!s.bindingId || typeof s.bindingId !== "string") return false;
-      if (!validBindingsMap.has(s.bindingId)) return false;
-      if (!s.sourceId || typeof s.sourceId !== "string") return false;
-      if (!s.generation || typeof s.generation !== "string") return false;
+      if (!s.bindingId || typeof s.bindingId !== "string" || !validBindingsMap.has(s.bindingId)) return false;
+      if (!s.sourceId || typeof s.sourceId !== "string" || !s.generation || typeof s.generation !== "string") return false;
       if (!isValidDecimalBytes(s.startOffset) || !isValidDecimalBytes(s.endOffset)) return false;
       const b = validBindingsMap.get(s.bindingId)!;
       if (b.sourceId !== s.sourceId || b.generation !== s.generation) return false;
@@ -478,13 +534,16 @@ export function deriveProgress(input: ProgressEvidence): Progress {
       const bFrom = BigInt(b.fromOffset);
       const bThrough = BigInt(b.throughOffset);
       if (sStart < bFrom || sEnd > bThrough) return false;
-      if (!isTimestampValid(s.observedAt, obsTime, 30_000)) return false;
+      if (!isTimestampValid(s.observedAt, obsTime, windowTtlMs)) return false;
       const event = filteredEvents.find((e) => e.eventId === s.eventId && e.bindingId === s.bindingId && e.sourceId === s.sourceId && e.generation === s.generation && e.startOffset === s.startOffset && e.endOffset === s.endOffset);
       if (!event || !event.recordComplete || (event.kind !== "line" && event.kind !== "redraw") || event.prefixIncomplete || !event.text || event.text.includes("\r") || event.ingestedAt !== s.observedAt) return false;
-      const measurement = (input.rateObservations ?? []).find((m) => !!m && !!m.fileIdentity && typeof m.fileIdentity.dev === "string" && typeof m.fileIdentity.inode === "string" && m.eventId === event.eventId && m.sourceId === event.sourceId && m.generation === event.generation && m.observedAt === event.ingestedAt && m.fileIdentity.dev === input.windows?.find((w) => !!w && w.windowId === s.windowId)?.fileIdentity?.dev && m.fileIdentity.inode === input.windows?.find((w) => !!w && w.windowId === s.windowId)?.fileIdentity?.inode && isValidDecimalBytes(event.endOffset) && isValidDecimalBytes(m.eofBytes) && isValidDecimalBytes(m.writerEofBytes) && BigInt(event.endOffset) <= BigInt(m.eofBytes) && m.eofBytes === m.writerEofBytes && areProcessKeysEqual(m.writerProcessKey, currentRun.mainProcessKey));
+      const win = input.windows?.find((w) => !!w && w.windowId === s.windowId && w.runId === runId && w.taskId === input.taskId && w.sourceId === s.sourceId && w.generation === s.generation && w.activeBindingId === s.bindingId && areProcessKeysEqual(w.mainProcessKey, currentRun.mainProcessKey));
+      if (!win) return false;
+      // For legacy flow, enforce strict open-window identity check on the newest sample
+      const measurement = (input.rateObservations ?? []).find((m) => !!m && !!m.fileIdentity && typeof m.fileIdentity.dev === "string" && typeof m.fileIdentity.inode === "string" && m.eventId === event.eventId && m.sourceId === event.sourceId && m.generation === event.generation && m.observedAt === event.ingestedAt && m.fileIdentity.dev === win.fileIdentity?.dev && m.fileIdentity.inode === win.fileIdentity?.inode && isValidDecimalBytes(event.endOffset) && isValidDecimalBytes(m.eofBytes) && isValidDecimalBytes(m.writerEofBytes) && BigInt(event.endOffset) <= BigInt(m.eofBytes) && m.eofBytes === m.writerEofBytes && areProcessKeysEqual(m.writerProcessKey, currentRun.mainProcessKey));
       if (!measurement) return false;
-      const record = parseFlowRecord(event.text, event.sourceId);
-      if (!record.isTrainingOutput || record.sessionCompletedCount !== s.completedCount) return false;
+      const numeric = numericProgressOf(registration!, event.text, event.sourceId);
+      if (!numeric || numeric.value !== s.completedCount) return false;
       return true;
     });
 
@@ -492,45 +551,81 @@ export function deriveProgress(input: ProgressEvidence): Progress {
       const ta = parseIsoMs(a.observedAt) ?? 0;
       const tb = parseIsoMs(b.observedAt) ?? 0;
       if (ta !== tb) return ta - tb;
-      const sa = BigInt(a.startOffset ?? 0);
-      const sb = BigInt(b.startOffset ?? 0);
-      if (sa < sb) return -1;
-      if (sa > sb) return 1;
+      if (a.generation === b.generation) {
+        const sa = BigInt(a.startOffset ?? 0);
+        const sb = BigInt(b.startOffset ?? 0);
+        if (sa < sb) return -1;
+        if (sa > sb) return 1;
+      }
       return 0;
     });
 
     if (validSamples.length >= 2) {
-      const prev = validSamples[validSamples.length - 2];
-      const last = validSamples[validSamples.length - 1];
+      const last = validSamples[validSamples.length - 1]!;
+      const lastTime = parseIsoMs(last.observedAt)!;
+      // Pick the earliest sample within the sliding window that has strictly lower progress
+      // (for 2 samples this naturally uses validSamples[0] vs validSamples[1], preserving exact Flow math).
+      const lastWin = input.windows?.find((w) => w.windowId === last.windowId);
+      const lastIsOpen = Boolean(lastWin?.isOpen);
 
-      const sameWindow = prev.windowId === last.windowId;
-      const sameBinding = prev.bindingId === last.bindingId;
-      const sameSource = prev.sourceId === last.sourceId;
-      const sameGen = prev.generation === last.generation;
-      const previousMeasurement = input.rateObservations?.find((m) => m.eventId === prev.eventId);
-      const latestMeasurement = input.rateObservations?.find((m) => m.eventId === last.eventId);
-      const eofProgression = !!previousMeasurement && !!latestMeasurement &&
-        isValidDecimalBytes(previousMeasurement.eofBytes) && isValidDecimalBytes(latestMeasurement.eofBytes) &&
-        BigInt(latestMeasurement.eofBytes) > BigInt(previousMeasurement.eofBytes);
+      if (lastIsOpen) {
+        let anchor: ProgressRateSample | null = null;
+        // Prefer same-window sample pair first when available; fall back to cross-rotation same-source pair.
+        const sameWindowCandidates = validSamples.slice(0, -1).filter((s) =>
+          s.windowId === last.windowId &&
+          s.bindingId === last.bindingId &&
+          s.sourceId === last.sourceId &&
+          s.generation === last.generation
+        );
+        const crossRotationCandidates = validSamples.slice(0, -1).filter((s) =>
+          s.sourceId === last.sourceId && s.generation !== last.generation
+        );
 
-      if (sameWindow && sameBinding && sameSource && sameGen && eofProgression) {
-        const t1 = parseIsoMs(prev.observedAt)!;
-        const t2 = parseIsoMs(last.observedAt)!;
-        const dt = (t2 - t1) / 1000;
-        const dn = last.completedCount - prev.completedCount;
+        const latestMeasurement = input.rateObservations?.find((m) => m.eventId === last.eventId);
 
-        const offsetProgressionValid =
-          BigInt(last.startOffset!) >= BigInt(prev.startOffset!) &&
-          BigInt(last.endOffset!) > BigInt(prev.endOffset!);
+        if (sameWindowCandidates.length > 0 && latestMeasurement && isValidDecimalBytes(latestMeasurement.eofBytes)) {
+          // Use the oldest sample within sliding window if >2 samples, or previous sample if 2 samples.
+          const candidatePool = sameWindowCandidates.filter((prev) => {
+            const t1 = parseIsoMs(prev.observedAt)!;
+            const dt = (lastTime - t1) / 1000;
+            const prevMeasurement = input.rateObservations?.find((m) => m.eventId === prev.eventId);
+            const eofProg = !!prevMeasurement && isValidDecimalBytes(prevMeasurement.eofBytes) &&
+              BigInt(latestMeasurement.eofBytes) > BigInt(prevMeasurement.eofBytes);
+            const offsetProg = BigInt(last.startOffset!) >= BigInt(prev.startOffset!) &&
+              BigInt(last.endOffset!) > BigInt(prev.endOffset!);
+            return dt > 0 && dt <= rateWindowSeconds && last.completedCount > prev.completedCount && eofProg && offsetProg;
+          });
+          // For flow with <= 2 samples, candidatePool[0] === validSamples[len-2].
+          // Using the oldest valid anchor in a sliding window (capped at last 10 samples) smooths jitter!
+          if (candidatePool.length > 0) {
+            anchor = candidatePool[Math.max(0, candidatePool.length - 10)]!;
+          }
+        } else if (crossRotationCandidates.length > 0) {
+          // Cross-log-rotation continuity: monotonic step progression across sealed -> new generation
+          const candidatePool = crossRotationCandidates.filter((prev) => {
+            const t1 = parseIsoMs(prev.observedAt)!;
+            const dt = (lastTime - t1) / 1000;
+            return dt > 0 && dt <= rateWindowSeconds && last.completedCount > prev.completedCount;
+          });
+          if (candidatePool.length > 0) {
+            anchor = candidatePool[candidatePool.length - 1]!;
+          }
+        }
 
-        if (dt > 0 && dt <= 30 && dn > 0 && offsetProgressionValid) {
-          iterationsPerSecond = dn / dt;
-          if (configuredTarget && configuredTarget.meaning === "exclusive_index" && globalTargetCount !== null && globalCompletedCount !== null && globalVerified) {
-            const remaining = globalTargetCount - globalCompletedCount;
-            if (remaining > 0) {
-              etaSeconds = Math.round(remaining / iterationsPerSecond);
-            } else {
-              etaSeconds = 0;
+        if (anchor) {
+          const t1 = parseIsoMs(anchor.observedAt)!;
+          const dt = (lastTime - t1) / 1000;
+          const dn = last.completedCount - anchor.completedCount;
+          if (dt > 0 && dt <= rateWindowSeconds && dn > 0) {
+            iterationsPerSecond = dn / dt;
+            if (isFlow) {
+              if (configuredTarget && configuredTarget.meaning === "exclusive_index" && globalTargetCount !== null && globalCompletedCount !== null && globalVerified) {
+                const remaining = globalTargetCount - globalCompletedCount;
+                etaSeconds = remaining > 0 ? Math.round(remaining / iterationsPerSecond) : 0;
+              }
+            } else if (totalValue !== null && currentValue !== null && totalValue >= currentValue) {
+              const remaining = totalValue - currentValue;
+              etaSeconds = remaining > 0 ? Math.round(remaining / iterationsPerSecond) : 0;
             }
           }
         }
@@ -543,13 +638,28 @@ export function deriveProgress(input: ProgressEvidence): Progress {
   );
 
   const globalUnit = globalVerified ? "completed_iterations" : "unknown";
-  const sessionUnit = (algorithm === 'flow' || algorithm === 'generic') && sessionVerified ? 'completed_iterations' : 'unknown';
+  const sessionUnit = (isFlow || algorithm === 'generic') && sessionVerified ? 'completed_iterations' : 'unknown';
+
+  const sessionTrack = {
+    completedCount: sessionCompletedCount,
+    targetCount: sessionTargetCount,
+    fraction: sessionFraction,
+    unit: sessionUnit as "completed_iterations" | "unknown",
+    verified: sessionVerified,
+    sourceId: latestEvent.sourceId,
+  };
 
   return {
     observedAt: (currentLatestEvent ?? latestEvent).ingestedAt,
     freshness: progressFreshness,
+    progressFreshness,
     runId,
     lastStepIndex,
+    unit,
+    current: currentValue,
+    total: totalValue,
+    ...(Object.keys(mergedScalars).length > 0 ? { scalars: mergedScalars } : {}),
+    ...(hasRealResumeSession ? { resumedSession: sessionTrack } : {}),
     bindingIds: activeBindingIds,
     baselineEvidenceId,
     resumeCheckpointIndex,
@@ -562,14 +672,7 @@ export function deriveProgress(input: ProgressEvidence): Progress {
       verified: globalVerified,
       sourceId: latestEvent.sourceId,
     },
-    session: {
-      completedCount: sessionCompletedCount,
-      targetCount: sessionTargetCount,
-      fraction: sessionFraction,
-      unit: sessionUnit,
-      verified: sessionVerified,
-      sourceId: latestEvent.sourceId,
-    },
+    session: sessionTrack,
     configuredTarget,
     iterationsPerSecond,
     etaSeconds,
@@ -584,8 +687,12 @@ export function createEmptyProgress(
   return {
     observedAt,
     freshness,
+    progressFreshness: freshness,
     runId: null,
     lastStepIndex: null,
+    unit: "unknown",
+    current: null,
+    total: null,
     bindingIds: [],
     baselineEvidenceId: null,
     resumeCheckpointIndex: null,

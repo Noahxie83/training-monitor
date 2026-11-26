@@ -1,5 +1,5 @@
 import type { HostRegistration, LogFormat, TaskRegistration } from "../../shared/contracts";
-import { taskAlgorithmName, taskLogFormat } from '../../shared/task-profile';
+import { normalizeLogFormat, taskAlgorithmName, taskLogFormat } from '../../shared/task-profile';
 import { isValidAbsolutePath } from '../../shared/validate';
 
 export interface TaskFormInputs {
@@ -41,7 +41,7 @@ export function parseAndValidateTaskForm(
     return { task: null, error: '算法名称最多 120 个字符，不能包含控制字符' };
   }
   const format = fields.logFormat ?? 'generic';
-  if (!['generic', 'flow', 'score', 'reflow', 'raw'].includes(format)) {
+  if (!['generic', 'legacy_flow', 'legacy_score', 'legacy_reflow', 'flow', 'score', 'reflow', 'raw'].includes(format)) {
     return { task: null, error: '请选择有效的日志识别方式' };
   }
 
@@ -78,7 +78,7 @@ export function parseAndValidateTaskForm(
 
   const existingTask = isEditingTaskId ? existingTasks.find((t) => t.taskId === isEditingTaskId) : null;
   const retainLegacyProfile = existingTask && existingTask.logFormat === undefined &&
-    algorithmName === taskAlgorithmName(existingTask) && format === taskLogFormat(existingTask);
+    algorithmName === taskAlgorithmName(existingTask) && normalizeLogFormat(format) === taskLogFormat(existingTask);
   let sources: TaskRegistration["sources"] = [];
 
   if (existingTask) {

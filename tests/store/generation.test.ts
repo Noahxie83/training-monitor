@@ -118,17 +118,13 @@ describe('generation recovery', () => {
     expect(completedSearch.events).toContainEqual(expect.objectContaining({ text: '-tail!', startOffset: '6', endOffset: '13' }));
   });
 
-  it('seals without retaining historical plaintext and preserves old run binding evidence', async () => {
+  it('seals without retaining historical plaintext and omits dropped v1 dead tables', async () => {
     const { db, directory } = await create();
     let cursor = await db.registerSource('s', observation(), 'task-a');
     await db.commitRead({ expected: cursor, reply: readReply(cursor, Buffer.from('sealed-secret')), ingestedAt: NOW });
     cursor = (await db.getCursor('s'))!;
     const historicalGeneration = cursor.generation;
     await db.close();
-    const seed = new DatabaseSync(path.join(directory, 'monitor.sqlite'));
-    seed.prepare('INSERT INTO run_bindings(binding_id,source_id,generation,from_offset,through_offset,binding_json) VALUES(?,?,?,?,?,?)')
-      .run('binding-old', 's', historicalGeneration, '0', '13', '{"runId":"old-run"}');
-    seed.close();
     const reopened = await (openStore as NonNullable<typeof openStore>)({ directory, now: () => Date.parse(NOW) });
     const before = (await reopened.getCursor('s'))!;
     await reopened.reconcileSource({ sourceId: 's', expected: { generation: before.generation, revision: before.revision, committedOffset: before.committedOffset }, candidateScan: { status: 'inconclusive', ranges: [] }, newFile: { status: 'unconfirmed' }, observedAt: NOW });
@@ -141,9 +137,8 @@ describe('generation recovery', () => {
     const historical = check.prepare('SELECT cursor_json FROM source_generations WHERE source_id=? AND generation=?').get('s', historicalGeneration) as { cursor_json: string };
     const parsed = JSON.parse(historical.cursor_json);
     expect(JSON.stringify(parsed)).not.toContain('sealed-secret');
-    const current = JSON.parse((check.prepare('SELECT cursor_json FROM source_cursors WHERE source_id=?').get('s') as { cursor_json: string }).cursor_json) as { generation: string };
-    expect(check.prepare('SELECT binding_id FROM run_bindings WHERE source_id=? AND generation=?').all('s', historicalGeneration)).toHaveLength(1);
-    expect(check.prepare('SELECT binding_id FROM run_bindings WHERE source_id=? AND generation=?').all('s', current.generation)).toHaveLength(0);
+    // Phase 2 SQLite v2 removes unused dead table run_bindings
+    expect(check.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='run_bindings'").all()).toHaveLength(0);
     check.close();
   });
 

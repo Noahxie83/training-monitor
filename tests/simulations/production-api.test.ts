@@ -312,7 +312,8 @@ describe('production monitor API core path', () => {
     expect(wsl.hostCalls).toBe(1);
     expect(snapshot.tasks).toEqual([]);
     expect(snapshot.hosts).toHaveLength(2);
-    expect((await client.getSnapshot()).hosts).toEqual([]);
+    // Phase 2 persists 0-task host snapshots in SQLite v2 host_snapshots table
+    expect((await client.getSnapshot()).hosts).toHaveLength(2);
     expect(snapshot.hosts.find((host) => host.hostId === 'host-a')).toMatchObject({
       connection: 'disconnected', freshness: 'unobserved', errorCode: 'SSH_UNAVAILABLE', lastSuccessAt: null,
     });

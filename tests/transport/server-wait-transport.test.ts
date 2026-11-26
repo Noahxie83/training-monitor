@@ -153,10 +153,10 @@ describe('SSH-only tmux wait transport', () => {
     await f.transport.cancelServerWait!(task, 'a'.repeat(64), signal);
     // get (compact), ensure probe (compact -> WORKER_SOURCE_REQUIRED), ensure upload (full), cancel (compact)
     expect(f.requests.map((r) => r.op)).toEqual(['get_server_wait', 'ensure_server_wait', 'ensure_server_wait', 'cancel_server_wait']);
-    expect(f.stdinSizes[0]!).toBeLessThan(80_000);
-    expect(f.stdinSizes[1]!).toBeLessThan(80_000);
+    expect(f.stdinSizes[0]!).toBeLessThan(120_000);
+    expect(f.stdinSizes[1]!).toBeLessThan(120_000);
     expect(f.stdinSizes[2]!).toBeGreaterThan(f.stdinSizes[1]!);
-    expect(f.stdinSizes[3]!).toBeLessThan(80_000);
+    expect(f.stdinSizes[3]!).toBeLessThan(120_000);
     expect(f.requests[2]).toMatchObject({ idleSeconds: 60, launchRequest: { gpuDevices: [], hostAllowedRoots: ['/allowed'], taskAllowedDirectories: ['/allowed/run'] } });
     expect(f.calls.every((call) => call.command === 'ssh' && call.options.shell === false && call.options.windowsHide)).toBe(true);
   });

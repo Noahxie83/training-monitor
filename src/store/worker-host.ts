@@ -1,4 +1,4 @@
-import { parentPort, workerData, type MessagePort } from 'node:worker_threads';
+import { parentPort, type MessagePort } from 'node:worker_threads';
 import { setImmediate as yieldToMessages } from 'node:timers/promises';
 import { statfs } from 'node:fs/promises';
 import path from 'node:path';
@@ -7,6 +7,17 @@ import type { StoreOperation, WorkerRequest, WorkerResponse } from './protocol';
 
 type FaultPoint = 'beforeCursorWrite' | 'beforeGenerationSeal';
 type WorkerData = { databasePath: string; openedAt: string; testOnly?: boolean; controlPort?: MessagePort };
+
+const READ_ONLY_METHODS = new Set<StoreOperation['method']>([
+  'getCursor',
+  'getSnapshot',
+  'getLogs',
+  'searchLogs',
+  'getMetricSeries',
+  'getGpuSeries',
+  'exportLogs',
+  'diagnostics',
+]);
 
 export async function installStoreWorker(data: WorkerData, testOnly = false): Promise<void> {
   if (!parentPort) throw new Error('STORE_WORKER_REQUIRES_PARENT_PORT');
@@ -22,7 +33,9 @@ export async function installStoreWorker(data: WorkerData, testOnly = false): Pr
   const injected = (point: FaultPoint): void => {
     if (failNext === point) { failNext = null; throw new Error(`INJECTED_${point}`); }
   };
-  const engine = new StoreEngine(data.databasePath, () => Date.parse(data.openedAt), {
+  // Production always uses live wall-clock Date.now() instead of a frozen startup timestamp.
+  const clock = testOnly ? () => Date.parse(data.openedAt) : () => Date.now();
+  const engine = new StoreEngine(data.databasePath, clock, {
     beforeCursorWrite: () => injected('beforeCursorWrite'),
     beforeGenerationSeal: async () => {
       injected('beforeGenerationSeal');
@@ -59,11 +72,14 @@ export async function installStoreWorker(data: WorkerData, testOnly = false): Pr
     }
     if (typeof message.id === 'number') port!.postMessage({ kind: 'control-applied', id: message.id });
   });
-  let requestTail = Promise.resolve();
+
+  // WAL Read/Write separation:
+  // - All write operations join `writeTail` FIFO so transactions never interleave.
+  // - Read-only queries execute concurrently on StoreEngine's independent readOnly SQLite connection
+  //   without waiting behind writes (unless a test fault-injection pause is explicitly active).
+  let writeTail = Promise.resolve();
   parentPort.on('message', (message: WorkerRequest) => {
     if (!message || typeof message.id !== 'number' || !message.operation) return;
-    // Cancellation must be able to run while a search yields. Every operation
-    // touching SQLite joins one FIFO so no request can observe an open txn.
     const run = async () => {
       try {
         const value = await dispatch(engine, message.operation);
@@ -73,10 +89,19 @@ export async function installStoreWorker(data: WorkerData, testOnly = false): Pr
         parentPort!.postMessage({ id: message.id, ok: false, error: error instanceof Error ? error.message : 'STORE_WORKER_ERROR' } satisfies WorkerResponse);
       }
     };
-    if (message.operation.method === 'cancelRequest') void run();
-    else {
-      if (message.operation.method === 'searchLogs') void engine.beginSearchRequest(message.operation.args[0].requestId);
-      requestTail = requestTail.then(run, run);
+    if (message.operation.method === 'cancelRequest') {
+      void run();
+      return;
+    }
+    if (message.operation.method === 'searchLogs') {
+      void engine.beginSearchRequest(message.operation.args[0].requestId);
+    }
+    const isReadOnly = READ_ONLY_METHODS.has(message.operation.method);
+    const holdForTestFaultPause = testOnly && (pauseAt !== null || releasePause !== null);
+    if (isReadOnly && !holdForTestFaultPause) {
+      void run();
+    } else {
+      writeTail = writeTail.then(run, run);
     }
   });
 }
@@ -91,6 +116,10 @@ async function dispatch(engine: StoreEngine, operation: StoreOperation): Promise
     case 'getCursor': return engine.getCursor(...operation.args);
     case 'registerSource': return engine.registerSource(...operation.args);
     case 'saveObservation': return engine.saveObservation(...operation.args);
+    case 'saveHostSnapshot': return engine.saveHostSnapshot(...operation.args);
+    case 'saveMetricSamples': return engine.saveMetricSamples(...operation.args);
+    case 'saveGpuSamples': return engine.saveGpuSamples(...operation.args);
+    case 'saveHostSamples': return engine.saveHostSamples(...operation.args);
     case 'commitRead': return engine.commitRead(...operation.args);
     case 'commitReadWithReceipt': return engine.commitReadWithReceipt(...operation.args);
     case 'commitArchiveRead': return engine.commitArchiveRead(...operation.args);
@@ -98,6 +127,10 @@ async function dispatch(engine: StoreEngine, operation: StoreOperation): Promise
     case 'getSnapshot': return engine.getSnapshot();
     case 'getLogs': return engine.getLogs(...operation.args);
     case 'searchLogs': return engine.searchLogs(...operation.args);
+    case 'getMetricSeries': return engine.getMetricSeries(...operation.args);
+    case 'getGpuSeries': return engine.getGpuSeries(...operation.args);
+    case 'exportLogs': return engine.exportLogs(...operation.args);
+    case 'purgeOrphans': return engine.purgeOrphans(...operation.args);
     case 'cancelRequest': return engine.cancelRequest(...operation.args);
     case 'retain': return engine.retain(...operation.args);
     case 'diagnostics': return engine.diagnostics();

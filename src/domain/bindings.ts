@@ -1,4 +1,11 @@
-import type { Bytes, LogEvent, ProcessKey, RunBinding, TaskRegistration } from "../shared/contracts";
+import type {
+  AttributionConfidence,
+  Bytes,
+  LogEvent,
+  ProcessKey,
+  RunBinding,
+  TaskRegistration,
+} from "../shared/contracts";
 import type { TaskObservation, TaskProcessObservation } from "../transport/types";
 import { areProcessKeysEqual, isRegisteredProcessEntry, isStrongProcessKey, makeRunId } from "./identity";
 import { parseRegisteredRecord } from '../parsers/registered';
@@ -131,6 +138,13 @@ export interface TrainerOutputObservation {
   text: string;
 }
 
+export interface AttributedProcessMatch {
+  primary: TaskProcessObservation | null;
+  treeMembers: TaskProcessObservation[];
+  attributionConfidence: AttributionConfidence;
+  substantive: boolean;
+}
+
 type RegisteredSource = TaskRegistration["sources"][number];
 
 function hasValidRegisteredSources(value: unknown): value is RegisteredSource[] {
@@ -202,6 +216,18 @@ export function parseSafeBigInt(val: unknown): bigint | null {
   return null;
 }
 
+function witnessMatchesSource(
+  witness: { fileIdentity: { dev: string; inode: string } | null; eofBytes: string } | undefined,
+  src: { fileIdentity: { dev: string; inode: string } | null; eofBytes: string | null },
+): boolean {
+  if (!witness || !witness.fileIdentity || !src.fileIdentity) return false;
+  if (witness.fileIdentity.dev !== src.fileIdentity.dev || witness.fileIdentity.inode !== src.fileIdentity.inode) return false;
+  const wEof = parseSafeBigInt(witness.eofBytes);
+  const sEof = parseSafeBigInt(src.eofBytes);
+  // Active log files grow between source sampling and FD inspection; require monotonic non-shrinking EOF.
+  return wEof !== null && sEof !== null && wEof >= sEof;
+}
+
 export function parseIsoMs(iso: string | null | undefined): number | null {
   if (!iso || typeof iso !== "string") return null;
   const t = Date.parse(iso);
@@ -220,6 +246,115 @@ export function isTimestampValid(
   if (t > refTime) return false;
   if (refTime - t > ttlMs) return false;
   return true;
+}
+
+/**
+ * Group candidate processes into connected process trees using shared positive PGID,
+ * parent-child `ppid` chains, or probe-verified `treeMember` markers.
+ */
+function groupProcessTrees(procs: TaskProcessObservation[], allProcs: TaskProcessObservation[]): TaskProcessObservation[][] {
+  if (procs.length <= 1) return procs.length === 1 ? [[procs[0]!]] : [];
+  const byPid = new Map<number, TaskProcessObservation>();
+  for (const p of allProcs) {
+    if (isStrongProcessKey(p.key)) byPid.set(p.key.pid, p);
+  }
+  const parent = procs.map((_, idx) => idx);
+  const find = (i: number): number => {
+    while (parent[i] !== i) {
+      parent[i] = parent[parent[i]!]!;
+      i = parent[i]!;
+    }
+    return i;
+  };
+  const union = (a: number, b: number) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent[ra] = rb;
+  };
+
+  const ancestorsOf = (p: TaskProcessObservation): Set<number> => {
+    const seen = new Set<number>();
+    if (!isStrongProcessKey(p.key)) return seen;
+    seen.add(p.key.pid);
+    let cur: TaskProcessObservation | undefined = p;
+    for (let depth = 0; depth < 32 && cur?.ppid && cur.ppid > 0; depth++) {
+      if (seen.has(cur.ppid)) break;
+      seen.add(cur.ppid);
+      cur = byPid.get(cur.ppid);
+    }
+    return seen;
+  };
+
+  const ancestorSets = procs.map(ancestorsOf);
+  for (let i = 0; i < procs.length; i++) {
+    for (let j = i + 1; j < procs.length; j++) {
+      const a = procs[i]!;
+      const b = procs[j]!;
+      if (a.key.hostBootId !== b.key.hostBootId) continue;
+      if (areProcessKeysEqual(a.key, b.key)) {
+        union(i, j);
+        continue;
+      }
+      // Shared positive PGID (torchrun / DDP / shell pipeline | tee)
+      if (typeof a.pgid === "number" && a.pgid > 0 && a.pgid === b.pgid) {
+        union(i, j);
+        continue;
+      }
+      // Ancestor / descendant or shared parent PID within the scan
+      let shared = false;
+      for (const pid of ancestorSets[i]!) {
+        if (ancestorSets[j]!.has(pid)) {
+          shared = true;
+          break;
+        }
+      }
+      if (shared) {
+        union(i, j);
+        continue;
+      }
+      // Probe-confirmed tree expansion member attached to a non-treeMember root on same boot
+      if ((a.treeMember === true && !b.treeMember) || (b.treeMember === true && !a.treeMember)) {
+        union(i, j);
+      }
+    }
+  }
+
+  const groups = new Map<number, TaskProcessObservation[]>();
+  for (let i = 0; i < procs.length; i++) {
+    const root = find(i);
+    const list = groups.get(root) ?? [];
+    list.push(procs[i]!);
+    groups.set(root, list);
+  }
+  return [...groups.values()];
+}
+
+function selectPrimaryTreeCandidate(
+  candidates: TaskProcessObservation[],
+  allProcs: TaskProcessObservation[],
+): TaskProcessObservation | null {
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0]!;
+  const trees = groupProcessTrees(candidates, allProcs);
+  if (trees.length !== 1) return null;
+  const members = trees[0]!;
+  const memberPids = new Set(members.map((p) => p.key.pid));
+  const sorted = [...members].sort((a, b) => {
+    // Prefer direct root (not treeMember-only)
+    const aTreeOnly = a.treeMember ? 1 : 0;
+    const bTreeOnly = b.treeMember ? 1 : 0;
+    if (aTreeOnly !== bTreeOnly) return aTreeOnly - bTreeOnly;
+    // Prefer root whose ppid is outside the candidate set
+    const aIsRoot = !a.ppid || !memberPids.has(a.ppid) ? 0 : 1;
+    const bIsRoot = !b.ppid || !memberPids.has(b.ppid) ? 0 : 1;
+    if (aIsRoot !== bIsRoot) return aIsRoot - bIsRoot;
+    // Prefer direct writer FD over exact_script_entry
+    const aWriter = a.roleEvidence === "exact_entry_and_direct_writer_fd" ? 0 : 1;
+    const bWriter = b.roleEvidence === "exact_entry_and_direct_writer_fd" ? 0 : 1;
+    if (aWriter !== bWriter) return aWriter - bWriter;
+    return a.key.pid - b.key.pid;
+  });
+  return sorted[0]!;
 }
 
 export function createInitialBindingState(): BindingState {
@@ -288,8 +423,6 @@ function retainBaselineRead(
     currentRun: { runId: makeRunId(task.hostId, task.taskId, key), mainProcessKey: key },
     observedAt,
   });
-  // Keep a context-applicable record for compatibility and evidence display.
-  // Projection independently requires the validator to grant baseline authority.
   return validated ?? {
     ...baseline,
     mainProcessKey: { ...baseline.mainProcessKey },
@@ -307,6 +440,40 @@ export function resolveTaskPolicy(
   return task;
 }
 
+function hasReadableLogWriterWitness(
+  task: TaskRegistration,
+  taskObservation: TaskObservation,
+  obsTime: number,
+  proc: TaskProcessObservation,
+): boolean {
+  if (!isStrongProcessKey(proc.key)) return false;
+  if (proc.roleEvidence !== "exact_entry_and_direct_writer_fd") return false;
+  if (!isRegisteredProcessEntry(task, proc)) return false;
+  if (proc.writerEvidenceComplete !== true || proc.evidenceComplete !== true) return false;
+  if (!Array.isArray(proc.directWriterSourceIds) || proc.directWriterSourceIds.length === 0) return false;
+  if (!isTimestampValid(proc.observedAt, obsTime)) return false;
+
+  return proc.directWriterSourceIds.some((sid) => {
+    const regSource = findRegisteredSource(task, sid);
+    if (!regSource || regSource.kind !== "log") return false;
+    const src = (taskObservation.sources || []).find((s) => s.sourceId === sid);
+    if (
+      !src ||
+      src.permission !== "readable" ||
+      src.exists !== true ||
+      src.evidenceComplete !== true ||
+      !isValidDecimalBytes(src.eofBytes) ||
+      !src.fileIdentity ||
+      !src.fileIdentity.dev ||
+      !src.fileIdentity.inode ||
+      !isTimestampValid(src.observedAt, obsTime)
+    ) {
+      return false;
+    }
+    return witnessMatchesSource(proc.writerSourceEvidence?.[sid], src);
+  });
+}
+
 export function findSubstantiveTrainerProcess(
   task: TaskRegistration,
   taskObservation: TaskObservation,
@@ -321,7 +488,8 @@ export function findSubstantiveTrainerProcess(
   if (taskObservation.freshness !== "fresh" || taskObservation.scanComplete !== true) return null;
   if (taskObservation.errorCode !== null && taskObservation.errorScope !== "source") return null;
   if (!Array.isArray(task.entryPaths) || task.entryPaths.length === 0) return null;
-  if (taskParser(task) === 'unknown') return null;
+  const parser = taskParser(task);
+  if (parser === 'unknown') return null;
 
   const procs = taskObservation.processes || [];
   const candidates = procs.filter((proc) => {
@@ -352,14 +520,13 @@ export function findSubstantiveTrainerProcess(
       }
 
       const witness = proc.writerSourceEvidence?.[sid];
-      if (
-        !witness ||
-        !witness.fileIdentity ||
-        witness.fileIdentity.dev !== src.fileIdentity.dev ||
-        witness.fileIdentity.inode !== src.fileIdentity.inode ||
-        witness.eofBytes !== src.eofBytes
-      ) {
+      if (!witnessMatchesSource(witness, src)) {
         return false;
+      }
+
+      // Raw log mode has no metric parser; a verified direct writer FD on a readable registered log is sufficient.
+      if (parser === 'raw') {
+        return true;
       }
 
       {
@@ -386,7 +553,97 @@ export function findSubstantiveTrainerProcess(
     return hasValidWitness;
   });
 
-  return candidates.length === 1 ? candidates[0] : null;
+  return selectPrimaryTreeCandidate(candidates, procs);
+}
+
+/**
+ * Three-tier process attribution decoupled from 30s log-output TTL:
+ * 1) `confirmed_process`: live registered process/tree holding direct log write FD (with or without recent metric output)
+ * 2) `inferred_tree`: live registered process/tree matching command/module/cwd (e.g. `| tee` pipeline or container redirect)
+ * 3) `log_only`: explicit `log_only` attribution mode with active log evidence when `/proc` is unavailable
+ * 4) `none`: no live process or log-only attribution
+ */
+export function findLiveAttributedProcess(
+  task: TaskRegistration,
+  taskObservation: TaskObservation,
+  obsTime: number | null,
+  outputSamples: Record<string, TrainerOutputObservation>,
+  sourceInfo: BindingObservation["sourceInfo"],
+  options?: { logOnlyActive?: boolean; skipInferredTree?: boolean },
+): AttributedProcessMatch {
+  const empty: AttributedProcessMatch = { primary: null, treeMembers: [], attributionConfidence: "none", substantive: false };
+  if (!isRuntimeTaskPolicy(task)) return empty;
+  if (!taskObservation || taskObservation.taskId !== task.taskId || taskObservation.hostId !== task.hostId) return empty;
+  if (obsTime === null || !isTimestampValid(taskObservation.observedAt, obsTime)) return empty;
+  if (taskObservation.freshness !== "fresh" || taskObservation.scanComplete !== true) return empty;
+  if (taskObservation.errorCode !== null && taskObservation.errorScope !== "source") return empty;
+
+  const procs = taskObservation.processes || [];
+  const collectTree = (primary: TaskProcessObservation): TaskProcessObservation[] => {
+    const related = procs.filter((p) => {
+      if (!isStrongProcessKey(p.key)) return false;
+      if (areProcessKeysEqual(p.key, primary.key)) return false;
+      const trees = groupProcessTrees([primary, p], procs);
+      return trees.length === 1;
+    });
+    return related;
+  };
+
+  // Tier 1A: Full substantive trainer (direct writer + parsed training output, or raw mode)
+  const substantive = findSubstantiveTrainerProcess(task, taskObservation, obsTime, outputSamples, sourceInfo);
+  if (substantive) {
+    return {
+      primary: substantive,
+      treeMembers: collectTree(substantive),
+      attributionConfidence: "confirmed_process",
+      substantive: true,
+    };
+  }
+
+  // Tier 1B: Live direct writer process decoupled from 30s log TTL (slow step, eval, torch.compile, raw)
+  const liveDirectWriters = procs.filter((p) => hasReadableLogWriterWitness(task, taskObservation, obsTime, p));
+  const primaryDirect = selectPrimaryTreeCandidate(liveDirectWriters, procs);
+  if (primaryDirect) {
+    return {
+      primary: primaryDirect,
+      treeMembers: collectTree(primaryDirect),
+      attributionConfidence: "confirmed_process",
+      substantive: false,
+    };
+  }
+
+  // Tier 2: Inferred process tree (e.g. `| tee` pipeline, torchrun/python -m without direct log FD)
+  if (!options?.skipInferredTree) {
+    const inferredCandidates = procs.filter((p) =>
+      isStrongProcessKey(p.key) &&
+      p.role !== "queue" &&
+      p.evidenceComplete === true &&
+      p.roleEvidence === "exact_script_entry" &&
+      isRegisteredProcessEntry(task, p) &&
+      isTimestampValid(p.observedAt, obsTime),
+    );
+    const primaryInferred = selectPrimaryTreeCandidate(inferredCandidates, procs);
+    if (primaryInferred) {
+      return {
+        primary: primaryInferred,
+        treeMembers: collectTree(primaryInferred),
+        attributionConfidence: "inferred_tree",
+        substantive: false,
+      };
+    }
+  }
+
+  // Tier 3: Log-only mode (explicitly opted in when /proc cannot reach container/Slurm job)
+  if (task.attributionMode === "log_only" && options?.logOnlyActive) {
+    return {
+      primary: null,
+      treeMembers: [],
+      attributionConfidence: "log_only",
+      substantive: false,
+    };
+  }
+
+  return empty;
 }
 
 export function updateBindings(state: BindingState, input: BindingObservation): BindingState {
@@ -455,23 +712,27 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     };
   }
 
-  // Detect mixed-writer contradictions among candidate processes on registered sources
-  const writersPerSource = new Map<string, ProcessKey[]>();
-  for (const proc of taskObservation.processes || []) {
+  // Detect mixed-writer contradictions ONLY among UNRELATED process trees on registered sources.
+  // DDP/FSDP ranks, DataLoader children, and pipeline members in the SAME process tree sharing
+  // stdout/stderr to the same log FD are normal and MUST NOT trigger revocation!
+  const allProcs = taskObservation.processes || [];
+  const writersPerSource = new Map<string, TaskProcessObservation[]>();
+  for (const proc of allProcs) {
     if (Array.isArray(proc.directWriterSourceIds)) {
       for (const sid of proc.directWriterSourceIds) {
         const list = writersPerSource.get(sid) ?? [];
-        // stdout and stderr can both point to the same log. Count distinct
-        // process instances rather than duplicate descriptors from one writer.
-        if (!list.some((key) => areProcessKeysEqual(key, proc.key))) list.push(proc.key);
+        if (!list.some((existing) => areProcessKeysEqual(existing.key, proc.key))) list.push(proc);
         writersPerSource.set(sid, list);
       }
     }
   }
   const contradictedSources = new Set<string>();
-  for (const [sid, pkeys] of writersPerSource.entries()) {
-    if (pkeys.length > 1) {
-      contradictedSources.add(sid);
+  for (const [sid, writerProcs] of writersPerSource.entries()) {
+    if (writerProcs.length > 1) {
+      const trees = groupProcessTrees(writerProcs, allProcs);
+      if (trees.length > 1) {
+        contradictedSources.add(sid);
+      }
     }
   }
   if (contradictedSources.size > 0) {
@@ -496,10 +757,10 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     }
   }
 
-  // Find confirmed substantive trainer process
+  // Find confirmed substantive trainer process (or primary root of a single DDP tree)
   const trainerProc = findSubstantiveTrainerProcess(task, taskObservation, obsTime, input.outputSamples, sourceInfo);
 
-  // Multiple or zero trainer candidates cannot confirm an active run
+  // Multiple unrelated trees or zero trainer candidates cannot confirm an active writer window
   if (!trainerProc) {
     for (const w of nextWindows) {
       w.isOpen = false;
@@ -577,13 +838,7 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     }
 
     const witness = trainerProc.writerSourceEvidence?.[w.sourceId];
-    if (
-      !witness ||
-      !witness.fileIdentity ||
-      witness.fileIdentity.dev !== src.fileIdentity.dev ||
-      witness.fileIdentity.inode !== src.fileIdentity.inode ||
-      witness.eofBytes !== src.eofBytes
-    ) {
+    if (!witnessMatchesSource(witness, src)) {
       w.isOpen = false;
       continue;
     }
@@ -610,12 +865,10 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     }
 
     if (srcEof < curThrough) {
-      // Truncation or rewind closes window
       w.isOpen = false;
       continue;
     }
 
-    // Window advances to current EOF
     w.throughOffset = src.eofBytes;
 
     if (srcEof > curFrom) {
@@ -647,7 +900,7 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     const sourceId = src.sourceId;
     const info = sourceInfo?.[sourceId];
     if (!info || !info.generation || typeof info.generation !== "string" || info.generation.trim() === "") {
-      continue; // No generation fallback
+      continue;
     }
     const gen = info.generation;
     if (!isValidDecimalBytes(src.eofBytes)) {
@@ -683,7 +936,6 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
       continue;
     }
 
-    // Source must be registered with kind: "log"
     const regSource = task.sources.find((s) => s.sourceId === sourceId);
     if (!regSource || regSource.kind !== "log") {
       continue;
@@ -702,13 +954,7 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     }
 
     const witness = trainerProc.writerSourceEvidence?.[sourceId];
-    if (
-      !witness ||
-      !witness.fileIdentity ||
-      witness.fileIdentity.dev !== src.fileIdentity.dev ||
-      witness.fileIdentity.inode !== src.fileIdentity.inode ||
-      witness.eofBytes !== src.eofBytes
-    ) {
+    if (!witnessMatchesSource(witness, src)) {
       continue;
     }
 
@@ -753,8 +999,8 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     if (!window.isOpen || window.runId !== currentRunId || window.observerEpoch !== observerEpoch) continue;
     const source = taskObservation.sources.find((candidate) => candidate.sourceId === window.sourceId);
     const writer = trainerProc.writerSourceEvidence?.[window.sourceId];
-    if (!source || !writer || source.eofBytes !== writer.eofBytes ||
-        !source.fileIdentity || source.fileIdentity.dev !== writer.fileIdentity?.dev || source.fileIdentity.inode !== writer.fileIdentity?.inode ||
+    if (!source || !writer || !witnessMatchesSource(writer, source) ||
+        !source.fileIdentity ||
         !isValidDecimalBytes(source.eofBytes) || !isTimestampValid(source.observedAt, obsTime)) continue;
     polls.push({
       taskId, runId: currentRunId, mainProcessKey: trainerProc.key, windowId: window.windowId,
@@ -805,7 +1051,6 @@ export function bindCompleteRecord(event: LogEvent, state: BindingState): LogEve
     return { ...event, runId: null, bindingId: null };
   }
 
-  // Active open window must exist for this event's source, gen, run, epoch
   const windows = Array.isArray(state.windows) ? state.windows : [];
   const bindings = Array.isArray(state.bindings) ? state.bindings : [];
   const revokedBindingIds = Array.isArray(state.revokedBindingIds) ? state.revokedBindingIds : [];
@@ -825,7 +1070,7 @@ export function bindCompleteRecord(event: LogEvent, state: BindingState): LogEve
     return { ...event, runId: null, bindingId: null };
   }
 
-  const activeWin = candidateWindows[0];
+  const activeWin = candidateWindows[0]!;
 
   const wFrom = parseSafeBigInt(activeWin.fromOffset);
   const wThrough = parseSafeBigInt(activeWin.throughOffset);
@@ -833,7 +1078,6 @@ export function bindCompleteRecord(event: LogEvent, state: BindingState): LogEve
     return { ...event, runId: null, bindingId: null };
   }
 
-  // Enforce semantic algorithm parsing: ordinary text or health text cannot pass
   if (!event.text || event.text.trim().length === 0) {
     return { ...event, runId: null, bindingId: null };
   }
@@ -844,13 +1088,14 @@ export function bindCompleteRecord(event: LogEvent, state: BindingState): LogEve
       !findRegisteredSource(registeredTask, event.sourceId, "log")) {
     return { ...event, runId: null, bindingId: null };
   }
-  const isTrainingOutput = parseRegisteredRecord(registeredTask, event.text, event.sourceId).isTrainingOutput;
-
-  if (!isTrainingOutput) {
-    return { ...event, runId: null, bindingId: null };
+  const parser = taskParser(registeredTask);
+  if (parser !== 'raw') {
+    const isTrainingOutput = parseRegisteredRecord(registeredTask, event.text, event.sourceId).isTrainingOutput;
+    if (!isTrainingOutput) {
+      return { ...event, runId: null, bindingId: null };
+    }
   }
 
-  // Find matching binding within the verified bounds of activeRunId
   const matchingBindings = bindings.filter((b) => {
     if (b === null || typeof b !== "object") return false;
     if (activeWin.activeBindingId && b.bindingId !== activeWin.activeBindingId) return false;
@@ -869,7 +1114,7 @@ export function bindCompleteRecord(event: LogEvent, state: BindingState): LogEve
     return { ...event, runId: null, bindingId: null };
   }
 
-  const matchingBinding = matchingBindings[0];
+  const matchingBinding = matchingBindings[0]!;
 
   return {
     ...event,

@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Remote-only tmux waiter for monitoring all GPUs before one-card launch."""
+"""Remote-only persistent waiter for multi-GPU idle monitoring and host-level auto-start."""
 
 import base64
 import csv
@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import time
+import traceback
 import types
 import uuid
 
@@ -27,6 +28,13 @@ MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_GPU_CSV_BYTES = 16 * 1024
 MAX_JOB_FILES = 256
+GC_TTL_SECONDS = 7 * 24 * 60 * 60
+GC_ORPHAN_LOCK_TTL_SECONDS = 24 * 60 * 60
+GC_KEEP_WORKERS = 3
+MAX_DIAG_LOG_BYTES = 64 * 1024
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_BACKOFF_SECONDS = 10
+MAX_RETRY_BACKOFF_SECONDS = 300
 IDLE_GAP_SECONDS = 15
 POLL_SECONDS = 5
 STATE_DIRECTORY = ".training-monitor-autostart"
@@ -49,10 +57,11 @@ def _python_executable():
 
 
 class _AgentError(Exception):
-    def __init__(self, error_code, message=None):
+    def __init__(self, error_code, message=None, error_params=None):
         super().__init__(error_code)
         self.error_code = error_code
         self.message = message
+        self.error_params = error_params
 
 
 def _monotonic():
@@ -82,7 +91,6 @@ def _valid_iso(value):
 
 
 def _mode_matches(info, expected):
-    # Windows does not expose POSIX mode bits through stat; the remote target is Linux.
     return os.name == "nt" or stat.S_IMODE(info.st_mode) == expected
 
 
@@ -110,9 +118,60 @@ def _lifetime_lock_path(state_root, job_key):
     return os.path.join(state_root, ".server-lifetime-" + job_key + ".lock")
 
 
+def _waiter_pid_path(state_root, job_key):
+    return os.path.join(state_root, ".server-pid-" + job_key + ".json")
+
+
+def _diag_log_path(state_root):
+    return os.path.join(state_root, ".waiter-diag.log")
+
+
 def _worker_source_name(source):
     digest = hashlib.sha256(source).hexdigest()
     return ".server-worker-v1-" + digest + ".py"
+
+
+def _runtime_socket_dir(uid):
+    """Short local-tmpfs directory for tmux.sock and locks (avoids NFS and 108-byte sun_path limit)."""
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    candidates = []
+    if xdg_runtime and os.path.isabs(xdg_runtime) and len(xdg_runtime) < 70:
+        candidates.append(os.path.join(xdg_runtime, "training-monitor"))
+    candidates.append(f"/tmp/training-monitor-{uid}")
+    for candidate in candidates:
+        try:
+            try:
+                info = os.lstat(candidate)
+            except FileNotFoundError:
+                os.makedirs(candidate, mode=0o700, exist_ok=True)
+                os.chmod(candidate, 0o700)
+                info = os.lstat(candidate)
+            if not stat.S_ISLNK(info.st_mode) and stat.S_ISDIR(info.st_mode) and info.st_uid == uid:
+                return candidate
+        except OSError:
+            continue
+    return f"/tmp/training-monitor-{uid}"
+
+
+def _append_diag_log(state_root, text):
+    """Write bounded diagnostic error traces (<= 64 KiB) without ever raising."""
+    try:
+        path = _diag_log_path(state_root)
+        entry = f"[{_iso_now()}] {text.strip()}\n"
+        existing = ""
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8", errors="replace") as stream:
+                existing = stream.read(MAX_DIAG_LOG_BYTES)
+        combined = (existing + entry)[-MAX_DIAG_LOG_BYTES:]
+        tmp = path + f".tmp-{os.getpid()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, combined.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def _strict_string(value, *, nonempty=True, maximum=8192):
@@ -139,7 +198,7 @@ def _normalize_common(request):
         raise _AgentError("INVALID_REQUEST")
     arm_id = _strict_string(request.get("armId"), maximum=128)
     try:
-        arm_id = str(__import__("uuid").UUID(arm_id))
+        arm_id = str(uuid.UUID(arm_id))
     except (ValueError, AttributeError) as exc:
         raise _AgentError("INVALID_REQUEST") from exc
     task_id = _strict_string(request.get("taskId"), maximum=1024)
@@ -150,13 +209,21 @@ def _normalize_common(request):
     task_directories = _strict_string_list(request.get("taskAllowedDirectories"), nonempty=True)
     if any(not os.path.isabs(path) for path in host_roots + task_directories):
         raise _AgentError("INVALID_REQUEST")
-    return {
+    state_dir = request.get("stateDir")
+    if state_dir is not None:
+        state_dir = _strict_string(state_dir)
+        if not os.path.isabs(state_dir) or ".." in state_dir.split("/"):
+            raise _AgentError("INVALID_REQUEST")
+    result = {
         "armId": arm_id,
         "taskId": task_id,
         "configHash": config_hash,
         "hostAllowedRoots": host_roots,
         "taskAllowedDirectories": task_directories,
     }
+    if state_dir is not None:
+        result["stateDir"] = state_dir
+    return result
 
 
 def _validate_manager_request(request):
@@ -174,9 +241,27 @@ def _validate_manager_request(request):
         retry_on_exit = request.get("retryOnExit", False)
         if type(retry_on_exit) is not bool:
             raise _AgentError("INVALID_REQUEST")
-        if retry_on_exit and not any(source.get("kind") == "status_json" for source in launch_request.get("sources", [])):
-            raise _AgentError("INVALID_REQUEST")
         common["retryOnExit"] = retry_on_exit
+        max_retries = request.get("maxRetries", DEFAULT_MAX_RETRIES)
+        if type(max_retries) is not int or not 0 <= max_retries <= 100:
+            raise _AgentError("INVALID_REQUEST")
+        common["maxRetries"] = max_retries
+        retry_backoff = request.get("retryBackoffSeconds", 0)
+        if type(retry_backoff) is not int or not 0 <= retry_backoff <= 3600:
+            raise _AgentError("INVALID_REQUEST")
+        common["retryBackoffSeconds"] = retry_backoff
+        req_gpus = request.get("requiredGpuCount", launch_request.get("requiredGpuCount", 1))
+        if type(req_gpus) is not int or not 1 <= req_gpus <= 64:
+            raise _AgentError("INVALID_REQUEST")
+        common["requiredGpuCount"] = req_gpus
+        for list_field in ("gpuDeviceIds", "gpuExcludeIds"):
+            raw_list = request.get(list_field, launch_request.get(list_field))
+            if raw_list is not None:
+                if not isinstance(raw_list, list) or len(raw_list) > 64 or any(
+                    not isinstance(item, str) or not _DEVICE_ID.fullmatch(item) for item in raw_list
+                ):
+                    raise _AgentError("INVALID_REQUEST")
+                common[list_field] = list(raw_list)
         worker_sha256 = request.get("workerSha256")
         if worker_sha256 is not None:
             normalized_sha = _strict_string(worker_sha256, maximum=64).lower()
@@ -295,7 +380,14 @@ def _validate_launch_request(launcher, common):
         "configHash": common["configHash"],
         "hostAllowedRoots": common["hostAllowedRoots"],
         "taskAllowedDirectories": common["taskAllowedDirectories"],
+        "requiredGpuCount": common.get("requiredGpuCount", 1),
     })
+    if common.get("stateDir"):
+        normalized_request["stateDir"] = common["stateDir"]
+    if "gpuDeviceIds" in common:
+        normalized_request["gpuDeviceIds"] = list(common["gpuDeviceIds"])
+    if "gpuExcludeIds" in common:
+        normalized_request["gpuExcludeIds"] = list(common["gpuExcludeIds"])
     return normalized_request
 
 
@@ -316,20 +408,82 @@ def _check_tmux():
     if result.returncode != 0:
         raise _AgentError("TMUX_UNAVAILABLE")
     output = result.stdout.decode("utf-8", "replace").strip()
-    match = re.fullmatch(r"tmux ([0-9]+)\.([0-9]+)[A-Za-z]?", output)
+    # Accept tmux next-* (git builds), 3.4.1, 3.3a, 2.1+, while rejecting < 2.1.
+    if re.match(r"^tmux\s+next-", output):
+        return executable
+    match = re.match(r"^tmux\s+([0-9]+)\.([0-9]+)(?:\.[0-9]+)?[A-Za-z0-9._-]*$", output)
     if not match or (int(match.group(1)), int(match.group(2))) < (2, 1):
         raise _AgentError("TMUX_UNAVAILABLE")
     return executable
 
 
+def _check_systemd_run():
+    executable = shutil.which("systemd-run")
+    if not executable:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "--user", "--version"],
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+        return executable if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _select_backend(tmux_executable=None):
+    """Choose tmux (preferred), or fall back automatically to systemd-run --user or setsid."""
+    if tmux_executable:
+        return "tmux", tmux_executable
+    try:
+        return "tmux", _check_tmux()
+    except _AgentError:
+        pass
+    systemd_bin = _check_systemd_run()
+    if systemd_bin:
+        return "systemd_run", systemd_bin
+    return "setsid", None
+
+
 def _tmux_base(executable, uid, state_root=None):
-    if state_root is not None:
-        # Keep the socket on the same writable filesystem as the waiter state.
-        return [executable, "-S", os.path.join(state_root, "tmux.sock"), "-f", "/dev/null"]
-    return [executable, "-L", "training-monitor-" + str(uid), "-f", "/dev/null"]
+    # Always keep tmux.sock on local tmpfs ($XDG_RUNTIME_DIR/training-monitor or /tmp/training-monitor-<uid>)
+    # to prevent NFS socket errors and sun_path > 108 byte truncation!
+    sock_dir = _runtime_socket_dir(uid)
+    return [executable, "-S", os.path.join(sock_dir, "tmux.sock"), "-f", "/dev/null"]
 
 
-def _session_exists(executable, uid, session_name, state_root=None):
+def _session_exists(executable, uid, session_name, state_root=None, backend="tmux", job_key=None):
+    if backend == "systemd_run":
+        systemctl = shutil.which("systemctl")
+        if not systemctl:
+            return False
+        try:
+            res = subprocess.run(
+                [systemctl, "--user", "is-active", "--quiet", session_name + ".service"],
+                shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=2, check=False,
+            )
+            return res.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    if backend == "setsid":
+        if not state_root or not job_key:
+            return False
+        try:
+            with open(_waiter_pid_path(state_root, job_key), "r", encoding="utf-8") as stream:
+                info = json.load(stream)
+            pid = info.get("pid")
+            if isinstance(pid, int) and pid > 0:
+                os.kill(pid, 0)
+                return True
+        except (OSError, ValueError):
+            pass
+        return False
     command = _tmux_base(executable, uid, state_root) + ["has-session", "-t", "=" + session_name]
     try:
         result = subprocess.run(
@@ -351,7 +505,7 @@ def _session_exists(executable, uid, session_name, state_root=None):
 
 
 def _lightweight_launcher():
-    """Minimal built-in launcher shim for read-only/cancel ops without embedding 465 KB."""
+    """Minimal built-in launcher shim for read-only/cancel ops without embedding full launcher."""
     try:
         import fcntl as _lw_fcntl
     except ImportError:
@@ -465,13 +619,8 @@ def _extract_launcher_from_worker(worker_bytes):
     return _load_launcher(b64_text)
 
 
-def _new_session(executable, uid, session_name, worker_script, job_key, state_root):
-    command = _tmux_base(executable, uid, state_root) + [
-        "new-session",
-        "-d",
-        "-s",
-        session_name,
-        "--",
+def _new_session(executable, uid, session_name, worker_script, job_key, state_root, backend="tmux"):
+    worker_argv = [
         _python_executable(),
         "-I",
         "-S",
@@ -481,6 +630,47 @@ def _new_session(executable, uid, session_name, worker_script, job_key, state_ro
         job_key,
         state_root,
     ]
+    if backend == "systemd_run":
+        command = [executable, "--user", "--unit=" + session_name, "--collect", "--"] + worker_argv
+        try:
+            result = subprocess.run(
+                command, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise _AgentError("SERVER_WAITER_START_FAILED") from exc
+        if result.returncode != 0:
+            raise _AgentError("SERVER_WAITER_START_FAILED")
+        return
+    if backend == "setsid":
+        try:
+            proc = subprocess.Popen(
+                worker_argv,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            pid_path = _waiter_pid_path(state_root, job_key)
+            tmp = pid_path + f".tmp-{os.getpid()}"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, json.dumps({"pid": proc.pid}).encode("ascii"))
+            finally:
+                os.close(fd)
+            os.replace(tmp, pid_path)
+            return
+        except OSError as exc:
+            raise _AgentError("SERVER_WAITER_START_FAILED") from exc
+    command = _tmux_base(executable, uid, state_root) + [
+        "new-session",
+        "-d",
+        "-s",
+        session_name,
+        "--",
+    ] + worker_argv
     try:
         result = subprocess.run(
             command,
@@ -562,9 +752,6 @@ def _write_all(fd, data):
 
 def _atomic_write(path, state_root, data, launcher, *, exclusive=False):
     mode = os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-    flags = mode | (os.O_EXCL if exclusive else 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     name = os.path.basename(path)
     temporary = os.path.join(
         state_root,
@@ -590,7 +777,6 @@ def _atomic_write(path, state_root, data, launcher, *, exclusive=False):
             except FileExistsError:
                 raise
             except OSError:
-                # link is unavailable on some filesystems; the locked caller still owns creation.
                 os.replace(temporary, path)
             else:
                 os.unlink(temporary)
@@ -687,6 +873,97 @@ def _release_file_lock(fd):
             pass
 
 
+def _gc_state_directory(state_root, launcher, *, now_epoch=None, active_worker_path=None):
+    """Automatic GC of expired terminal waits, old worker scripts, receipts, and orphan locks.
+    Prevents 256-file STATE_FILE_LIMIT self-destruct without ever touching active wait records."""
+    if not state_root or not os.path.isdir(state_root):
+        return 0
+    now = time.time() if now_epoch is None else float(now_epoch)
+    removed = 0
+    try:
+        names = os.listdir(state_root)
+    except OSError:
+        return 0
+
+    terminal_waits = []
+    worker_scripts = []
+    for name in names:
+        full = os.path.join(state_root, name)
+        try:
+            info = os.lstat(full)
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            continue
+        age = max(0.0, now - info.st_mtime)
+
+        if re.fullmatch(r"\.server-wait-[a-f0-9]{64}\.json", name):
+            try:
+                rec = _read_json(full, launcher)
+            except _AgentError:
+                rec = None
+            if rec is None or (rec.get("state") in _TERMINAL_STATES and not _watching_process(rec)):
+                if age >= GC_TTL_SECONDS:
+                    try:
+                        os.unlink(full)
+                        removed += 1
+                    except OSError:
+                        pass
+                else:
+                    terminal_waits.append((info.st_mtime, full))
+            continue
+
+        if re.fullmatch(r"\.server-worker-v1-[a-f0-9]{64}\.py", name):
+            worker_scripts.append((info.st_mtime, full))
+            continue
+
+        if name.startswith((".claim-", ".receipt-", ".exit-", ".server-pid-")) and age >= GC_TTL_SECONDS:
+            try:
+                os.unlink(full)
+                removed += 1
+            except OSError:
+                pass
+            continue
+
+        if name.endswith(".lock") and name.startswith(".server-lifetime-") and age >= GC_ORPHAN_LOCK_TTL_SECONDS:
+            try:
+                fd = _acquire_file_lock(full, launcher, nonblocking=True)
+                if fd is not None:
+                    _release_file_lock(fd)
+                    os.unlink(full)
+                    removed += 1
+            except Exception:
+                pass
+
+    # If still near/over MAX_JOB_FILES, evict oldest terminal wait records so new jobs never hit STATE_FILE_LIMIT
+    remaining_wait_count = sum(
+        1 for n in os.listdir(state_root) if re.fullmatch(r"\.server-wait-[a-f0-9]{64}\.json", n)
+    )
+    if remaining_wait_count >= MAX_JOB_FILES - 16 and terminal_waits:
+        terminal_waits.sort(key=lambda pair: pair[0])
+        to_evict = remaining_wait_count - (MAX_JOB_FILES - 32)
+        for _mtime, path in terminal_waits[:max(0, to_evict)]:
+            try:
+                os.unlink(path)
+                removed += 1
+            except OSError:
+                pass
+
+    # Keep only the newest GC_KEEP_WORKERS worker scripts (plus active_worker_path)
+    if len(worker_scripts) > GC_KEEP_WORKERS:
+        worker_scripts.sort(key=lambda pair: pair[0], reverse=True)
+        for _mtime, path in worker_scripts[GC_KEEP_WORKERS:]:
+            if active_worker_path and os.path.abspath(path) == os.path.abspath(active_worker_path):
+                continue
+            try:
+                os.unlink(path)
+                removed += 1
+            except OSError:
+                pass
+
+    return removed
+
+
 def _status(
     *,
     state,
@@ -698,9 +975,15 @@ def _status(
     started_at=None,
     pid=None,
     error_code=None,
+    error_params=None,
     message=None,
     session_name=None,
     selected_device_id=None,
+    selected_device_ids=None,
+    retry_count=None,
+    max_retries=None,
+    exit_code=None,
+    backend=None,
 ):
     if state not in _ALL_STATES:
         state = "failed"
@@ -720,7 +1003,7 @@ def _status(
         and re.fullmatch(r"tm-wait-[a-f0-9]{40}", session_name)
         else None
     )
-    return {
+    payload = {
         "state": state,
         "armId": arm_id,
         "configHash": config_hash,
@@ -738,6 +1021,21 @@ def _status(
             else None
         ),
     }
+    if isinstance(error_params, dict) and error_params:
+        payload["errorParams"] = error_params
+    if isinstance(selected_device_ids, list) and selected_device_ids:
+        safe_ids = [d for d in selected_device_ids if isinstance(d, str) and _DEVICE_ID.fullmatch(d)]
+        if safe_ids:
+            payload["selectedDeviceIds"] = safe_ids
+    if type(retry_count) is int and retry_count > 0:
+        payload["retryCount"] = retry_count
+    if type(max_retries) is int and max_retries >= 0 and retry_count:
+        payload["maxRetries"] = max_retries
+    if type(exit_code) is int:
+        payload["exitCode"] = exit_code
+    if backend in ("tmux", "systemd_run", "setsid") and backend != "tmux":
+        payload["backend"] = backend
+    return payload
 
 
 def _missing_status(arm_id, config_hash, required_idle=1):
@@ -761,13 +1059,19 @@ def _record_status(record):
         started_at=record.get("startedAt"),
         pid=record.get("pid"),
         error_code=record.get("errorCode"),
+        error_params=record.get("errorParams"),
         message=record.get("message"),
         session_name=record.get("sessionName"),
         selected_device_id=record.get("selectedDeviceId"),
+        selected_device_ids=record.get("selectedDeviceIds"),
+        retry_count=record.get("retryCount"),
+        max_retries=record.get("maxRetries"),
+        exit_code=record.get("exitCode"),
+        backend=record.get("backend"),
     )
 
 
-def _base_record(common, launch_request):
+def _base_record(common, launch_request, backend="tmux"):
     job_key = _job_key(common["taskId"], common["armId"])
     return {
         "version": VERSION,
@@ -779,20 +1083,29 @@ def _base_record(common, launch_request):
         "taskAllowedDirectories": common["taskAllowedDirectories"],
         "idleSeconds": common["idleSeconds"],
         "requiredIdleSeconds": common["idleSeconds"],
+        "requiredGpuCount": common.get("requiredGpuCount", 1),
         "launchRequest": launch_request,
         "retryOnExit": common.get("retryOnExit", False),
+        "maxRetries": common.get("maxRetries", DEFAULT_MAX_RETRIES),
+        "retryBackoffSeconds": common.get("retryBackoffSeconds", DEFAULT_RETRY_BACKOFF_SECONDS),
+        "retryCount": 0,
+        "nextRetryAtEpoch": 0,
         "attemptArmId": common["armId"],
         "processKey": None,
         "retryFinished": False,
+        "exitCode": None,
+        "backend": backend,
         "state": "waiting",
         "idleElapsedSeconds": 0,
         "lastCheckedAt": None,
         "startedAt": None,
         "pid": None,
         "errorCode": None,
+        "errorParams": None,
         "message": None,
         "sessionName": _session_name(job_key),
         "selectedDeviceId": None,
+        "selectedDeviceIds": [],
     }
 
 
@@ -817,6 +1130,7 @@ def _validate_record(record, *, job_key=None):
 
 
 def _matching_records(state_root, launcher, task_id):
+    _gc_state_directory(state_root, launcher)
     try:
         names = os.listdir(state_root)
     except OSError as exc:
@@ -834,12 +1148,14 @@ def _matching_records(state_root, launcher, task_id):
     return records
 
 
-def _set_terminal(record, state, *, error_code, message):
+def _set_terminal(record, state, *, error_code, message, error_params=None):
     record["state"] = state
     record["errorCode"] = error_code
+    record["errorParams"] = error_params
     record["message"] = message
     record["idleElapsedSeconds"] = 0
     record["selectedDeviceId"] = None
+    record["selectedDeviceIds"] = []
 
 
 def _active_record_for_task(state_root, launcher, task_id):
@@ -862,16 +1178,17 @@ def _refresh_lost_session(
 ):
     if record["state"] not in _ACTIVE_STATES and not _watching_process(record):
         return False
-    if tmux_executable is None:
+    backend = record.get("backend") or "tmux"
+    if backend == "tmux" and tmux_executable is None:
         tmux_executable = _check_tmux()
     uid = launcher._current_uid()
-    if _session_exists(tmux_executable, uid, record["sessionName"], state_root):
+    if _session_exists(tmux_executable, uid, record["sessionName"], state_root, backend=backend, job_key=record["jobKey"]):
         return False
     _set_terminal(
         record,
         "failed",
         error_code="SERVER_WAITER_LOST",
-        message="The dedicated tmux waiter session is missing.",
+        message="The dedicated server waiter session is missing.",
     )
     _write_json(path, state_root, record, launcher)
     return True
@@ -910,22 +1227,57 @@ def _existing_server_wait_status(
     return _record_status(record)
 
 
-def _state_directory(host_root, launcher, *, create):
-    state_root = os.path.join(host_root, STATE_DIRECTORY)
-    if not create:
+def _default_persistent_state_dir():
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    if xdg_state and os.path.isabs(xdg_state):
+        return os.path.join(xdg_state, "training-monitor")
+    home = os.path.expanduser("~")
+    if home and home != "~" and os.path.isabs(home):
+        return os.path.join(home, ".local", "state", "training-monitor")
+    return None
+
+
+def _state_directory(host_root, launcher, *, create, state_dir=None):
+    if state_dir:
+        candidate = state_dir
+        if not create:
+            try:
+                info = os.lstat(candidate)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise _AgentError("STATE_DIRECTORY_INVALID") from exc
+            if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != launcher._current_uid()
+                    or not _mode_matches(info, 0o700)):
+                raise _AgentError("STATE_DIRECTORY_INVALID")
+            return candidate
         try:
-            info = os.lstat(state_root)
-        except FileNotFoundError:
-            return None
+            os.makedirs(candidate, mode=0o700, exist_ok=True)
+            os.chmod(candidate, 0o700)
+            return candidate
         except OSError as exc:
             raise _AgentError("STATE_DIRECTORY_INVALID") from exc
-        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
-                or info.st_uid != launcher._current_uid()
-                or not _mode_matches(info, 0o700)):
-            raise _AgentError("STATE_DIRECTORY_INVALID")
-        if os.path.dirname(os.path.realpath(state_root)) != os.path.realpath(host_root):
-            raise _AgentError("STATE_DIRECTORY_INVALID")
-        return state_root
+
+    legacy_root = os.path.join(host_root, STATE_DIRECTORY)
+    if not create:
+        for candidate, check_parent in ((legacy_root, True), (_default_persistent_state_dir(), False)):
+            if not candidate:
+                continue
+            try:
+                info = os.lstat(candidate)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise _AgentError("STATE_DIRECTORY_INVALID") from exc
+            if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != launcher._current_uid()
+                    or not _mode_matches(info, 0o700)):
+                raise _AgentError("STATE_DIRECTORY_INVALID")
+            if check_parent and os.path.dirname(os.path.realpath(candidate)) != os.path.realpath(host_root):
+                raise _AgentError("STATE_DIRECTORY_INVALID")
+            return candidate
+        return None
     try:
         return launcher._state_directory(host_root)
     except launcher._LaunchError as exc:
@@ -937,13 +1289,12 @@ def ensure_server_wait(request, launcher, *, tmux_executable=None, worker_source
     hosts, _tasks = _canonical_roots(
         launcher, common["hostAllowedRoots"], common["taskAllowedDirectories"])
 
-    # Durable terminal and active arm status must remain readable after registered
-    # paths disappear. Reconcile an existing state root before launcher validation.
-    state_root = _state_directory(hosts[0], launcher, create=False)
+    state_root = _state_directory(hosts[0], launcher, create=False, state_dir=common.get("stateDir"))
     if state_root is not None:
         control_fd = _acquire_file_lock(
             _control_lock_path(state_root, common["taskId"]), launcher)
         try:
+            _gc_state_directory(state_root, launcher)
             existing_status = _existing_server_wait_status(
                 common,
                 state_root,
@@ -955,9 +1306,6 @@ def ensure_server_wait(request, launcher, *, tmux_executable=None, worker_source
         finally:
             _release_file_lock(control_fd)
 
-    # On-demand worker deployment: if caller passed workerSha256 without embedding the full
-    # worker source, reuse the verified remote worker script if present; otherwise ask caller
-    # to upload it once.
     reused_worker_script = None
     if worker_source is None and AGENT_SOURCE_B64 == "__SERVER_AGENT_SOURCE_B64__":
         worker_sha = common.get("workerSha256")
@@ -976,8 +1324,8 @@ def ensure_server_wait(request, launcher, *, tmux_executable=None, worker_source
         raise _AgentError("WORKER_SOURCE_REQUIRED")
 
     launch_request = _validate_launch_request(launcher, common)
-    executable = tmux_executable or _check_tmux()
-    state_root = _state_directory(hosts[0], launcher, create=True)
+    backend, executable = _select_backend(tmux_executable)
+    state_root = _state_directory(hosts[0], launcher, create=True, state_dir=common.get("stateDir"))
     if reused_worker_script is None and worker_source is None:
         worker_source = _load_worker_source(AGENT_SOURCE_B64)
     control_fd = _acquire_file_lock(_control_lock_path(state_root, common["taskId"]), launcher)
@@ -988,7 +1336,7 @@ def ensure_server_wait(request, launcher, *, tmux_executable=None, worker_source
             common,
             state_root,
             launcher,
-            tmux_executable=executable,
+            tmux_executable=executable if backend == "tmux" else None,
         )
         if existing_status is not None and not _can_restore_waiter(common, existing_status):
             return existing_status
@@ -1005,12 +1353,12 @@ def ensure_server_wait(request, launcher, *, tmux_executable=None, worker_source
             )
 
         worker_script = reused_worker_script or _write_worker_script(worker_source, state_root, launcher)
-        record = _base_record(common, launch_request)
+        _gc_state_directory(state_root, launcher, active_worker_path=worker_script)
+        record = _base_record(common, launch_request, backend=backend)
         restoring = existing_status is not None
         if restoring:
             previous = _read_json(path, launcher)
             record["retryCount"] = previous.get("retryCount", 0)
-            # The original launch attempt may already have a receipt.
             record["attemptArmId"] = str(uuid.uuid4())
         if not _write_json(path, state_root, record, launcher, exclusive=not restoring):
             raise _AgentError("STATE_FILE_EXISTS")
@@ -1022,18 +1370,24 @@ def ensure_server_wait(request, launcher, *, tmux_executable=None, worker_source
                 worker_script,
                 job_key,
                 state_root,
+                backend=backend,
             )
         except _AgentError as exc:
             _set_terminal(
                 record,
                 "failed",
                 error_code=exc.error_code,
-                message="The dedicated tmux waiter could not be started.",
+                message="The dedicated server waiter could not be started.",
             )
             _write_json(path, state_root, record, launcher)
             return _record_status(record)
         record["lastCheckedAt"] = _iso_now()
-        record["message"] = "Waiting for one GPU to remain continuously idle."
+        req_count = record.get("requiredGpuCount", 1)
+        record["message"] = (
+            f"Waiting for {req_count} GPUs to remain continuously idle."
+            if req_count > 1
+            else "Waiting for one GPU to remain continuously idle."
+        )
         _write_json(path, state_root, record, launcher)
         return _record_status(record)
     except launcher._LaunchError as exc:
@@ -1051,11 +1405,12 @@ def get_server_wait(request, launcher, *, tmux_executable=None):
     task_id = common["taskId"]
     hosts, _tasks = _canonical_roots(
         launcher, common["hostAllowedRoots"], common["taskAllowedDirectories"])
-    state_root = _state_directory(hosts[0], launcher, create=False)
+    state_root = _state_directory(hosts[0], launcher, create=False, state_dir=common.get("stateDir"))
     if state_root is None:
         return _missing_status(common["armId"], common["configHash"])
     control_fd = _acquire_file_lock(_control_lock_path(state_root, task_id), launcher)
     try:
+        _gc_state_directory(state_root, launcher)
         job_key = _job_key(task_id, common["armId"])
         path = _job_path(state_root, job_key)
         record = _read_json(path, launcher)
@@ -1106,6 +1461,7 @@ def _reconcile_starting(record, state_root, launcher):
         record["startedAt"] = receipt.get("startedAt")
         record["processKey"] = receipt.get("processKey")
         record["errorCode"] = None
+        record["errorParams"] = None
         record["message"] = "The registered task was started."
         return True
     if receipt.get("status") == "failed":
@@ -1123,11 +1479,12 @@ def cancel_server_wait(request, launcher):
     common = _validate_manager_request(request)
     hosts, _tasks = _canonical_roots(
         launcher, common["hostAllowedRoots"], common["taskAllowedDirectories"])
-    state_root = _state_directory(hosts[0], launcher, create=False)
+    state_root = _state_directory(hosts[0], launcher, create=False, state_dir=common.get("stateDir"))
     if state_root is None:
         return _missing_status(common["armId"], common["configHash"])
     control_fd = _acquire_file_lock(_control_lock_path(state_root, common["taskId"]), launcher)
     try:
+        _gc_state_directory(state_root, launcher)
         job_key = _job_key(common["taskId"], common["armId"])
         path = _job_path(state_root, job_key)
         record = _read_json(path, launcher)
@@ -1293,59 +1650,106 @@ def _best_candidate(candidates):
     return candidates[0] if candidates else None
 
 
-def _reset_candidate_idle_state(idle_state, candidate):
-    gpu_uuid = candidate["uuid"]
-    idle_state.get("idleSince", {}).pop(gpu_uuid, None)
-    idle_state.get("indexes", {}).pop(gpu_uuid, None)
+def _select_candidates(candidates, required_count):
+    """Select top N deterministic idle candidates; returns (selected_list, effective_elapsed_seconds)."""
+    count = max(1, int(required_count or 1))
+    if len(candidates) < count:
+        return [], 0
+    chosen = candidates[:count]
+    # All N GPUs must be simultaneously idle for requiredIdleSeconds -> bottleneck is the min elapsed among top N.
+    effective_elapsed = min(item["elapsedSeconds"] for item in chosen)
+    return chosen, effective_elapsed
 
 
-def _set_progress(record, best, state=None, message=None):
+def _reset_candidate_idle_state(idle_state, candidate_or_list):
+    items = candidate_or_list if isinstance(candidate_or_list, list) else [candidate_or_list]
+    for candidate in items:
+        gpu_uuid = candidate["uuid"]
+        idle_state.get("idleSince", {}).pop(gpu_uuid, None)
+        idle_state.get("indexes", {}).pop(gpu_uuid, None)
+
+
+def _set_progress(record, selected, state=None, message=None, error_code=None, error_params=None, elapsed_override=None):
     record["lastCheckedAt"] = _iso_now()
-    if best is None:
+    items = selected if isinstance(selected, list) else ([selected] if selected else [])
+    if not items:
         record["idleElapsedSeconds"] = 0
         record["selectedDeviceId"] = None
+        record["selectedDeviceIds"] = []
         record["state"] = state or "waiting"
-        record["errorCode"] = None
-        record["message"] = message or "No GPU is currently idle."
+        record["errorCode"] = error_code
+        record["errorParams"] = error_params
+        record["message"] = message or "No eligible GPU is currently idle."
     else:
-        record["idleElapsedSeconds"] = best["elapsedSeconds"]
-        record["selectedDeviceId"] = best["deviceId"]
-        record["state"] = state or ("countdown" if best["elapsedSeconds"] > 0 else "waiting")
-        record["errorCode"] = None
+        elapsed = elapsed_override if elapsed_override is not None else min(c["elapsedSeconds"] for c in items)
+        record["idleElapsedSeconds"] = elapsed
+        record["selectedDeviceId"] = items[0]["deviceId"]
+        record["selectedDeviceIds"] = [c["deviceId"] for c in items]
+        record["state"] = state or ("countdown" if elapsed > 0 else "waiting")
+        record["errorCode"] = error_code
+        record["errorParams"] = error_params
         record["message"] = message or "Timing continuous GPU idle state."
 
 
-def _restrict_gpu_candidates(candidates, launch_resources):
+def _restrict_gpu_candidates(candidates, launch_resources, *, state_root=None, launcher=None):
+    filtered = list(candidates)
     allowed = launch_resources.get("gpuDeviceIds")
-    if not isinstance(allowed, list) or not allowed:
-        return candidates
-    permitted = set(allowed)
-    return [candidate for candidate in candidates if candidate["deviceId"] in permitted]
+    if isinstance(allowed, list) and allowed:
+        permitted = set(allowed)
+        filtered = [c for c in filtered if c["deviceId"] in permitted]
+    excluded = launch_resources.get("gpuExcludeIds")
+    if isinstance(excluded, list) and excluded:
+        denied = set(excluded)
+        filtered = [c for c in filtered if c["deviceId"] not in denied]
+    # Host-level FIFO coordination: exclude GPUs that already have an exclusive lock held
+    # by a launching/warming-up task so multiple waiters never race on the same card.
+    if launcher is not None and not launch_resources.get("gpuSharing") and hasattr(launcher, "_is_gpu_locked"):
+        lock_dirs = []
+        if hasattr(launcher, "_runtime_lock_dir"):
+            try:
+                lock_dirs.append(launcher._runtime_lock_dir())
+            except Exception:
+                pass
+        if state_root and state_root not in lock_dirs:
+            lock_dirs.append(state_root)
+        unlocked = []
+        for c in filtered:
+            if any(launcher._is_gpu_locked(ld, c["uuid"]) for ld in lock_dirs):
+                continue
+            unlocked.append(c)
+        filtered = unlocked
+    return filtered
 
 
-def _chosen_launch_request(record, candidate):
+def _chosen_launch_request(record, candidate_or_list):
+    items = candidate_or_list if isinstance(candidate_or_list, list) else [candidate_or_list]
     launch_request = copy.deepcopy(record["launchRequest"])
     launch_request["armId"] = record.get("attemptArmId", launch_request["armId"])
-    launch_request["gpuDevices"] = [{
-        "deviceId": candidate["deviceId"],
-        "uuid": candidate["uuid"],
-    }]
+    launch_request["gpuDevices"] = [
+        {"deviceId": c["deviceId"], "uuid": c["uuid"]}
+        for c in items
+    ]
     return launch_request
 
 
-def _launch_candidate(record, path, state_root, launcher, candidate):
+def _launch_candidate(record, path, state_root, launcher, candidate_or_list):
+    items = candidate_or_list if isinstance(candidate_or_list, list) else [candidate_or_list]
+    elapsed = min(c["elapsedSeconds"] for c in items)
     record["state"] = "starting"
-    record["selectedDeviceId"] = candidate["deviceId"]
-    record["idleElapsedSeconds"] = candidate["elapsedSeconds"]
+    record["selectedDeviceId"] = items[0]["deviceId"]
+    record["selectedDeviceIds"] = [c["deviceId"] for c in items]
+    record["idleElapsedSeconds"] = elapsed
     record["lastCheckedAt"] = _iso_now()
     record["errorCode"] = None
-    record["message"] = "The selected GPU is ready; starting the registered task."
+    record["errorParams"] = None
+    record["message"] = "Selected GPU(s) ready; starting the registered task."
     _write_json(path, state_root, record, launcher)
     try:
-        result = launcher.launch_task(_chosen_launch_request(record, candidate))
+        result = launcher.launch_task(_chosen_launch_request(record, items))
     except launcher._LaunchError as exc:
         result = {"status": "failed", "errorCode": exc.error_code}
     except Exception:
+        _append_diag_log(state_root, traceback.format_exc())
         result = {"status": "failed", "errorCode": "UNKNOWN_LAUNCH_RESULT"}
     status_value = result.get("status") if isinstance(result, dict) else None
     if status_value == "started":
@@ -1361,6 +1765,7 @@ def _launch_candidate(record, path, state_root, launcher, candidate):
             record["processKey"] = result.get("processKey")
             record["lastCheckedAt"] = _iso_now()
             record["errorCode"] = None
+            record["errorParams"] = None
             record["message"] = "The registered task was started."
             _write_json(path, state_root, record, launcher)
             return not record.get("retryOnExit", False)
@@ -1368,7 +1773,9 @@ def _launch_candidate(record, path, state_root, launcher, candidate):
         record["state"] = "blocked" if status_value == "already_running" else "waiting"
         record["idleElapsedSeconds"] = 0
         record["selectedDeviceId"] = None
+        record["selectedDeviceIds"] = []
         record["errorCode"] = None if status_value == "busy" else "TASK_ALREADY_RUNNING"
+        record["errorParams"] = None
         record["message"] = (
             "The launch was busy; idle timers will recount."
             if status_value == "busy"
@@ -1388,9 +1795,12 @@ def _launch_candidate(record, path, state_root, launcher, candidate):
     )
     _write_json(path, state_root, record, launcher)
     if record.get("retryOnExit"):
-        _prepare_retry(record, idle_state=None)
+        if _can_retry_again(record):
+            _prepare_retry(record, idle_state=None)
+            _write_json(path, state_root, record, launcher)
+            return False
+        _mark_max_retries_exceeded(record)
         _write_json(path, state_root, record, launcher)
-        return False
     return True
 
 
@@ -1412,11 +1822,33 @@ def _process_is_running(key, proc_root="/proc"):
     except (FileNotFoundError, ProcessLookupError, KeyError, IndexError):
         return False
     except OSError:
-        # An incomplete identity check must not cause a second copy to launch.
         return True
 
 
-def _completion_reported(record, launcher):
+def _read_exit_code(record, state_root, launcher):
+    """Read real exit code written by supervisor wrapper when available."""
+    if not hasattr(launcher, "_exit_receipt_path"):
+        return None
+    attempt_arm = record.get("attemptArmId", record.get("armId"))
+    exit_path = launcher._exit_receipt_path(state_root, record["taskId"], attempt_arm)
+    try:
+        data = _read_json(exit_path, launcher)
+    except _AgentError:
+        return None
+    if isinstance(data, dict) and type(data.get("exitCode")) is int:
+        if record.get("pid") is None or data.get("pid") == record.get("pid"):
+            return data["exitCode"]
+    return None
+
+
+def _completion_reported(record, state_root, launcher):
+    # Priority 1: supervisor recorded real exitCode == 0
+    exit_code = _read_exit_code(record, state_root, launcher)
+    if exit_code is not None:
+        record["exitCode"] = exit_code
+        if exit_code == 0:
+            return True
+    # Priority 2: standard status_json / HuggingFace trainer_state.json
     for source in record["launchRequest"].get("sources", []):
         if source.get("kind") != "status_json":
             continue
@@ -1428,25 +1860,49 @@ def _completion_reported(record, launcher):
             status = json.loads(opened["data"])
         except (ValueError, TypeError, KeyError):
             continue
-        if not isinstance(status, dict) or status.get("status") not in {"completed", "finished", "succeeded", "success"}:
+        if not isinstance(status, dict):
             continue
-        if record.get("pid") and status.get("pid") != record["pid"]:
+        # HuggingFace trainer_state.json completion check
+        if isinstance(status.get("global_step"), (int, float)) and isinstance(status.get("max_steps"), (int, float)):
+            if status["max_steps"] > 0 and status["global_step"] >= status["max_steps"]:
+                return True
+        if status.get("status") not in {"completed", "finished", "succeeded", "success"}:
             continue
-        total, done = status.get("total_samples"), status.get("completed_samples")
-        if isinstance(total, (int, float)) and (not isinstance(done, (int, float)) or done < total):
+        if record.get("pid") and status.get("pid") is not None and status.get("pid") != record["pid"]:
             continue
         return True
     return False
 
 
+def _can_retry_again(record):
+    max_retries = record.get("maxRetries", DEFAULT_MAX_RETRIES)
+    return record.get("retryCount", 0) < max_retries
+
+
+def _mark_max_retries_exceeded(record):
+    max_retries = record.get("maxRetries", DEFAULT_MAX_RETRIES)
+    record["retryFinished"] = True
+    _set_terminal(
+        record,
+        "failed",
+        error_code="MAX_RETRIES_EXCEEDED",
+        error_params={"retryCount": record.get("retryCount", 0), "maxRetries": max_retries},
+        message=f"Maximum retry count ({max_retries}) reached; automatic retry stopped.",
+    )
+
+
 def _prepare_retry(record, idle_state):
     record["previousPid"] = record.get("pid")
     record["attemptArmId"] = str(uuid.uuid4())
-    record["retryCount"] = record.get("retryCount", 0) + 1
+    next_count = record.get("retryCount", 0) + 1
+    record["retryCount"] = next_count
+    base_backoff = record.get("retryBackoffSeconds", 0)
+    delay = min(MAX_RETRY_BACKOFF_SECONDS, base_backoff * (2 ** max(0, next_count - 1))) if base_backoff > 0 else 0
+    record["nextRetryAtEpoch"] = time.time() + delay if delay > 0 else 0
     record["pid"] = None
     record["processKey"] = None
     record["startedAt"] = None
-    _set_progress(record, None, message="Task exited before completion; waiting for any idle GPU.")
+    _set_progress(record, None, message="Task exited before completion; waiting for eligible idle GPU(s).")
     if idle_state is not None:
         idle_state.clear()
         idle_state.update(_new_idle_state())
@@ -1463,14 +1919,20 @@ def _retry_iteration(job_key, state_root, launcher, idle_state):
             record["lastCheckedAt"] = _iso_now()
             _write_json(path, state_root, record, launcher)
             return True
-        if _completion_reported(record, launcher):
+        if _completion_reported(record, state_root, launcher):
             record["retryFinished"] = True
             record["state"] = "started"
+            record["errorCode"] = None
+            record["errorParams"] = None
             record["message"] = "Task completed; automatic retry has finished."
             record["lastCheckedAt"] = _iso_now()
             _write_json(path, state_root, record, launcher)
             return False
         if record["state"] == "started":
+            if not _can_retry_again(record):
+                _mark_max_retries_exceeded(record)
+                _write_json(path, state_root, record, launcher)
+                return False
             _prepare_retry(record, idle_state)
             _write_json(path, state_root, record, launcher)
             return True
@@ -1498,7 +1960,8 @@ def _worker_iteration(
             return retry_result
     if record["state"] in _TERMINAL_STATES:
         return False
-    if not _session_exists(tmux_executable, launcher._current_uid(), record["sessionName"], state_root):
+    backend = record.get("backend") or "tmux"
+    if not _session_exists(tmux_executable, launcher._current_uid(), record["sessionName"], state_root, backend=backend, job_key=job_key):
         control_fd = _acquire_file_lock(
             _control_lock_path(state_root, record["taskId"]), launcher)
         try:
@@ -1509,12 +1972,17 @@ def _worker_iteration(
                     record,
                     "failed",
                     error_code="SERVER_WAITER_LOST",
-                    message="The dedicated tmux waiter session is missing.",
+                    message="The dedicated server waiter session is missing.",
                 )
                 _write_json(path, state_root, record, launcher)
         finally:
             _release_file_lock(control_fd)
         return False
+
+    # Enforce retry backoff window if recovering from a prior exit
+    next_retry_at = record.get("nextRetryAtEpoch", 0)
+    if isinstance(next_retry_at, (int, float)) and next_retry_at > 0 and time.time() < next_retry_at:
+        return True
 
     launch_resources = record["launchRequest"]
     disk_floor = launch_resources.get("minFreeDiskMiB", 0)
@@ -1527,11 +1995,18 @@ def _worker_iteration(
                 if record["state"] in _TERMINAL_STATES:
                     return False
                 _reset_idle_state(idle_state, _monotonic())
-                _set_progress(record, None, message=f"输出磁盘可用空间不足 {disk_floor} MiB，等待恢复后启动。")
+                _set_progress(
+                    record,
+                    None,
+                    error_code="DISK_SPACE_LOW",
+                    error_params={"minFreeDiskMiB": disk_floor},
+                    message=f"Free output disk space is below {disk_floor} MiB.",
+                )
                 _write_json(path, state_root, record, launcher)
                 return True
             finally:
                 _release_file_lock(control)
+
     query_started = _monotonic()
     try:
         query = (launcher._probe()._query_linux_gpu(include_free=True) if launch_resources.get("minFreeMemoryMiB")
@@ -1539,7 +2014,10 @@ def _worker_iteration(
     except Exception:
         query = {"status": "unavailable", "errorCode": "NVIDIA_SMI_UNAVAILABLE"}
     query_finished = _monotonic()
-    if (isinstance(query, dict) and query.get("status") == "ok"
+    query_error_code = None
+    query_message = None
+    if (query_finished >= query_started
+            and isinstance(query, dict) and query.get("status") == "ok"
             and isinstance(query.get("csv"), str)):
         candidates = _update_idle_timers(
             query["csv"],
@@ -1549,19 +2027,24 @@ def _worker_iteration(
             idle_state,
             launch_resources.get("minFreeMemoryMiB"),
         )
-        query_message = None
     else:
         _update_idle_timers("", 0, 0, query_finished, idle_state)
         candidates = []
+        query_error_code = "GPU_UNAVAILABLE"
         query_message = "GPU state is unavailable; idle timers were reset."
-    del query_started
+
     if launch_resources.get("gpuSharing"):
         candidates = [c for c in candidates if launcher._sharing_candidate_allowed(state_root, launch_resources, c["uuid"])]
         if not candidates and query_message is None:
-            query_message = "等待可用显存和共享 GPU 名额；同卡启动阶段依次进行。"
-    elif launch_resources.get("minFreeMemoryMiB") and not candidates:
-        query_message = "等待 GPU 可用显存达到设定门槛。"
-    best = _best_candidate(_restrict_gpu_candidates(candidates, launch_resources))
+            query_error_code = "GPU_SHARING_WAITING"
+            query_message = "Waiting for free GPU memory and shared GPU slot."
+    elif launch_resources.get("minFreeMemoryMiB") and not candidates and query_message is None:
+        query_error_code = "GPU_FREE_MEMORY_LOW"
+        query_message = "Waiting for GPU free memory threshold."
+
+    eligible = _restrict_gpu_candidates(candidates, launch_resources, state_root=state_root, launcher=launcher)
+    required_gpu_count = max(1, int(record.get("requiredGpuCount", launch_resources.get("requiredGpuCount", 1))))
+    chosen, effective_elapsed = _select_candidates(eligible, required_gpu_count)
 
     control_fd = _acquire_file_lock(_control_lock_path(state_root, record["taskId"]), launcher)
     try:
@@ -1582,10 +2065,8 @@ def _worker_iteration(
             return False
 
         try:
-            launch_request = launcher._validate_request(_chosen_launch_request(
-                record,
-                best or {"deviceId": "GPU 0", "uuid": "GPU-server-waiter"},
-            ))
+            dummy_devices = chosen if chosen else [{"deviceId": "GPU 0", "uuid": "GPU-server-waiter"}]
+            launch_request = launcher._validate_request(_chosen_launch_request(record, dummy_devices))
             hosts, tasks = launcher._probe()._canonical_task_roots(
                 record["hostAllowedRoots"], record["taskAllowedDirectories"])
             scan = launcher._scan_for_registered_process(
@@ -1595,29 +2076,33 @@ def _worker_iteration(
         except Exception:
             scan = launcher._LaunchError("PROCESS_SCAN_INCOMPLETE")
         if isinstance(scan, launcher._LaunchError):
-            _set_progress(record, None, state="blocked", message="Process scan is incomplete.")
-            record["errorCode"] = scan.error_code
+            _set_progress(record, None, state="blocked", error_code=scan.error_code, message="Process scan is incomplete.")
             record["lastCheckedAt"] = _iso_now()
             _reset_idle_state(idle_state, _monotonic())
             _write_json(path, state_root, record, launcher)
             return True
         if scan is not None:
-            _set_progress(record, None, state="blocked", message="A registered task process is running.")
-            record["errorCode"] = "TASK_ALREADY_RUNNING"
+            _set_progress(record, None, state="blocked", error_code="TASK_ALREADY_RUNNING", message="A registered task process is running.")
             _reset_idle_state(idle_state, _monotonic())
             _write_json(path, state_root, record, launcher)
             return True
 
-        if best is not None and best["elapsedSeconds"] >= record["requiredIdleSeconds"]:
-            terminal = _launch_candidate(record, path, state_root, launcher, best)
+        if chosen and effective_elapsed >= record["requiredIdleSeconds"]:
+            terminal = _launch_candidate(record, path, state_root, launcher, chosen)
             if not terminal:
                 if record["state"] == "blocked":
                     _reset_idle_state(idle_state, _monotonic())
                 else:
-                    _reset_candidate_idle_state(idle_state, best)
+                    _reset_candidate_idle_state(idle_state, chosen)
             return not terminal
 
-        _set_progress(record, best, message=query_message)
+        _set_progress(
+            record,
+            chosen,
+            message=query_message,
+            error_code=query_error_code if not chosen else None,
+            elapsed_override=effective_elapsed,
+        )
         _write_json(path, state_root, record, launcher)
         return True
     finally:
@@ -1667,7 +2152,6 @@ def _emit_worker_progress(job_key, state_root, launcher):
         sys.stdout.write(_worker_progress_line(record) + "\n")
         sys.stdout.flush()
     except Exception:
-        # Attached tmux output is advisory and must never affect waiting or launch.
         return
 
 
@@ -1676,27 +2160,34 @@ def _run_worker(job_key, state_root, launcher, *, max_iterations=None):
         return 2
     if not isinstance(state_root, str) or not os.path.isabs(state_root):
         return 2
-    host_root = os.path.dirname(state_root)
-    if _state_directory(host_root, launcher, create=False) != state_root:
+    try:
+        info = os.lstat(state_root)
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != launcher._current_uid()
+                or not _mode_matches(info, 0o700)):
+            return 2
+    except OSError:
         return 2
     lifetime_fd = _acquire_file_lock(
         _lifetime_lock_path(state_root, job_key), launcher, nonblocking=True)
     if lifetime_fd is None:
         return 3
     try:
-        executable = _check_tmux()
+        record_init = _read_json(_job_path(state_root, job_key), launcher)
+        backend = (record_init or {}).get("backend") or "tmux"
+        executable = _check_tmux() if backend == "tmux" else None
         idle_state = _new_idle_state()
         iterations = 0
         while max_iterations is None or iterations < max_iterations:
             iterations += 1
+            if iterations % 60 == 1:
+                _gc_state_directory(state_root, launcher)
             try:
                 keep_waiting = _worker_iteration(
                     job_key, state_root, launcher, idle_state, tmux_executable=executable)
             except (_AgentError, OSError) as exc:
                 if not _storage_exhausted(exc):
                     raise
-                # An atomic state write can fail even while launch is gated on disk space.
-                # Keep the tmux worker alive and restart the countdown after storage recovers.
                 _reset_idle_state(idle_state, None)
                 keep_waiting = True
             if not keep_waiting:
@@ -1707,6 +2198,7 @@ def _run_worker(job_key, state_root, launcher, *, max_iterations=None):
                 _sleep(POLL_SECONDS)
         return 0
     except _AgentError as exc:
+        _append_diag_log(state_root, f"AgentError({exc.error_code}): {exc.message or ''}\n{traceback.format_exc()}")
         try:
             control_fd = _acquire_file_lock(
                 _control_lock_path(state_root, _read_json(
@@ -1722,6 +2214,7 @@ def _run_worker(job_key, state_root, launcher, *, max_iterations=None):
                     record,
                     "failed",
                     error_code=exc.error_code,
+                    error_params=exc.error_params,
                     message=exc.message or "The server waiter failed.",
                 )
                 _write_json(_job_path(state_root, job_key), state_root, record, launcher)
@@ -1729,6 +2222,9 @@ def _run_worker(job_key, state_root, launcher, *, max_iterations=None):
             return 1
         finally:
             _release_file_lock(control_fd)
+        return 1
+    except Exception:
+        _append_diag_log(state_root, traceback.format_exc())
         return 1
     finally:
         _release_file_lock(lifetime_fd)
@@ -1784,6 +2280,7 @@ def _failure_payload(request, error):
         config_hash=config_hash,
         required_idle=required_idle,
         error_code=error.error_code,
+        error_params=getattr(error, "error_params", None),
         message=error.message or "The server waiter request failed.",
     )
 

@@ -6,12 +6,15 @@ import { readFile } from 'node:fs/promises';
 import { createMockApi } from '../mocks/api';
 import { createProductionApi, type ProductionMonitorApi } from '../collector/service';
 import { createPreferencesStore } from '../registry/preferences';
+import type { Preferences } from '../shared/contracts';
 import { createRegistryStore } from '../registry/config';
 import { openStore } from '../store/client';
 import { createTransport, HostSessionPool } from '../transport/transport';
 import { createGpuWindowManager, createWindow } from './window';
 import { registerMonitorIpc } from './ipc';
 import { runStoreCanary } from './runtime-canary';
+import { CHANNELS } from './channels';
+import { appendJobControlAudit, showDesktopAlert } from './notifications';
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) app.quit();
@@ -84,6 +87,18 @@ if (gotLock) {
           clock: Date.now,
           preferencesProvider: () => preferencesStore.load(),
           preferencesSaver: (preferences) => preferencesStore.save(preferences),
+          onAlert: async (alert) => {
+            const prefs: Preferences = await preferencesStore.load().catch((): Preferences => ({ theme: 'system' }));
+            if (prefs.alerts?.desktopNotifications === false) return;
+            showDesktopAlert(alert, (taskId) => {
+              if (!mainWindow || mainWindow.isDestroyed()) return;
+              if (mainWindow.isMinimized()) mainWindow.restore();
+              mainWindow.show();
+              mainWindow.focus();
+              if (taskId) mainWindow.webContents.send(CHANNELS.focusTask, taskId);
+            });
+          },
+          auditJobControl: (entry) => appendJobControlAudit(userData, entry).catch(() => undefined),
         });
         api = productionApi;
         await productionApi.start();

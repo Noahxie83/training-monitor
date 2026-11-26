@@ -1,34 +1,102 @@
 export type Freshness = 'fresh' | 'stale' | 'unobserved';
 export type Confidence = 'high' | 'medium' | 'low' | 'none';
+export type AttributionConfidence = 'confirmed_process' | 'inferred_tree' | 'log_only' | 'none';
 export type Bytes = string;
-export type Lifecycle = 'running' | 'queued' | 'ready_not_training' | 'completed' | 'failed' | 'unconfirmed' | 'not_observed' | 'unknown';
+export type Lifecycle =
+  | 'running'
+  | 'queued'
+  | 'ready_not_training'
+  | 'completed'
+  | 'failed'
+  | 'stopped_unconfirmed'
+  | 'unconfirmed'
+  | 'not_observed'
+  | 'unknown';
 export type HostKind = 'ssh' | 'wsl' | 'local';
 export type AcceleratorAvailability = 'available' | 'none' | 'unavailable';
+export type ProgressUnit =
+  | 'step'
+  | 'epoch'
+  | 'token'
+  | 'sample'
+  | 'percent'
+  | 'completed_iterations'
+  | 'unknown';
 
 export interface Stamp { observedAt: string | null; freshness: Freshness }
 export interface ProcessKey { hostBootId: string; pid: number; startTicks: string }
 export interface ProcessInstance {
   key: ProcessKey | null;
   pid: number;
+  ppid?: number | null;
+  pgid?: number | null;
+  nsPid?: number | null;
   parentKey: ProcessKey | null;
   cwd: string | null;
   scriptEntry: string | null;
   launcherEntry?: string | null;
+  exe?: string | null;
+  command?: string | null;
   role: 'trainer' | 'queue' | 'worker' | 'unknown';
   observedAt: string;
 }
+
+export interface GpuActiveProcess {
+  pid: number;
+  command: string;
+  user?: string | null;
+  memoryMiB: number | null;
+  smUtilPct?: number | null;
+}
+
+export interface GpuDeviceDetail {
+  deviceId: string;
+  index: number;
+  uuid: string;
+  name?: string | null;
+  utilizationPct?: number | null;
+  memoryUsedMiB?: number | null;
+  memoryTotalMiB?: number | null;
+  memoryFreeMiB?: number | null;
+  temperatureC?: number | null;
+  powerDrawW?: number | null;
+  powerLimitW?: number | null;
+  fanSpeedPct?: number | null;
+  pciBusId?: string | null;
+  computeMode?: string | null;
+  eccErrors?: number | null;
+  activeProcesses?: GpuActiveProcess[];
+}
+
 export interface HostGpuSnapshot {
   observedAt: string | null;
   state: 'available' | 'unavailable';
   acceleratorAvailability?: AcceleratorAvailability;
   errorCode: string | null;
   metrics: ResourceMetric[];
+  devices?: GpuDeviceDetail[];
 }
+
+export interface HostDiskUsage {
+  path: string;
+  usedBytes: Bytes;
+  availableBytes: Bytes;
+  totalBytes: Bytes;
+}
+
+export interface HostSystemHealth extends Stamp {
+  cpuUtilizationPct: number | null;
+  memoryUsedBytes: Bytes | null;
+  memoryTotalBytes: Bytes | null;
+  disks: HostDiskUsage[];
+}
+
 export interface TaskGpuUsage extends Stamp {
   state: 'available' | 'unavailable';
   errorCode: string | null;
   processKeys: ProcessKey[];
 }
+
 export interface HostSnapshot extends Stamp {
   version: 1;
   hostId: string;
@@ -42,15 +110,18 @@ export interface HostSnapshot extends Stamp {
   consecutiveFailures?: number;
   acceleratorAvailability?: AcceleratorAvailability;
   gpu?: HostGpuSnapshot;
+  system?: HostSystemHealth;
 }
+
 export interface CountView {
   completedCount: number | null;
   targetCount: number | null;
   fraction: number | null;
-  unit: 'completed_iterations' | 'unknown';
+  unit: ProgressUnit;
   verified: boolean;
   sourceId: string | null;
 }
+
 export interface Progress extends Stamp {
   runId: string | null;
   lastStepIndex: number | null;
@@ -60,19 +131,31 @@ export interface Progress extends Stamp {
   firstLoopIndex: number | null;
   global: CountView;
   session: CountView;
+  resumedSession?: CountView | null;
+  unit?: ProgressUnit;
+  current?: number | null;
+  total?: number | null;
+  scalars?: Record<string, number>;
+  progressFreshness?: Freshness;
   configuredTarget: { value: number; meaning: 'exclusive_index' | 'count' | 'unknown' } | null;
   iterationsPerSecond: number | null;
   etaSeconds: number | null;
 }
+
 export interface Checkpoint extends Stamp {
   path: string | null;
   fileStepIndex: number | null;
-  stepSource: 'filename' | null;
+  stepSource: 'filename' | 'metadata' | null;
   sizeBytes: Bytes | null;
   mtime: string | null;
   evidence: 'none' | 'file_found' | 'file_stable_observed';
   scanComplete: boolean;
+  isDirectory?: boolean;
+  fileCount?: number | null;
+  name?: string | null;
+  metadata?: Record<string, string | number | boolean | null> | null;
 }
+
 export type ResourceMetric = Stamp & {
   source: string;
   name: 'gpu_utilization' | 'gpu_memory_used' | 'gpu_memory_total' | 'cpu_utilization' | 'process_rss';
@@ -82,6 +165,7 @@ export type ResourceMetric = Stamp & {
   | { scope: 'device'; deviceId: string; processKey: null }
   | { scope: 'process'; deviceId: string | null; processKey: ProcessKey }
 );
+
 export interface TaskSnapshot {
   version: 1;
   taskId: string;
@@ -90,6 +174,9 @@ export interface TaskSnapshot {
   freshness: Freshness;
   statusObservedAt: string | null;
   confidence: Confidence;
+  attributionConfidence?: AttributionConfidence;
+  exitCode?: number | null;
+  terminalSummary?: string | null;
   reason: string;
   evidence: { kind: string; sourceId: string | null; observedAt: string; confidence: Confidence; summary: string }[];
   currentRun: { runId: string; mainProcessKey: ProcessKey } | null;
@@ -101,6 +188,7 @@ export interface TaskSnapshot {
   gpuUsage?: TaskGpuUsage;
   autoStart?: AutoStartStatus;
 }
+
 export interface LogSourceSnapshot extends Stamp {
   sourceId: string;
   taskId: string;
@@ -124,7 +212,9 @@ export interface LogSourceSnapshot extends Stamp {
   catchupBytesRead: Bytes | null;
   catchupBytesTotal: Bytes | null;
   errorCode: string | null;
+  resolvedPath?: string | null;
 }
+
 export interface LogEvent {
   version: 1;
   eventId: string;
@@ -136,6 +226,7 @@ export interface LogEvent {
   endOffset: Bytes | null;
   ingestedAt: string;
   text: string | null;
+  rawAnsi?: string | null;
   reason: string | null;
   displayTruncated: boolean;
   recordComplete: boolean | null;
@@ -143,6 +234,7 @@ export interface LogEvent {
   runId: string | null;
   bindingId: string | null;
 }
+
 export interface CursorState {
   sourceId: string;
   generation: string;
@@ -164,6 +256,7 @@ export interface CursorState {
     recordInvalidUtf8?: boolean;
   };
 }
+
 export interface RunBinding {
   bindingId: string;
   runId: string;
@@ -172,7 +265,7 @@ export interface RunBinding {
   generation: string;
   fromOffset: Bytes;
   throughOffset: Bytes;
-  evidenceKind: 'instance_linked_record' | 'observed_direct_writer';
+  evidenceKind: 'instance_linked_record' | 'observed_direct_writer' | 'inferred_tree' | 'log_only';
   observerEpoch: string;
   observedAt: string;
 }
@@ -210,17 +303,51 @@ export interface HostRegistration {
   stateDir?: string;
   /** Optional per-host poll interval in milliseconds (default 5000, allowed 2000..60000). */
   pollIntervalMs?: number;
-  /** Opt-in remote job control flag (default false; reserved for Phase 2). */
+  /** Opt-in remote job control flag (default false). */
   allowJobControl?: boolean;
 }
 
-export type LogFormat = 'generic' | 'flow' | 'score' | 'reflow' | 'raw';
+export type LogFormat =
+  | 'generic'
+  | 'legacy_flow'
+  | 'legacy_score'
+  | 'legacy_reflow'
+  | 'flow'
+  | 'score'
+  | 'reflow'
+  | 'raw';
+
+export type TaskSourcePathMode = 'exact' | 'glob_latest' | 'dir_latest';
+
+export interface CustomPatternConfig {
+  progressRegex?: string;
+  metricRegexes?: Record<string, string>;
+  jsonFields?: Record<string, string>;
+}
+
+export interface AutoStartLaunchSpec {
+  mode?: 'python_script' | 'python_module' | 'command';
+  pythonPath?: string;
+  entryPath?: string;
+  moduleName?: string;
+  command?: string[];
+  cwd: string;
+  arguments: string;
+  logSourceId: string;
+  condaEnv?: string;
+  venvPath?: string;
+  modules?: string[];
+  env?: Record<string, string>;
+}
 
 export interface AutoStartConfig {
   execution?: 'server_tmux';
   enabled: boolean;
   armId: string;
   gpuDeviceIds: string[];
+  gpuExcludeIds?: string[];
+  requiredGpuCount?: number;
+  cudaVisibleDevicesMode?: 'index' | 'uuid';
   idleSeconds: number;
   maxUtilizationPercent: number;
   maxMemoryMiB: number;
@@ -228,7 +355,9 @@ export interface AutoStartConfig {
   minFreeDiskMiB?: number;
   gpuSharing?: { groupId: string; maxDevices: number; maxWorkersPerDevice: number };
   retryOnExit?: boolean;
-  launch: { pythonPath: string; entryPath: string; cwd: string; arguments: string; logSourceId: string };
+  maxRetries?: number;
+  retryBackoffSeconds?: number;
+  launch: AutoStartLaunchSpec;
 }
 
 export interface AutoStartStatus {
@@ -236,6 +365,7 @@ export interface AutoStartStatus {
   remoteConfirmed?: boolean;
   sessionName?: string | null;
   selectedDeviceId?: string | null;
+  selectedDeviceIds?: string[];
   armId: string;
   phase: 'waiting' | 'countdown' | 'blocked' | 'starting' | 'started' | 'failed';
   idleElapsedSeconds: number;
@@ -243,7 +373,12 @@ export interface AutoStartStatus {
   lastCheckedAt: string | null;
   startedAt: string | null;
   pid: number | null;
+  exitCode?: number | null;
+  retryCount?: number;
+  maxRetries?: number;
+  backend?: 'tmux' | 'systemd_run' | 'setsid' | null;
   errorCode: string | null;
+  errorParams?: Record<string, string | number | boolean | null> | null;
   message: string | null;
 }
 
@@ -254,10 +389,13 @@ export interface TaskRegistration {
   enabled: boolean;
   algorithm: string;
   logFormat?: LogFormat;
+  customPatterns?: CustomPatternConfig;
+  attributionMode?: 'auto' | 'log_only';
+  allowCrossUidScan?: boolean;
   autoStart?: AutoStartConfig;
   allowedDirectories: string[];
   entryPaths: string[];
-  sources: { sourceId: string; path: string; kind: 'log' | 'status_json' | 'queue_lock' }[];
+  sources: { sourceId: string; path: string; kind: 'log' | 'status_json' | 'queue_lock'; pathMode?: TaskSourcePathMode }[];
   checkpointDirectories: string[];
 }
 
@@ -276,12 +414,49 @@ export interface WindowBounds {
   isMaximized?: boolean;
 }
 
+export type AlertEventKind =
+  | 'cuda_oom'
+  | 'process_crashed'
+  | 'loss_nan_inf'
+  | 'training_stalled'
+  | 'training_completed'
+  | 'host_disconnected';
+
+export interface AlertEvent {
+  alertId: string;
+  kind: AlertEventKind;
+  taskId: string | null;
+  hostId: string;
+  severity: 'info' | 'warning' | 'critical';
+  title: string;
+  message: string;
+  observedAt: string;
+  details?: Record<string, string | number | boolean | null>;
+}
+
+export interface WebhookChannelConfig {
+  enabled: boolean;
+  kind: 'feishu' | 'slack' | 'discord' | 'generic';
+  url: string;
+  label?: string;
+}
+
+export interface AlertPreferences {
+  desktopNotifications?: boolean;
+  stallThresholdMinutes?: number;
+  hostDisconnectThresholdSeconds?: number;
+  cooldownSeconds?: number;
+  enabledKinds?: AlertEventKind[];
+  webhooks?: WebhookChannelConfig[];
+}
+
 export interface Preferences {
   theme: 'system' | 'light' | 'dark';
   locale?: 'zh-CN' | 'en-US';
   minimizeToTrayOnClose?: boolean;
   launchAtLogin?: boolean;
   windowBounds?: WindowBounds;
+  alerts?: AlertPreferences;
 }
 
 export interface DiscoveredSshHost {
@@ -296,6 +471,74 @@ export interface DiscoveredSshHost {
 export interface DiscoveredWslDistro {
   name: string;
   running: boolean;
+}
+
+export interface DiscoveredProcess {
+  pid: number;
+  pgid: number | null;
+  command: string;
+  cwd: string | null;
+  gpuIndices: number[];
+  gpuMemoryMiB: number | null;
+  openLogPaths: string[];
+  suggestedName: string;
+  suggestedEntry: string | null;
+}
+
+export type JobControlAction = 'stop' | 'kill' | 'restart';
+
+export interface JobControlResult {
+  ok: boolean;
+  taskId: string;
+  action: JobControlAction;
+  pidsSignaled?: number[];
+  pid?: number | null;
+  errorCode: string | null;
+  message?: string | null;
+}
+
+export interface JobControlAuditEntry {
+  timestamp: string;
+  hostId: string;
+  taskId: string;
+  action: JobControlAction;
+  allowed: boolean;
+  ok: boolean;
+  pidsSignaled: number[];
+  errorCode: string | null;
+  reason?: string;
+}
+
+export interface MetricSeriesPoint {
+  observedAt: string;
+  step: number | null;
+  value: number;
+}
+
+export interface MetricSeriesResponse {
+  taskId: string;
+  series: Record<string, MetricSeriesPoint[]>;
+}
+
+export interface GpuSeriesPoint {
+  observedAt: string;
+  deviceId: string;
+  utilPct: number | null;
+  memUsedMiB: number | null;
+  memTotalMiB: number | null;
+  tempC: number | null;
+  powerW: number | null;
+}
+
+export interface HostSeriesPoint {
+  observedAt: string;
+  cpuPct: number | null;
+  ramUsedMiB: number | null;
+  ramTotalMiB: number | null;
+}
+
+export interface SaveRegistryOptions {
+  forceLocal?: boolean;
 }
 
 export interface ConfigRecoveryNotice {

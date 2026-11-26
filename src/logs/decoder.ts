@@ -1,15 +1,37 @@
 import { Buffer } from 'node:buffer';
 import type { CursorState, LogEvent } from '../shared/contracts';
 import type { Bytes } from './types';
+import { hasAnsi, stripAnsi } from '../parsers/ansi';
 
 const MAX_PREVIEW_BYTES = 64 * 1024;
 
 function eventId(sourceId: string, generation: string, offset: string, kind: string): string {
-  return `${sourceId}:${generation}:${offset}:${kind}`;
+  // Share one logical line ID across in-progress CR redraws and the finalized LF line
+  // so tqdm/progress redraws overwrite in-place instead of leaving duplicate redraw+line rows.
+  const logicalKind = kind === 'redraw' ? 'line' : kind;
+  return `${sourceId}:${generation}:${offset}:${logicalKind}`;
 }
 
-function makeEvent(cursor: CursorState, taskId: string, kind: LogEvent['kind'], startOffset: Bytes | null, endOffset: Bytes | null, text: string | null, ingestedAt: string, complete: boolean | null, prefixIncomplete: boolean | null, truncated = false, diagnostic: string | null = null): LogEvent {
+function makeEvent(
+  cursor: CursorState,
+  taskId: string,
+  kind: LogEvent['kind'],
+  startOffset: Bytes | null,
+  endOffset: Bytes | null,
+  rawText: string | null,
+  ingestedAt: string,
+  complete: boolean | null,
+  prefixIncomplete: boolean | null,
+  truncated = false,
+  diagnostic: string | null = null,
+): LogEvent {
   const keyOffset = startOffset ?? 'none';
+  let text = rawText;
+  let rawAnsi: string | undefined;
+  if (rawText !== null && hasAnsi(rawText)) {
+    rawAnsi = rawText;
+    text = stripAnsi(rawText);
+  }
   return {
     version: 1,
     eventId: eventId(cursor.sourceId, cursor.generation, keyOffset, kind),
@@ -21,6 +43,7 @@ function makeEvent(cursor: CursorState, taskId: string, kind: LogEvent['kind'], 
     endOffset,
     ingestedAt,
     text,
+    ...(rawAnsi !== undefined ? { rawAnsi } : {}),
     reason: diagnostic ?? (kind === 'import_boundary' ? 'prefix_not_imported' : null),
     displayTruncated: truncated,
     recordComplete: complete,
@@ -43,7 +66,7 @@ function trimToByteLimit(value: string, maxBytes: number): { text: string; trunc
     if (utf8Length(value.slice(0, middle)) <= maxBytes) low = middle;
     else high = middle - 1;
   }
-  if (low > 0 && low < value.length && /[\uD800-\uDBFF]/.test(value[low - 1])) low--;
+  if (low > 0 && low < value.length && /[\uD800-\uDBFF]/.test(value[low - 1]!)) low--;
   return { text: value.slice(0, low), truncated: true };
 }
 
@@ -52,14 +75,14 @@ function decodedPrefix(bytes: Uint8Array): { text: string; carry: Uint8Array } {
   const minimumStart = Math.max(0, bytes.length - 4);
   let splitAt = bytes.length;
   for (let start = bytes.length - 1; start >= minimumStart; start--) {
-    const lead = bytes[start];
+    const lead = bytes[start]!;
     const expected = lead >= 0xc2 && lead <= 0xdf ? 2 : lead >= 0xe0 && lead <= 0xef ? 3 : lead >= 0xf0 && lead <= 0xf4 ? 4 : 0;
     const available = bytes.length - start;
     if (expected === 0 || available >= expected) continue;
 
     let possiblePrefix = true;
     for (let index = 1; index < available; index++) {
-      const continuation = bytes[start + index];
+      const continuation = bytes[start + index]!;
       if ((continuation & 0xc0) !== 0x80
         || (index === 1 && lead === 0xe0 && continuation < 0xa0)
         || (index === 1 && lead === 0xed && continuation > 0x9f)
@@ -222,4 +245,3 @@ export function importBoundaryEvent(cursor: CursorState, taskId: string, ingeste
   const event = makeEvent(cursor, taskId, 'import_boundary', null, null, null, ingestedAt, null, null);
   return { ...event, eventId: eventId(cursor.sourceId, cursor.generation, cursor.generationStartOffset, 'import_boundary') };
 }
-
