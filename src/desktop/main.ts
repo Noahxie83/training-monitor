@@ -8,7 +8,7 @@ import { createProductionApi, type ProductionMonitorApi } from '../collector/ser
 import { createPreferencesStore } from '../registry/preferences';
 import { createRegistryStore } from '../registry/config';
 import { openStore } from '../store/client';
-import { createTransport } from '../transport/transport';
+import { createTransport, HostSessionPool } from '../transport/transport';
 import { createGpuWindowManager, createWindow } from './window';
 import { registerMonitorIpc } from './ipc';
 import { runStoreCanary } from './runtime-canary';
@@ -18,6 +18,7 @@ if (!gotLock) app.quit();
 let mainWindow: BrowserWindow | null = null;
 let disposeIpc: (() => void) | null = null;
 let productionApi: ProductionMonitorApi | null = null;
+let sessionPool: HostSessionPool | null = null;
 let shutdownStarted = false;
 let quitReady = false;
 const demo = process.argv.includes('--demo');
@@ -35,6 +36,8 @@ app.on('before-quit', (event) => {
   void (async () => {
     await productionApi?.stop();
     productionApi = null;
+    await sessionPool?.closeAll();
+    sessionPool = null;
     quitReady = true;
     app.quit();
   })().catch((error) => {
@@ -67,6 +70,8 @@ if (gotLock) {
         const probeSource = await readFile(path.join(__dirname, 'probe', 'readonly_probe.py'), 'utf8');
         const launcherSource = await readFile(path.join(__dirname, 'launch', 'launcher.py'), 'utf8');
         const serverAgentSource = await readFile(path.join(__dirname, 'launch', 'server_agent.py'), 'utf8');
+        sessionPool = new HostSessionPool();
+        const pool = sessionPool;
         productionApi = createProductionApi({
           launchLedger: createLaunchLedger(userData),
           store,
@@ -74,7 +79,7 @@ if (gotLock) {
           registrySaver: (registry) => registryStore.saveRegistry(registry),
           transportProvider: (host, registry) => createTransport(
             { hostId: host.hostId, host, registry },
-            { probeSource, launcherSource, serverAgentSource, registryProvider },
+            { probeSource, launcherSource, serverAgentSource, registryProvider, sessionPool: pool },
           ),
           clock: Date.now,
           preferencesProvider: () => preferencesStore.load(),
@@ -86,6 +91,8 @@ if (gotLock) {
         console.error(`MONITOR_STARTUP_FAILED ${String(error)}`);
         await productionApi?.stop().catch(() => undefined);
         productionApi = null;
+        await sessionPool?.closeAll().catch(() => undefined);
+        sessionPool = null;
         app.exit(1);
         return;
       }

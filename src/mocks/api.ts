@@ -22,11 +22,11 @@ function makeDemoEvent(index: number, eventId = `demo-event-${String(index).padS
   };
 }
 
-const emptyRegistry: Registry = { version: 1, revision: 0, hosts: [], tasks: [] };
+const emptyRegistry: Registry = { version: 2, revision: 0, hosts: [], tasks: [] };
 export function createMockApi(options: { demo?: boolean } = {}): MonitorApi {
   let registry: Registry = options.demo === true ? {
-    version: 1, revision: 0,
-    hosts: [{ hostId: 'demo-host', label: '模拟宿主', enabled: false, allowedRoots: ['/simulated'], target: { kind: 'wsl', distribution: 'Ubuntu-26.04' } }],
+    version: 2, revision: 0,
+    hosts: [{ hostId: 'demo-host', label: '模拟宿主', enabled: false, allowedRoots: ['/simulated'], target: { kind: 'ssh', alias: 'gpu-server-01' } }],
     tasks: [{ taskId: 'demo-task', hostId: 'demo-host', label: 'demo-task', enabled: false, algorithm: 'unknown',
       allowedDirectories: ['/simulated'], entryPaths: ['train.py'], sources: [{ sourceId: 'demo-log', path: '/simulated/train.log', kind: 'log' }], checkpointDirectories: [] }],
   } : structuredClone(emptyRegistry);

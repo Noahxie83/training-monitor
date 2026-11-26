@@ -1,8 +1,33 @@
 import { validateAutoStartConfig, validateAutoStartStatus } from './auto-start';
-import type { Bytes, Registry, ResourceMetric, Freshness, HostGpuSnapshot } from './contracts';
-import type { LogEvent, HostSnapshot, TaskSnapshot, LogSourceSnapshot, Stamp } from './contracts';
+import type {
+  Bytes,
+  DiscoveredSshHost,
+  DiscoveredWslDistro,
+  Freshness,
+  HostGpuSnapshot,
+  HostSnapshot,
+  HostTarget,
+  LogEvent,
+  LogSourceSnapshot,
+  Preferences,
+  Registry,
+  ResourceMetric,
+  Stamp,
+  TaskSnapshot,
+  WindowBounds,
+} from './contracts';
 import type { LogPage, LogQuery, LogSearchPage, LogSearchRequest, MonitorSnapshot, MonitorUpdate } from './api';
-import { EVENT_PREVIEW_BYTES, PAGE_EVENT_LIMIT, PAGE_TEXT_BUDGET_BYTES, SEARCH_LITERAL_LIMIT, SUBSCRIPTION_TEXT_BUDGET_BYTES } from './budgets';
+import {
+  EVENT_PREVIEW_BYTES,
+  PAGE_EVENT_LIMIT,
+  PAGE_TEXT_BUDGET_BYTES,
+  SEARCH_LITERAL_LIMIT,
+  SUBSCRIPTION_TEXT_BUDGET_BYTES,
+} from './budgets';
+
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+const WHITESPACE_OR_CONTROL = /[\s\u0000-\u001f\u007f]/;
+const WINDOWS_DRIVE_ABS = /^[A-Za-z]:[\\/]/;
 
 export function parseBytes(value: Bytes): bigint {
   if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) throw new TypeError('INVALID_BYTES');
@@ -34,6 +59,81 @@ function isBoundedPreview(value: unknown): value is string | null {
   return value === null || (typeof value === 'string' && new TextEncoder().encode(value).byteLength <= EVENT_PREVIEW_BYTES);
 }
 
+export function isValidAbsolutePath(value: unknown, allowWindowsDrive = false): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4096 || CONTROL_CHARS.test(value)) return false;
+  if (value.startsWith('/')) {
+    return !value.split('/').includes('..');
+  }
+  if (allowWindowsDrive && WINDOWS_DRIVE_ABS.test(value)) {
+    return !value.split(/[\\/]/).includes('..');
+  }
+  return false;
+}
+
+function isSafeSshToken(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= maxLength &&
+    !value.startsWith('-') &&
+    !WHITESPACE_OR_CONTROL.test(value);
+}
+
+function isSafePathOption(value: unknown, maxLength = 1024): value is string {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= maxLength &&
+    !CONTROL_CHARS.test(value);
+}
+
+export function validateHostTarget(value: unknown, code = 'INVALID_REGISTRY'): HostTarget {
+  const target = object(value, code);
+  if (target.kind === 'ssh') {
+    exact(target, ['kind', 'alias', 'hostname', 'user', 'port', 'identityFile', 'proxyJump', 'pythonPath'], code);
+    const hasAlias = target.alias !== undefined;
+    const hasHostname = target.hostname !== undefined;
+    if (!hasAlias && !hasHostname) throw new TypeError(code);
+    if (hasAlias && !isSafeSshToken(target.alias, 255)) throw new TypeError(code);
+    if (hasHostname && !isSafeSshToken(target.hostname, 255)) throw new TypeError(code);
+    if (target.user !== undefined && !isSafeSshToken(target.user, 128)) throw new TypeError(code);
+    if (target.port !== undefined && (typeof target.port !== 'number' || !Number.isSafeInteger(target.port) || target.port < 1 || target.port > 65535)) {
+      throw new TypeError(code);
+    }
+    if (target.identityFile !== undefined && (!isSafePathOption(target.identityFile, 1024) || target.identityFile.startsWith('-'))) {
+      throw new TypeError(code);
+    }
+    if (target.proxyJump !== undefined && !isSafeSshToken(target.proxyJump, 512)) throw new TypeError(code);
+    if (target.pythonPath !== undefined && (!isSafePathOption(target.pythonPath, 1024) || /['"`$;|&<>]/.test(target.pythonPath))) {
+      throw new TypeError(code);
+    }
+    return structuredClone(target) as unknown as HostTarget;
+  }
+  if (target.kind === 'wsl') {
+    exact(target, ['kind', 'distribution', 'pythonPath'], code);
+    if (
+      typeof target.distribution !== 'string' ||
+      target.distribution.length === 0 ||
+      target.distribution.length > 255 ||
+      target.distribution.startsWith('-') ||
+      CONTROL_CHARS.test(target.distribution) ||
+      /[\\/]/.test(target.distribution)
+    ) {
+      throw new TypeError(code);
+    }
+    if (target.pythonPath !== undefined && (!isSafePathOption(target.pythonPath, 1024) || /['"`$;|&<>]/.test(target.pythonPath))) {
+      throw new TypeError(code);
+    }
+    return structuredClone(target) as unknown as HostTarget;
+  }
+  if (target.kind === 'local') {
+    exact(target, ['kind', 'pythonPath'], code);
+    if (target.pythonPath !== undefined && !isSafePathOption(target.pythonPath, 1024)) {
+      throw new TypeError(code);
+    }
+    return structuredClone(target) as unknown as HostTarget;
+  }
+  throw new TypeError(code);
+}
+
 export function validateMetric(value: unknown): ResourceMetric {
   const metric = object(value, 'INVALID_METRIC');
   exact(metric, ['observedAt', 'freshness', 'source', 'name', 'unit', 'value', 'scope', 'deviceId', 'processKey'], 'INVALID_METRIC');
@@ -54,38 +154,68 @@ export function validateMetric(value: unknown): ResourceMetric {
 export function validateRegistry(value: unknown): Registry {
   const root = object(value, 'INVALID_REGISTRY');
   exact(root, ['version', 'revision', 'hosts', 'tasks'], 'INVALID_REGISTRY');
-  if (root.version !== 1 || !Number.isSafeInteger(root.revision) || (root.revision as number) < 0 || !Array.isArray(root.hosts) || !Array.isArray(root.tasks)) throw new TypeError('INVALID_REGISTRY');
+  if (root.version !== 2 || !Number.isSafeInteger(root.revision) || (root.revision as number) < 0 || !Array.isArray(root.hosts) || !Array.isArray(root.tasks)) throw new TypeError('INVALID_REGISTRY');
   const hosts = root.hosts.map((entry) => {
     const host = object(entry, 'INVALID_REGISTRY');
-    exact(host, ['hostId', 'label', 'enabled', 'allowedRoots', 'target'], 'INVALID_REGISTRY');
-    const target = object(host.target, 'INVALID_REGISTRY');
-    if (target.kind === 'ssh') { exact(target, ['kind', 'alias'], 'INVALID_REGISTRY'); if (target.alias !== 'lab-campus') throw new TypeError('INVALID_REGISTRY'); }
-    else if (target.kind === 'wsl') { exact(target, ['kind', 'distribution'], 'INVALID_REGISTRY'); if (target.distribution !== 'Ubuntu-26.04') throw new TypeError('INVALID_REGISTRY'); }
-    else throw new TypeError('INVALID_REGISTRY');
-    if (typeof host.hostId !== 'string' || !host.hostId || typeof host.label !== 'string' || typeof host.enabled !== 'boolean' || !Array.isArray(host.allowedRoots) || host.allowedRoots.some((path) => typeof path !== 'string' || !path)) throw new TypeError('INVALID_REGISTRY');
-    return host;
+    exact(host, ['hostId', 'label', 'enabled', 'allowedRoots', 'target', 'stateDir', 'pollIntervalMs', 'allowJobControl'], 'INVALID_REGISTRY');
+    const target = validateHostTarget(host.target, 'INVALID_REGISTRY');
+    const allowWin = target.kind === 'local';
+    if (
+      typeof host.hostId !== 'string' ||
+      !host.hostId ||
+      host.hostId.length > 256 ||
+      CONTROL_CHARS.test(host.hostId) ||
+      typeof host.label !== 'string' ||
+      host.label.length > 256 ||
+      CONTROL_CHARS.test(host.label) ||
+      typeof host.enabled !== 'boolean' ||
+      !Array.isArray(host.allowedRoots) ||
+      host.allowedRoots.some((rootPath) => !isValidAbsolutePath(rootPath, allowWin))
+    ) {
+      throw new TypeError('INVALID_REGISTRY');
+    }
+    if (host.stateDir !== undefined && !isValidAbsolutePath(host.stateDir, allowWin)) {
+      throw new TypeError('INVALID_REGISTRY');
+    }
+    if (host.pollIntervalMs !== undefined && (typeof host.pollIntervalMs !== 'number' || !Number.isSafeInteger(host.pollIntervalMs) || host.pollIntervalMs < 2000 || host.pollIntervalMs > 60000)) {
+      throw new TypeError('INVALID_REGISTRY');
+    }
+    if (host.allowJobControl !== undefined && typeof host.allowJobControl !== 'boolean') {
+      throw new TypeError('INVALID_REGISTRY');
+    }
+    return { ...host, target } as Record<string, unknown> & { hostId: string; target: HostTarget };
   });
-  const hostIds = new Set(hosts.map((host) => host.hostId));
-  if (hostIds.size !== hosts.length) throw new TypeError('DUPLICATE_ID');
+  const hostMap = new Map(hosts.map((host) => [host.hostId, host]));
+  if (hostMap.size !== hosts.length) throw new TypeError('DUPLICATE_ID');
   const seenTaskIds = new Set<string>();
   const seenSourceIds = new Set<string>();
   const tasks = root.tasks.map((entry) => {
     const task = object(entry, 'INVALID_REGISTRY');
     exact(task, ['taskId', 'hostId', 'label', 'enabled', 'algorithm', 'logFormat', 'autoStart', 'allowedDirectories', 'entryPaths', 'sources', 'checkpointDirectories'], 'INVALID_REGISTRY');
-    if (typeof task.taskId !== 'string' || !task.taskId || typeof task.hostId !== 'string' || !hostIds.has(task.hostId) || typeof task.label !== 'string' || typeof task.enabled !== 'boolean' ||
-        typeof task.algorithm !== 'string' || task.algorithm.length > 120 || /[\u0000-\u001f\u007f]/.test(task.algorithm) ||
+    if (typeof task.taskId !== 'string' || !task.taskId || typeof task.hostId !== 'string' || !hostMap.has(task.hostId) || typeof task.label !== 'string' || typeof task.enabled !== 'boolean' ||
+        typeof task.algorithm !== 'string' || task.algorithm.length > 120 || CONTROL_CHARS.test(task.algorithm) ||
         (task.logFormat !== undefined && !enumIs(task.logFormat, ['generic', 'flow', 'score', 'reflow', 'raw']))) throw new TypeError('INVALID_REGISTRY');
     if (seenTaskIds.has(task.taskId)) throw new TypeError('DUPLICATE_ID'); seenTaskIds.add(task.taskId);
-    for (const key of ['allowedDirectories', 'entryPaths', 'checkpointDirectories'] as const) if (!Array.isArray(task[key]) || task[key].some((path) => typeof path !== 'string' || !path)) throw new TypeError('INVALID_REGISTRY');
+    const parentHost = hostMap.get(task.hostId)!;
+    const allowWin = parentHost.target.kind === 'local';
+    for (const key of ['allowedDirectories', 'checkpointDirectories'] as const) {
+      if (!Array.isArray(task[key]) || task[key].some((dirPath) => !isValidAbsolutePath(dirPath, allowWin))) throw new TypeError('INVALID_REGISTRY');
+    }
+    if (!Array.isArray(task.entryPaths) || task.entryPaths.some((entryPath) => typeof entryPath !== 'string' || !entryPath || CONTROL_CHARS.test(entryPath))) throw new TypeError('INVALID_REGISTRY');
     if (!Array.isArray(task.sources)) throw new TypeError('INVALID_REGISTRY');
-    for (const source of task.sources) { const src = object(source, 'INVALID_REGISTRY'); exact(src, ['sourceId', 'path', 'kind'], 'INVALID_REGISTRY'); if (typeof src.sourceId !== 'string' || !src.sourceId || typeof src.path !== 'string' || !src.path || !enumIs(src.kind, ['log', 'status_json', 'queue_lock'])) throw new TypeError('INVALID_REGISTRY'); if (seenSourceIds.has(src.sourceId)) throw new TypeError('DUPLICATE_ID'); seenSourceIds.add(src.sourceId); }
+    for (const source of task.sources) {
+      const src = object(source, 'INVALID_REGISTRY');
+      exact(src, ['sourceId', 'path', 'kind'], 'INVALID_REGISTRY');
+      if (typeof src.sourceId !== 'string' || !src.sourceId || !isValidAbsolutePath(src.path, allowWin) || !enumIs(src.kind, ['log', 'status_json', 'queue_lock'])) throw new TypeError('INVALID_REGISTRY');
+      if (seenSourceIds.has(src.sourceId)) throw new TypeError('DUPLICATE_ID'); seenSourceIds.add(src.sourceId);
+    }
     if (task.autoStart !== undefined) {
       const autoStart = validateAutoStartConfig(task.autoStart, task as unknown as Registry['tasks'][number]);
-      if (autoStart.enabled && autoStart.execution === 'server_tmux' && (hosts as unknown as Registry['hosts']).find(host => host.hostId === task.hostId)?.target.kind !== 'ssh') throw new TypeError('AUTO_START_SSH_ONLY');
+      if (autoStart.enabled && autoStart.execution === 'server_tmux' && parentHost.target.kind !== 'ssh') throw new TypeError('AUTO_START_SSH_ONLY');
     }
     return task;
   });
-  return { version: 1, revision: root.revision as number, hosts: hosts as unknown as Registry['hosts'], tasks: tasks as unknown as Registry['tasks'] };
+  return { version: 2, revision: root.revision as number, hosts: hosts as unknown as Registry['hosts'], tasks: tasks as unknown as Registry['tasks'] };
 }
 
 export function isFreshness(value: unknown): value is Freshness { return value === 'fresh' || value === 'stale' || value === 'unobserved'; }
@@ -108,26 +238,51 @@ function processKey(value: unknown): boolean {
 }
 function validateProcess(value: unknown): void {
   const p = object(value, 'INVALID_PROCESS');
-  exact(p, ['key', 'pid', 'parentKey', 'cwd', 'scriptEntry', 'role', 'observedAt'], 'INVALID_PROCESS');
-  if (!processKey(p.key) || !Number.isSafeInteger(p.pid) || typeof p.pid !== 'number' || p.pid <= 0 || !processKey(p.parentKey) || !nullableString(p.cwd) || !nullableString(p.scriptEntry) || !enumIs(p.role, ['trainer', 'queue', 'worker', 'unknown']) || !validTime(p.observedAt) || p.observedAt === null) throw new TypeError('INVALID_PROCESS');
+  exact(p, ['key', 'pid', 'parentKey', 'cwd', 'scriptEntry', 'launcherEntry', 'role', 'observedAt'], 'INVALID_PROCESS');
+  if (!processKey(p.key) || !Number.isSafeInteger(p.pid) || typeof p.pid !== 'number' || p.pid <= 0 || !processKey(p.parentKey) || !nullableString(p.cwd) || !nullableString(p.scriptEntry) || (p.launcherEntry !== undefined && !nullableString(p.launcherEntry)) || !enumIs(p.role, ['trainer', 'queue', 'worker', 'unknown']) || !validTime(p.observedAt) || p.observedAt === null) throw new TypeError('INVALID_PROCESS');
 }
 
 export function validateHostSnapshot(value: unknown): HostSnapshot {
   const h = object(value, 'INVALID_HOST_SNAPSHOT');
-  exact(h, ['observedAt', 'freshness', 'version', 'hostId', 'kind', 'connection', 'lastSuccessAt', 'lastProbeDurationMs', 'scanComplete', 'errorCode', 'gpu'], 'INVALID_HOST_SNAPSHOT');
+  exact(h, [
+    'observedAt', 'freshness', 'version', 'hostId', 'kind', 'connection',
+    'lastSuccessAt', 'lastProbeDurationMs', 'scanComplete', 'errorCode',
+    'nextRetryAt', 'consecutiveFailures', 'acceleratorAvailability', 'gpu',
+  ], 'INVALID_HOST_SNAPSHOT');
   stamp({ observedAt: h.observedAt, freshness: h.freshness });
-  if (h.version !== 1 || !string(h.hostId) || !enumIs(h.kind, ['ssh', 'wsl']) || !enumIs(h.connection, ['unobserved', 'connecting', 'connected', 'disconnected']) || !validTime(h.lastSuccessAt) || !finiteOrNull(h.lastProbeDurationMs) || (h.lastProbeDurationMs !== null && h.lastProbeDurationMs < 0) || typeof h.scanComplete !== 'boolean' || !nullableString(h.errorCode)) throw new TypeError('INVALID_HOST_SNAPSHOT');
-  if (Object.prototype.hasOwnProperty.call(h, 'gpu')) validateHostGpuSnapshot(h.gpu);
+  if (
+    h.version !== 1 ||
+    !string(h.hostId) ||
+    !enumIs(h.kind, ['ssh', 'wsl', 'local']) ||
+    !enumIs(h.connection, ['unobserved', 'connecting', 'connected', 'disconnected']) ||
+    !validTime(h.lastSuccessAt) ||
+    !finiteOrNull(h.lastProbeDurationMs) ||
+    (h.lastProbeDurationMs !== null && h.lastProbeDurationMs < 0) ||
+    typeof h.scanComplete !== 'boolean' ||
+    !nullableString(h.errorCode)
+  ) {
+    throw new TypeError('INVALID_HOST_SNAPSHOT');
+  }
+  if (h.nextRetryAt !== undefined && !validTime(h.nextRetryAt)) throw new TypeError('INVALID_HOST_SNAPSHOT');
+  if (h.consecutiveFailures !== undefined && (typeof h.consecutiveFailures !== 'number' || !Number.isSafeInteger(h.consecutiveFailures) || h.consecutiveFailures < 0)) {
+    throw new TypeError('INVALID_HOST_SNAPSHOT');
+  }
+  if (h.acceleratorAvailability !== undefined && !enumIs(h.acceleratorAvailability, ['available', 'none', 'unavailable'])) {
+    throw new TypeError('INVALID_HOST_SNAPSHOT');
+  }
+  if (Object.prototype.hasOwnProperty.call(h, 'gpu') && h.gpu !== undefined) validateHostGpuSnapshot(h.gpu);
   return h as unknown as HostSnapshot;
 }
 
 function validateHostGpuSnapshot(value: unknown): HostGpuSnapshot {
   const gpu = object(value, 'INVALID_HOST_GPU_SNAPSHOT');
-  exact(gpu, ['observedAt', 'state', 'errorCode', 'metrics'], 'INVALID_HOST_GPU_SNAPSHOT');
-  if (!validTime(gpu.observedAt) || !enumIs(gpu.state, ['available', 'unavailable']) || !nullableString(gpu.errorCode) ||
+  exact(gpu, ['observedAt', 'state', 'acceleratorAvailability', 'errorCode', 'metrics'], 'INVALID_HOST_GPU_SNAPSHOT');
+  if (!validTime(gpu.observedAt) || !enumIs(gpu.state, ['available', 'unavailable']) ||
+      (gpu.acceleratorAvailability !== undefined && !enumIs(gpu.acceleratorAvailability, ['available', 'none', 'unavailable'])) ||
+      !nullableString(gpu.errorCode) ||
       !Array.isArray(gpu.metrics) || gpu.metrics.length > 768) throw new TypeError('INVALID_HOST_GPU_SNAPSHOT');
-  for (const value of gpu.metrics) {
-    const metric = validateMetric(value);
+  for (const item of gpu.metrics) {
+    const metric = validateMetric(item);
     const expectedUnit = metric.name === 'gpu_utilization' ? 'percent_device' : 'bytes';
     if (metric.scope !== 'device' || metric.processKey !== null ||
         !['gpu_utilization', 'gpu_memory_used', 'gpu_memory_total'].includes(metric.name) || metric.unit !== expectedUnit ||
@@ -206,12 +361,88 @@ export function validateMonitorUpdate(value: unknown): MonitorUpdate {
   if (u.kind === 'logs') { exact(u, ['kind', 'sourceId', 'events'], 'INVALID_UPDATE'); if (!string(u.sourceId) || !Array.isArray(u.events) || u.events.length > PAGE_EVENT_LIMIT) throw new TypeError('INVALID_UPDATE'); const events = u.events.map(validateLogEvent); const textBytes = events.reduce((n, event) => n + new TextEncoder().encode(event.text ?? '').byteLength, 0); if (textBytes > SUBSCRIPTION_TEXT_BUDGET_BYTES) throw new TypeError('INVALID_UPDATE'); return { kind: 'logs', sourceId: u.sourceId, events }; }
   throw new TypeError('INVALID_UPDATE');
 }
-export function validatePreferences(value: unknown) {
-  const p = object(value, 'INVALID_PREFERENCES'); exact(p, ['theme'], 'INVALID_PREFERENCES'); if (!enumIs(p.theme, ['system', 'light', 'dark'])) throw new TypeError('INVALID_PREFERENCES'); return { theme: p.theme as 'system' | 'light' | 'dark' };
+
+function validateWindowBounds(value: unknown): WindowBounds {
+  const b = object(value, 'INVALID_PREFERENCES');
+  exact(b, ['x', 'y', 'width', 'height', 'isMaximized'], 'INVALID_PREFERENCES');
+  if (
+    typeof b.x !== 'number' || !Number.isFinite(b.x) ||
+    typeof b.y !== 'number' || !Number.isFinite(b.y) ||
+    typeof b.width !== 'number' || !Number.isFinite(b.width) || b.width <= 0 ||
+    typeof b.height !== 'number' || !Number.isFinite(b.height) || b.height <= 0 ||
+    (b.isMaximized !== undefined && typeof b.isMaximized !== 'boolean')
+  ) {
+    throw new TypeError('INVALID_PREFERENCES');
+  }
+  return {
+    x: Math.round(b.x),
+    y: Math.round(b.y),
+    width: Math.round(b.width),
+    height: Math.round(b.height),
+    ...(b.isMaximized !== undefined ? { isMaximized: b.isMaximized } : {}),
+  };
+}
+
+export function validatePreferences(value: unknown): Preferences {
+  const p = object(value, 'INVALID_PREFERENCES');
+  exact(p, ['theme', 'locale', 'minimizeToTrayOnClose', 'launchAtLogin', 'windowBounds'], 'INVALID_PREFERENCES');
+  if (!enumIs(p.theme, ['system', 'light', 'dark'])) throw new TypeError('INVALID_PREFERENCES');
+  if (p.locale !== undefined && !enumIs(p.locale, ['zh-CN', 'en-US'])) throw new TypeError('INVALID_PREFERENCES');
+  if (p.minimizeToTrayOnClose !== undefined && typeof p.minimizeToTrayOnClose !== 'boolean') throw new TypeError('INVALID_PREFERENCES');
+  if (p.launchAtLogin !== undefined && typeof p.launchAtLogin !== 'boolean') throw new TypeError('INVALID_PREFERENCES');
+  const result: Preferences = { theme: p.theme as Preferences['theme'] };
+  if (p.locale !== undefined) result.locale = p.locale as Preferences['locale'];
+  if (p.minimizeToTrayOnClose !== undefined) result.minimizeToTrayOnClose = p.minimizeToTrayOnClose;
+  if (p.launchAtLogin !== undefined) result.launchAtLogin = p.launchAtLogin;
+  if (p.windowBounds !== undefined) result.windowBounds = validateWindowBounds(p.windowBounds);
+  return result;
 }
 
 export function validateRefreshScope(value: unknown): { hostId?: string; taskId?: string } {
   const s = object(value, 'INVALID_SCOPE'); exact(s, ['hostId', 'taskId'], 'INVALID_SCOPE');
   if ((s.hostId !== undefined && !string(s.hostId)) || (s.taskId !== undefined && !string(s.taskId))) throw new TypeError('INVALID_SCOPE');
   return s as { hostId?: string; taskId?: string };
+}
+
+export function validateDiscoveredSshHosts(value: unknown): DiscoveredSshHost[] {
+  if (!Array.isArray(value) || value.length > 512) throw new TypeError('INVALID_DISCOVERED_HOSTS');
+  return value.map((item) => {
+    const h = object(item, 'INVALID_DISCOVERED_HOSTS');
+    exact(h, ['alias', 'hostname', 'user', 'port', 'identityFile', 'proxyJump'], 'INVALID_DISCOVERED_HOSTS');
+    if (!isSafeSshToken(h.alias, 255)) throw new TypeError('INVALID_DISCOVERED_HOSTS');
+    const result: DiscoveredSshHost = { alias: h.alias };
+    if (h.hostname !== undefined) {
+      if (!isSafeSshToken(h.hostname, 255)) throw new TypeError('INVALID_DISCOVERED_HOSTS');
+      result.hostname = h.hostname;
+    }
+    if (h.user !== undefined) {
+      if (!isSafeSshToken(h.user, 128)) throw new TypeError('INVALID_DISCOVERED_HOSTS');
+      result.user = h.user;
+    }
+    if (h.port !== undefined) {
+      if (typeof h.port !== 'number' || !Number.isSafeInteger(h.port) || h.port < 1 || h.port > 65535) throw new TypeError('INVALID_DISCOVERED_HOSTS');
+      result.port = h.port;
+    }
+    if (h.identityFile !== undefined) {
+      if (!isSafePathOption(h.identityFile, 1024)) throw new TypeError('INVALID_DISCOVERED_HOSTS');
+      result.identityFile = h.identityFile;
+    }
+    if (h.proxyJump !== undefined) {
+      if (!isSafeSshToken(h.proxyJump, 512)) throw new TypeError('INVALID_DISCOVERED_HOSTS');
+      result.proxyJump = h.proxyJump;
+    }
+    return result;
+  });
+}
+
+export function validateDiscoveredWslDistros(value: unknown): DiscoveredWslDistro[] {
+  if (!Array.isArray(value) || value.length > 128) throw new TypeError('INVALID_DISCOVERED_WSL');
+  return value.map((item) => {
+    const d = object(item, 'INVALID_DISCOVERED_WSL');
+    exact(d, ['name', 'running'], 'INVALID_DISCOVERED_WSL');
+    if (typeof d.name !== 'string' || !d.name || d.name.length > 255 || CONTROL_CHARS.test(d.name) || typeof d.running !== 'boolean') {
+      throw new TypeError('INVALID_DISCOVERED_WSL');
+    }
+    return { name: d.name, running: d.running };
+  });
 }

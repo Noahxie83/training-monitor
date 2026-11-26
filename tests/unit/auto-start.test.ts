@@ -5,7 +5,7 @@ import type { Registry } from '../../src/shared/contracts';
 import type { HostObservation, ServerWaitResult, Transport } from '../../src/transport/types';
 
 export function autoRegistry(): Registry {
-  return { version: 1, revision: 1, hosts: [{ hostId: 'h', label: 'Lab', enabled: true, allowedRoots: ['/allowed'], target: { kind: 'ssh', alias: 'lab-campus' } }],
+  return { version: 2, revision: 1, hosts: [{ hostId: 'h', label: 'Lab', enabled: true, allowedRoots: ['/allowed'], target: { kind: 'ssh', alias: 'gpu-node' } }],
     tasks: [{ taskId: 't', hostId: 'h', label: 'train', enabled: true, algorithm: '', allowedDirectories: ['/allowed/run'], entryPaths: ['train.py'], checkpointDirectories: [],
       sources: [{ sourceId: 'log', kind: 'log', path: '/allowed/run/output.log' }], autoStart: { execution: 'server_tmux', enabled: true,
         armId: '12345678-1234-4234-8234-123456789abc', gpuDeviceIds: [], idleSeconds: 60, maxUtilizationPercent: 5, maxMemoryMiB: 1024,

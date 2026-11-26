@@ -364,7 +364,7 @@ export const testFlowSource: LogSourceSnapshot = {
 };
 
 export const testRegistry: Registry = {
-  version: 1,
+  version: 2,
   revision: 1,
   hosts: [
     {

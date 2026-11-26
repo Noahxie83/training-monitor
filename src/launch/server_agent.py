@@ -22,6 +22,7 @@ import uuid
 
 
 VERSION = 1
+FRAME_MAGIC = b"TMF1"
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_GPU_CSV_BYTES = 16 * 1024
@@ -34,12 +35,17 @@ LAUNCHER_SOURCE_B64 = "__LAUNCHER_SOURCE_B64__"
 AGENT_SOURCE_B64 = "__SERVER_AGENT_SOURCE_B64__"
 
 _HEX64 = re.compile(r"[a-f0-9]{64}\Z")
-_GPU_UUID = re.compile(r"GPU-[A-Za-z0-9._:-]+\Z")
+_GPU_UUID = re.compile(r"(?:GPU|MIG)-[A-Za-z0-9._:/-]+\Z")
+_MISSING_GPU_VALUE = re.compile(r"^(?:\[?\s*(?:N/A|NA|Not Supported|Unknown)\s*\]?|-)$", re.IGNORECASE)
 _ERROR_CODE = re.compile(r"[A-Z0-9_]{1,128}\Z")
 _DEVICE_ID = re.compile(r"GPU (?:0|[1-9][0-9]{0,3})\Z")
 _ACTIVE_STATES = {"waiting", "countdown", "blocked", "starting"}
 _TERMINAL_STATES = {"started", "failed", "cancelled"}
 _ALL_STATES = _ACTIVE_STATES | _TERMINAL_STATES | {"missing"}
+
+
+def _python_executable():
+    return sys.executable or shutil.which("python3") or shutil.which("python") or "/usr/bin/python3"
 
 
 class _AgentError(Exception):
@@ -171,6 +177,12 @@ def _validate_manager_request(request):
         if retry_on_exit and not any(source.get("kind") == "status_json" for source in launch_request.get("sources", [])):
             raise _AgentError("INVALID_REQUEST")
         common["retryOnExit"] = retry_on_exit
+        worker_sha256 = request.get("workerSha256")
+        if worker_sha256 is not None:
+            normalized_sha = _strict_string(worker_sha256, maximum=64).lower()
+            if not _HEX64.fullmatch(normalized_sha):
+                raise _AgentError("INVALID_REQUEST")
+            common["workerSha256"] = normalized_sha
     elif operation in {"get_server_wait", "cancel_server_wait"}:
         if "launchRequest" in request or "idleSeconds" in request:
             raise _AgentError("INVALID_REQUEST")
@@ -338,6 +350,121 @@ def _session_exists(executable, uid, session_name, state_root=None):
     raise _AgentError("TMUX_UNAVAILABLE")
 
 
+def _lightweight_launcher():
+    """Minimal built-in launcher shim for read-only/cancel ops without embedding 465 KB."""
+    try:
+        import fcntl as _lw_fcntl
+    except ImportError:
+        _lw_fcntl = None
+
+    class _LwLaunchError(Exception):
+        def __init__(self, error_code):
+            super().__init__(error_code)
+            self.error_code = error_code
+
+    def _lw_within(root, candidate):
+        try:
+            r = os.path.normcase(os.path.abspath(root))
+            c = os.path.normcase(os.path.abspath(candidate))
+            return os.path.commonpath((r, c)) == r
+        except (OSError, ValueError):
+            return False
+
+    def _lw_canonical_task_roots(host_roots, task_directories):
+        if not isinstance(host_roots, list) or not host_roots or not isinstance(task_directories, list) or not task_directories:
+            return None, None
+        hosts = [os.path.realpath(r) for r in host_roots]
+        tasks = []
+        for r in task_directories:
+            cand = os.path.realpath(r)
+            if cand not in tasks:
+                tasks.append(cand)
+        if not hosts or not tasks or any(not any(_lw_within(h, t) for h in hosts) for t in tasks):
+            return None, None
+        return hosts, tasks
+
+    def _lw_current_uid():
+        getter = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
+        if not callable(getter):
+            raise _LwLaunchError("UNSUPPORTED_PLATFORM")
+        return getter()
+
+    def _lw_require_fcntl():
+        if _lw_fcntl is None:
+            raise _LwLaunchError("UNSUPPORTED_PLATFORM")
+        return _lw_fcntl
+
+    def _lw_fsync_directory(directory):
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        fd = os.open(directory, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _lw_attempt_paths(state_dir, task_id, arm_id):
+        key = hashlib.sha256((task_id + "\0" + arm_id).encode("utf-8")).hexdigest()
+        return (os.path.join(state_dir, ".claim-" + key), os.path.join(state_dir, ".receipt-" + key))
+
+    def _lw_inspect_existing_attempt(state_dir, task_id, arm_id, config_hash):
+        claim_path, receipt_path = _lw_attempt_paths(state_dir, task_id, arm_id)
+        for p, is_receipt in ((receipt_path, True), (claim_path, False)):
+            try:
+                with open(p, "rb") as stream:
+                    raw = stream.read(4097)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise _LwLaunchError("UNKNOWN_LAUNCH_RESULT") from exc
+            if len(raw) > 4096:
+                raise _LwLaunchError("UNKNOWN_LAUNCH_RESULT")
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise _LwLaunchError("UNKNOWN_LAUNCH_RESULT") from exc
+            if not isinstance(value, dict) or value.get("version") != VERSION or value.get("configHash") != config_hash:
+                raise _LwLaunchError("CONFIG_CHANGED")
+            if is_receipt:
+                res = value.get("result")
+                if not isinstance(res, dict) or res.get("status") not in {"started", "failed"}:
+                    raise _LwLaunchError("UNKNOWN_LAUNCH_RESULT")
+                return res
+            raise _LwLaunchError("UNKNOWN_LAUNCH_RESULT")
+        return None
+
+    probe_ns = types.SimpleNamespace(_canonical_task_roots=_lw_canonical_task_roots)
+    return types.SimpleNamespace(
+        _lightweight=True,
+        _LaunchError=_LwLaunchError,
+        _probe=lambda: probe_ns,
+        _current_uid=_lw_current_uid,
+        _require_fcntl=_lw_require_fcntl,
+        _fsync_directory=_lw_fsync_directory,
+        _attempt_paths=_lw_attempt_paths,
+        _inspect_existing_attempt=_lw_inspect_existing_attempt,
+    )
+
+
+def _existing_worker_script_for_sha(state_root, worker_sha256, launcher):
+    path = os.path.join(state_root, ".server-worker-v1-" + worker_sha256 + ".py")
+    if _secure_regular(path, launcher, exact_mode=0o600) is None:
+        return None, None
+    data = _read_secure_bytes(path, launcher, MAX_SOURCE_BYTES)
+    if data is None or hashlib.sha256(data).hexdigest() != worker_sha256:
+        return None, None
+    return path, data
+
+
+def _extract_launcher_from_worker(worker_bytes):
+    match = re.search(rb'LAUNCHER_SOURCE_B64\s*=\s*"([^"\r\n]+)"', worker_bytes)
+    if not match:
+        return None
+    b64_text = match.group(1).decode("ascii", "strict")
+    return _load_launcher(b64_text)
+
+
 def _new_session(executable, uid, session_name, worker_script, job_key, state_root):
     command = _tmux_base(executable, uid, state_root) + [
         "new-session",
@@ -345,7 +472,7 @@ def _new_session(executable, uid, session_name, worker_script, job_key, state_ro
         "-s",
         session_name,
         "--",
-        "/usr/bin/python3",
+        _python_executable(),
         "-I",
         "-S",
         "-B",
@@ -828,10 +955,30 @@ def ensure_server_wait(request, launcher, *, tmux_executable=None, worker_source
         finally:
             _release_file_lock(control_fd)
 
+    # On-demand worker deployment: if caller passed workerSha256 without embedding the full
+    # worker source, reuse the verified remote worker script if present; otherwise ask caller
+    # to upload it once.
+    reused_worker_script = None
+    if worker_source is None and AGENT_SOURCE_B64 == "__SERVER_AGENT_SOURCE_B64__":
+        worker_sha = common.get("workerSha256")
+        if worker_sha and state_root is not None:
+            reused_path, reused_bytes = _existing_worker_script_for_sha(state_root, worker_sha, launcher)
+            if reused_path is not None and reused_bytes is not None:
+                reused_worker_script = reused_path
+                if getattr(launcher, "_lightweight", False):
+                    loaded = _extract_launcher_from_worker(reused_bytes)
+                    if loaded is None:
+                        raise _AgentError("WORKER_SOURCE_REQUIRED")
+                    launcher = loaded
+        if reused_worker_script is None:
+            raise _AgentError("WORKER_SOURCE_REQUIRED")
+    elif getattr(launcher, "_lightweight", False):
+        raise _AgentError("WORKER_SOURCE_REQUIRED")
+
     launch_request = _validate_launch_request(launcher, common)
     executable = tmux_executable or _check_tmux()
     state_root = _state_directory(hosts[0], launcher, create=True)
-    if worker_source is None:
+    if reused_worker_script is None and worker_source is None:
         worker_source = _load_worker_source(AGENT_SOURCE_B64)
     control_fd = _acquire_file_lock(_control_lock_path(state_root, common["taskId"]), launcher)
     try:
@@ -857,7 +1004,7 @@ def ensure_server_wait(request, launcher, *, tmux_executable=None, worker_source
                 message="Another server waiter arm is active for this task.",
             )
 
-        worker_script = _write_worker_script(worker_source, state_root, launcher)
+        worker_script = reused_worker_script or _write_worker_script(worker_source, state_root, launcher)
         record = _base_record(common, launch_request)
         restoring = existing_status is not None
         if restoring:
@@ -1029,13 +1176,7 @@ def _gpu_metric(text):
     if not isinstance(text, str):
         return None
     normalized = text.strip()
-    if not normalized or normalized.upper() in {
-        "N/A",
-        "[N/A]",
-        "NA",
-        "UNKNOWN",
-        "NOT SUPPORTED",
-    }:
+    if not normalized or _MISSING_GPU_VALUE.fullmatch(normalized):
         return None
     try:
         value = float(normalized)
@@ -1649,6 +1790,7 @@ def _failure_payload(request, error):
 
 def _emit_frame(envelope):
     payload = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    sys.stdout.buffer.write(FRAME_MAGIC)
     sys.stdout.buffer.write(len(payload).to_bytes(4, "big"))
     sys.stdout.buffer.write(payload)
     sys.stdout.buffer.flush()
@@ -1658,7 +1800,11 @@ def _manager_main():
     request = None
     try:
         request = _decode_request(REQUEST_B64)
-        launcher = _load_launcher(LAUNCHER_SOURCE_B64)
+        op = request.get("op")
+        if LAUNCHER_SOURCE_B64 == "__LAUNCHER_SOURCE_B64__" and op in {"get_server_wait", "cancel_server_wait", "ensure_server_wait"}:
+            launcher = _lightweight_launcher()
+        else:
+            launcher = _load_launcher(LAUNCHER_SOURCE_B64)
         payload = _dispatch(request, launcher)
         return 0, {
             "version": VERSION,

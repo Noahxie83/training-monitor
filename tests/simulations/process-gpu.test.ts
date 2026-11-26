@@ -23,6 +23,7 @@ describe('task GPU collection and history', () => {
       return observation;
     };
     await monitor.api.start();
+    await monitor.api.requestRefresh({});
     let snapshot = await monitor.api.getSnapshot();
     let task = snapshot.tasks[0]!;
     const own = task.resources.filter(metric => metric.scope === 'process' && metric.name === 'gpu_memory_used');
@@ -32,6 +33,7 @@ describe('task GPU collection and history', () => {
     const sampledAt = own[0]!.observedAt;
 
     unavailable = true;
+    await monitor.api.requestRefresh({});
     snapshot = await monitor.api.getSnapshot();
     task = snapshot.tasks[0]!;
     expect(task.resources.filter(metric => metric.scope === 'process' && metric.name === 'gpu_memory_used')).toMatchObject([
@@ -40,12 +42,14 @@ describe('task GPU collection and history', () => {
     expect(task.gpuUsage).toMatchObject({ state: 'unavailable', freshness: 'stale', observedAt: sampledAt });
 
     monitor.setStartTicks('200');
+    await monitor.api.requestRefresh({});
     snapshot = await monitor.api.getSnapshot();
     expect(snapshot.tasks[0]!.resources.filter(metric => metric.scope === 'process' && metric.name === 'gpu_memory_used')).toEqual([]);
     expect(snapshot.tasks[0]!.gpuUsage?.processKeys).toEqual([]);
 
     unavailable = false;
     device = 'GPU 7';
+    await monitor.api.requestRefresh({});
     snapshot = await monitor.api.getSnapshot();
     expect(snapshot.tasks[0]!.resources.filter(metric => metric.scope === 'process' && metric.name === 'gpu_memory_used')).toMatchObject([
       { deviceId: 'GPU 7', freshness: 'fresh', processKey: { pid: 42, startTicks: '200' } },

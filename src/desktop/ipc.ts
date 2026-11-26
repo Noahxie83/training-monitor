@@ -5,7 +5,8 @@ import type { MonitorApi } from '../shared/api';
 import type { Registry } from '../shared/contracts';
 import { MONITOR_API_KEYS } from '../shared/api';
 import { CHANNELS } from './channels';
-import { validateLogPage, validateLogQuery, validateLogSearchPage, validateLogSearchRequest, validateMonitorSnapshot, validateMonitorUpdate, validatePreferences, validateRegistry } from '../shared/validate';
+import { discoverSshHosts, discoverWslDistros } from '../transport/discovery';
+import { validateDiscoveredSshHosts, validateDiscoveredWslDistros, validateLogPage, validateLogQuery, validateLogSearchPage, validateLogSearchRequest, validateMonitorSnapshot, validateMonitorUpdate, validatePreferences, validateRegistry } from '../shared/validate';
 
 type Subscription = { sessionId: string; subscriptionId: string; contentsId: number; dispose: () => void };
 const subscriptions = new Map<string, Subscription>();
@@ -89,6 +90,8 @@ export function registerMonitorIpc(api: MonitorApi, windows?: { openGpuWindow: (
       windows.openGpuWindow(arg as string | undefined);
     }],
     [CHANNELS.copy, async (event, arg) => { assertSender(event); if (!arg || typeof arg !== 'object' || Array.isArray(arg) || Object.keys(arg).some((k) => !['taskId', 'sourceId'].includes(k))) throw new TypeError('INVALID_COPY_REQUEST'); const req = arg as { taskId?: unknown; sourceId?: unknown }; if (typeof req.taskId !== 'string' || (req.sourceId !== undefined && typeof req.sourceId !== 'string')) throw new TypeError('INVALID_COPY_REQUEST'); const reg = validateRegistry(await api.getRegistry()); const task = reg.tasks.find((x) => x.taskId === req.taskId && x.enabled); const source = task?.sources.find((x) => req.sourceId === undefined || x.sourceId === req.sourceId); if (!source) throw new Error('PATH_NOT_REGISTERED'); clipboard.writeText(source.path); }],
+    [CHANNELS.discoverSsh, async (event) => { assertSender(event); return validateDiscoveredSshHosts(await discoverSshHosts()); }],
+    [CHANNELS.discoverWsl, async (event) => { assertSender(event); return validateDiscoveredWslDistros(await discoverWslDistros()); }],
   ];
   for (const [channel, handler] of handlers) ipcMain.handle(channel, handler);
   return () => { for (const [channel] of handlers) ipcMain.removeHandler(channel); for (const subscription of subscriptions.values()) subscription.dispose(); subscriptions.clear(); activeSessions.clear(); lifecycleHooks.clear(); };

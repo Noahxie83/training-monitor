@@ -30,13 +30,16 @@ import { projectTask } from '../domain/lifecycle';
 import { projectResources } from '../domain/resources';
 import { areProcessKeysEqual, isRegisteredProcessEntry, makeRunId, processEntry } from '../domain/identity';
 import { ingestStructuredBaselineRead } from '../domain/evidence';
-import { validateRegistry } from '../shared/validate';
+import { validatePreferences, validateRegistry } from '../shared/validate';
+import { nextBackoffMs } from './backoff';
 import { CollectorScheduler } from './scheduler';
 import { isRegisteredGpuProcess } from '../transport/gpu';
 
 type Scope = { hostId?: string; taskId?: string };
 type MaybePromise<T> = T | Promise<T>;
 type CommittedLogBatch = { ingestedAt: string; events: LogEvent[] };
+type HostRetryState = { consecutiveFailures: number; backoffMs: number | null; nextRetryAtMs: number | null };
+type BoundedSignatureCache = { generation: string | null; entries: Map<string, string> };
 
 export interface ProductionMonitorOptions {
   store: StoreClient;
@@ -54,12 +57,15 @@ export interface ProductionMonitorOptions {
 export interface ProductionMonitorApi extends MonitorApi {
   start(): Promise<void>;
   stop(): Promise<void>;
+  /** Diagnostic helper for verifying host epoch rotation on reconnect/reboot. */
+  getHostEpoch?(hostId: string): string | null;
 }
 
 const HOST_PROBE_INTERVAL_MS = 5_000;
 const NORMAL_READ_BYTES = 256 * 1024;
 const CATCH_UP_READ_BYTES = 1024 * 1024;
 const PAGE_SIZE = 50;
+const MAX_PUBLISHED_SIGNATURES_PER_SOURCE = 512;
 
 function eventSignature(event: LogEvent): string { return JSON.stringify(event); }
 
@@ -81,6 +87,7 @@ function iso(ms: number): string {
 
 function retainStaleGpu(current: HostObservation, previous?: HostObservation): HostObservation {
   if (current.gpu?.state === 'available') return current;
+  if (current.acceleratorAvailability === 'none' || current.gpu?.acceleratorAvailability === 'none') return current;
   const priorMetrics = previous?.gpu?.metrics ?? [];
   if (priorMetrics.length === 0) return current;
   return {
@@ -88,6 +95,7 @@ function retainStaleGpu(current: HostObservation, previous?: HostObservation): H
     gpu: {
       observedAt: previous?.gpu?.observedAt ?? null,
       state: 'unavailable',
+      acceleratorAvailability: current.gpu?.acceleratorAvailability ?? 'unavailable',
       errorCode: current.gpu?.errorCode ?? 'GPU_SAMPLE_UNAVAILABLE',
       metrics: priorMetrics.map((metric) => ({ ...metric, freshness: 'stale' })),
     },
@@ -108,6 +116,9 @@ function taskResources(gpu: HostGpuObservation | undefined, previous: TaskSnapsh
       processKey: metric.processKey,
     })), { now, ttlMs: 15_000 });
     return [...processMetrics, ...deviceSamples];
+  }
+  if (gpu?.acceleratorAvailability === 'none') {
+    return [...processMetrics];
   }
   const staleDeviceMetrics = gpu?.metrics.length
     ? gpu.metrics.map((metric) => ({ ...metric, freshness: 'stale' as const }))
@@ -141,7 +152,9 @@ function withTaskGpu(snapshot: TaskSnapshot, previous: TaskSnapshot | null, task
   return { ...snapshot, resources: [...baseResources, ...retained], gpuUsage: {
     observedAt: retained.length ? previous?.gpuUsage?.observedAt ?? retained[0]!.observedAt : null,
     freshness: retained.length ? 'stale' : 'unobserved', state: 'unavailable',
-    errorCode: observation.processGpu?.errorCode ?? (complete ? 'PROCESS_GPU_UNAVAILABLE' : 'PROCESS_SCAN_INCOMPLETE'),
+    errorCode: observation.processGpu?.errorCode !== undefined
+      ? observation.processGpu.errorCode
+      : (complete ? 'PROCESS_GPU_UNAVAILABLE' : 'PROCESS_SCAN_INCOMPLETE'),
     processKeys: retained.length ? previous?.gpuUsage?.processKeys ?? [] : [],
   } };
 }
@@ -193,11 +206,6 @@ function exactWriter(task: TaskRegistration, process: TaskProcessObservation): b
       task.sources.some((source) => source.sourceId === sourceId && source.kind === 'log'));
 }
 
-/**
- * A completed probe can establish process identity before a readable training
- * record is available. Keep that identity useful, but leave run progress
- * unconfirmed and all baseline-derived facts null.
- */
 function retainObservedRun(snapshot: TaskSnapshot, task: TaskRegistration, observation: TaskObservation): TaskSnapshot {
   if (snapshot.currentRun || observation.freshness !== 'fresh' || !observation.scanComplete) return snapshot;
   const candidates = observation.processes.filter((process) => exactWriter(task, process));
@@ -286,27 +294,43 @@ class ProductionMonitor implements ProductionMonitorApi {
   private readonly scheduler = new CollectorScheduler();
   private readonly listeners = new Set<(update: MonitorUpdate) => void>();
   private readonly previousTasks = new Map<string, TaskSnapshot>();
-  private readonly taskRegistrations = new Map<string, string>();
+  private readonly taskRegistrations = new Map<string, { signature: string; sourceIds: string[] }>();
   private readonly bindings = new Map<string, BindingState>();
   private readonly hostEpochs = new Map<string, string>();
+  private readonly lastHostBootIds = new Map<string, string>();
   private readonly connectedHosts = new Set<string>();
   private readonly lastHostObservation = new Map<string, HostObservation>();
   private readonly lastHostSuccessAt = new Map<string, string>();
   private readonly lastHostProbeDurationMs = new Map<string, number>();
+  private readonly lastHostAttemptAtMs = new Map<string, number>();
   private readonly hostTargets = new Map<string, string>();
+  private readonly hostPollIntervals = new Map<string, number>();
+  private readonly hostRetry = new Map<string, HostRetryState>();
+  private readonly hostTails = new Map<string, Promise<void>>();
+  private readonly inFlightHosts = new Set<string>();
+  private readonly hostTransports = new Map<string, { targetKey: string; transport: Transport }>();
   private readonly lastTaskObservation = new Map<string, TaskObservation>();
-  private readonly publishedLogSignatures = new Map<string, Map<string, string>>();
+  private readonly publishedLogSignatures = new Map<string, BoundedSignatureCache>();
   private readonly seededLogSources = new Set<string>();
   private readonly abort = new AbortController();
-  private tail: Promise<void> = Promise.resolve();
+  private registryTail: Promise<void> = Promise.resolve();
   private started = false;
   private stopped = false;
   private preferences: Preferences = { theme: 'system' };
 
   private readonly autoStart: AutoStartController;
   constructor(private readonly options: ProductionMonitorOptions) {
-    this.autoStart = new AutoStartController({ ledger: options.launchLedger, clock: options.clock, monotonicClock: options.monotonicClock,
-      registryProvider: options.registryProvider, onChange: async () => this.publishSnapshot(await options.registryProvider()) });
+    this.autoStart = new AutoStartController({
+      ledger: options.launchLedger,
+      clock: options.clock,
+      monotonicClock: options.monotonicClock,
+      registryProvider: options.registryProvider,
+      onChange: async () => this.publishSnapshot(await options.registryProvider()),
+    });
+  }
+
+  getHostEpoch(hostId: string): string | null {
+    return this.hostEpochs.get(hostId) ?? null;
   }
 
   async start(): Promise<void> {
@@ -321,9 +345,14 @@ class ProductionMonitor implements ProductionMonitorApi {
       if (host.lastProbeDurationMs !== null) this.lastHostProbeDurationMs.set(host.hostId, host.lastProbeDurationMs);
     }
     for (const task of snapshot.tasks) this.previousTasks.set(task.taskId, task);
-    for (const task of registry.tasks) this.taskRegistrations.set(task.taskId, JSON.stringify(task));
+    for (const task of registry.tasks) {
+      this.taskRegistrations.set(task.taskId, {
+        signature: JSON.stringify(task),
+        sourceIds: task.sources.map((s) => s.sourceId),
+      });
+    }
     if (this.options.preferencesProvider) this.preferences = await this.options.preferencesProvider();
-    this.scheduler.schedule(HOST_PROBE_INTERVAL_MS, '__collector__', () => this.enqueueRefresh({}));
+    this.syncHostSchedules(registry);
     this.scheduler.start();
   }
 
@@ -332,9 +361,14 @@ class ProductionMonitor implements ProductionMonitorApi {
     this.stopped = true;
     this.abort.abort();
     this.scheduler.stop();
-    await this.tail.catch(() => undefined);
+    await Promise.allSettled([...this.hostTails.values(), this.registryTail, this.scheduler.waitIdle()]);
+    const transports = [...this.hostTransports.values()];
+    this.hostTransports.clear();
+    await Promise.allSettled(transports.map((entry) => entry.transport.close?.()));
     await this.options.store.close().catch(() => undefined);
     this.listeners.clear();
+    this.publishedLogSignatures.clear();
+    this.seededLogSources.clear();
   }
 
   subscribe(listener: (update: MonitorUpdate) => void): () => void {
@@ -342,17 +376,63 @@ class ProductionMonitor implements ProductionMonitorApi {
     return () => this.listeners.delete(listener);
   }
 
+  /**
+   * Non-blocking snapshot read: returns persisted + in-memory state immediately with zero network wait,
+   * and triggers asynchronous background refresh for any unobserved or stale enabled hosts.
+   */
   async getSnapshot(): Promise<MonitorSnapshot> {
-    await this.enqueueRefresh({});
+    if (this.stopped) throw new Error('MONITOR_STOPPED');
     const [snapshot, registry] = await Promise.all([
       this.options.store.getSnapshot(),
       this.options.registryProvider(),
     ]);
+    this.syncRegisteredTasks(registry);
+    this.syncRegisteredHosts(registry);
+    this.syncHostSchedules(registry);
+
+    const nowMs = this.options.clock();
+    const staleHostIds: string[] = [];
+    for (const host of registry.hosts) {
+      if (!host.enabled || this.inFlightHosts.has(host.hostId)) continue;
+      const retry = this.hostRetry.get(host.hostId);
+      if (retry?.nextRetryAtMs !== null && retry?.nextRetryAtMs !== undefined && nowMs < retry.nextRetryAtMs) {
+        continue;
+      }
+      const lastAttempt = this.lastHostAttemptAtMs.get(host.hostId);
+      // Only trigger initial non-blocking probe on unobserved hosts; CollectorScheduler owns periodic polling.
+      if (lastAttempt === undefined) {
+        staleHostIds.push(host.hostId);
+      }
+    }
+
+    if (staleHostIds.length > 0 && !this.stopped) {
+      void this.refreshSelectedHosts(registry, staleHostIds, {}, false).catch(() => undefined);
+    }
+
     return this.snapshotWithHostStates(projectRegistrySnapshot(snapshot, registry), registry);
   }
 
   async requestRefresh(scope: Scope): Promise<void> {
-    await this.enqueueRefresh(scope);
+    if (this.stopped) throw new Error('MONITOR_STOPPED');
+    const registry = await this.options.registryProvider();
+    this.autoStart.synchronize(registry);
+    this.syncRegisteredTasks(registry);
+    this.syncRegisteredHosts(registry);
+    this.syncHostSchedules(registry);
+
+    const scopedTaskHostId = scope.taskId
+      ? registry.tasks.find((task) => task.taskId === scope.taskId)?.hostId
+      : undefined;
+    const selectedHosts = registry.hosts.filter((host) => scope.hostId
+      ? host.hostId === scope.hostId
+      : scope.taskId ? host.hostId === scopedTaskHostId : true);
+
+    // Manual refresh / "重试连接" immediately resets backoff for selected hosts.
+    for (const host of selectedHosts) {
+      this.resetHostBackoff(host.hostId);
+    }
+
+    await this.refreshSelectedHosts(registry, selectedHosts.map((h) => h.hostId), scope, true);
   }
 
   getLogs(query: LogQuery): Promise<LogPage> { return this.options.store.getLogs(query); }
@@ -366,29 +446,38 @@ class ProductionMonitor implements ProductionMonitorApi {
   async saveRegistry(registry: Registry): Promise<Registry> {
     if (!this.options.registrySaver) throw new Error('REGISTRY_SAVE_UNAVAILABLE');
     const validated = validateRegistry(registry);
-    const run = this.tail.catch(() => undefined).then(async () => {
+    // Serialized only against other registry saves — never blocked by an offline host!
+    const run = this.registryTail.catch(() => undefined).then(async () => {
       if (this.stopped) throw new Error('MONITOR_STOPPED');
       const current = await this.options.registryProvider();
       if (validated.revision !== current.revision) throw new Error('REVISION_CONFLICT');
       await cancelChangedServerWaits(current, validated, this.options.transportProvider, this.abort.signal);
       const saved = await this.options.registrySaver!(validated);
-      await this.refresh({});
+      this.autoStart.synchronize(saved);
+      this.syncRegisteredTasks(saved);
+      this.syncRegisteredHosts(saved);
+      this.syncHostSchedules(saved);
+      await this.publishSnapshot(saved);
+      const enabledIds = saved.hosts.filter((h) => h.enabled).map((h) => h.hostId);
+      if (enabledIds.length > 0 && !this.stopped) {
+        void this.refreshSelectedHosts(saved, enabledIds, {}, false).catch(() => undefined);
+      }
       return structuredClone(saved);
     });
-    this.tail = run.then(() => undefined, () => undefined);
+    this.registryTail = run.then(() => undefined, () => undefined);
     return run;
   }
 
   async getPreferences(): Promise<Preferences> {
-    return { ...this.preferences };
+    return structuredClone(this.preferences);
   }
 
   async savePreferences(value: Preferences): Promise<Preferences> {
-    if (value.theme !== 'system' && value.theme !== 'light' && value.theme !== 'dark') throw new TypeError('INVALID_PREFERENCES');
+    const validated = validatePreferences(value);
     this.preferences = this.options.preferencesSaver
-      ? await this.options.preferencesSaver({ theme: value.theme })
-      : { theme: value.theme };
-    return { ...this.preferences };
+      ? await this.options.preferencesSaver(validated)
+      : structuredClone(validated);
+    return structuredClone(this.preferences);
   }
 
   async copyRegisteredPath(): Promise<void> {
@@ -396,34 +485,130 @@ class ProductionMonitor implements ProductionMonitorApi {
     // inspect or mutate the registered remote path.
   }
 
-  private enqueueRefresh(scope: Scope): Promise<void> {
-    if (this.stopped) return Promise.reject(new Error('MONITOR_STOPPED'));
-    const run = this.tail.catch(() => undefined).then(() => this.refresh(scope));
-    this.tail = run;
-    return run;
+  private resetHostBackoff(hostId: string): void {
+    this.hostRetry.delete(hostId);
   }
 
-  private async refresh(scope: Scope): Promise<void> {
-    if (this.stopped) return;
+  private recordHostFailure(hostId: string): void {
+    const prev = this.hostRetry.get(hostId) ?? { consecutiveFailures: 0, backoffMs: null, nextRetryAtMs: null };
+    const backoffMs = nextBackoffMs(prev.backoffMs);
+    this.hostRetry.set(hostId, {
+      consecutiveFailures: prev.consecutiveFailures + 1,
+      backoffMs,
+      nextRetryAtMs: this.options.clock() + backoffMs,
+    });
+  }
+
+  private syncHostSchedules(registry: Registry): void {
+    const activeIds = new Set<string>();
+    for (const host of registry.hosts) {
+      if (!host.enabled) {
+        this.scheduler.unscheduleHost(host.hostId);
+        this.hostPollIntervals.delete(host.hostId);
+        continue;
+      }
+      activeIds.add(host.hostId);
+      const delay = host.pollIntervalMs ?? HOST_PROBE_INTERVAL_MS;
+      const existingDelay = this.hostPollIntervals.get(host.hostId);
+      if (existingDelay !== delay || !this.scheduler.hasHost(host.hostId)) {
+        this.scheduler.unscheduleHost(host.hostId);
+        this.hostPollIntervals.set(host.hostId, delay);
+        this.scheduler.schedule(delay, host.hostId, () => this.runScheduledHostTick(host.hostId));
+      }
+    }
+    for (const hostId of [...this.hostPollIntervals.keys()]) {
+      if (!activeIds.has(hostId)) {
+        this.scheduler.unscheduleHost(hostId);
+        this.hostPollIntervals.delete(hostId);
+      }
+    }
+  }
+
+  private async runScheduledHostTick(hostId: string): Promise<void> {
+    if (this.stopped || this.abort.signal.aborted) return;
+    const retry = this.hostRetry.get(hostId);
+    if (retry?.nextRetryAtMs !== null && retry?.nextRetryAtMs !== undefined && this.options.clock() < retry.nextRetryAtMs) {
+      return;
+    }
     const registry = await this.options.registryProvider();
     this.autoStart.synchronize(registry);
     this.syncRegisteredTasks(registry);
     this.syncRegisteredHosts(registry);
-    const scopedTaskHostId = scope.taskId
-      ? registry.tasks.find((task) => task.taskId === scope.taskId)?.hostId
-      : undefined;
-    const selectedHosts = registry.hosts.filter((host) => scope.hostId
-      ? host.hostId === scope.hostId
-      : scope.taskId ? host.hostId === scopedTaskHostId : true);
-    for (const host of selectedHosts) {
-      if (this.abort.signal.aborted) return;
-      if (!host.enabled) continue;
-      const tasks = registry.tasks.filter((task) => task.enabled && task.hostId === host.hostId &&
-        (!scope.taskId || task.taskId === scope.taskId));
-      try { await this.refreshHost(host, tasks, registry); }
-      catch { /* A task-side failure on one host must not block the remaining hosts. */ }
+    const host = registry.hosts.find((item) => item.hostId === hostId);
+    if (!host || !host.enabled) return;
+    await this.enqueueHostWork(host.hostId, async () => {
+      if (this.stopped || this.abort.signal.aborted) return;
+      const latestRegistry = await this.options.registryProvider();
+      const latestHost = latestRegistry.hosts.find((item) => item.hostId === hostId);
+      if (!latestHost || !latestHost.enabled) return;
+      const tasks = latestRegistry.tasks.filter((task) => task.enabled && task.hostId === hostId);
+      await this.refreshHost(latestHost, tasks, latestRegistry);
+      await this.publishSnapshot(latestRegistry);
+    });
+  }
+
+  private enqueueHostWork(hostId: string, work: () => Promise<void>): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    const previous = this.hostTails.get(hostId) ?? Promise.resolve();
+    const current: Promise<void> = previous.catch(() => undefined).then(async () => {
+      this.inFlightHosts.add(hostId);
+      try {
+        await work();
+      } catch {
+        // Host-level errors are isolated per host and never break sibling hosts.
+      } finally {
+        this.inFlightHosts.delete(hostId);
+        if (this.hostTails.get(hostId) === current) this.hostTails.delete(hostId);
+      }
+    });
+    this.hostTails.set(hostId, current);
+    return current;
+  }
+
+  private async refreshSelectedHosts(
+    registry: Registry,
+    hostIds: string[],
+    scope: Scope,
+    publishAtEnd: boolean,
+  ): Promise<void> {
+    const selected = registry.hosts.filter((host) => hostIds.includes(host.hostId));
+    // All hosts execute independently in parallel!
+    await Promise.allSettled(selected.map(async (host) => {
+      if (this.abort.signal.aborted || !host.enabled) return;
+      const tasks = registry.tasks.filter((task) =>
+        task.enabled && task.hostId === host.hostId && (!scope.taskId || task.taskId === scope.taskId),
+      );
+      await this.enqueueHostWork(host.hostId, async () => {
+        if (this.abort.signal.aborted || this.stopped) return;
+        await this.refreshHost(host, tasks, registry);
+        await this.publishSnapshot(registry);
+      });
+    }));
+    if (publishAtEnd && !this.stopped) {
+      await this.publishSnapshot(registry);
     }
-    await this.publishSnapshot(registry);
+  }
+
+  private async getHostTransport(host: HostRegistration, registry: Registry): Promise<Transport> {
+    const targetKey = JSON.stringify(host.target);
+    const cached = this.hostTransports.get(host.hostId);
+    if (cached && cached.targetKey === targetKey) {
+      return cached.transport;
+    }
+    if (cached) {
+      this.hostTransports.delete(host.hostId);
+      void cached.transport.close?.().catch(() => undefined);
+    }
+    const transport = await this.options.transportProvider(host, registry);
+    this.hostTransports.set(host.hostId, { targetKey, transport });
+    return transport;
+  }
+
+  private releaseSourceSignatures(sourceIds: string[]): void {
+    for (const sourceId of sourceIds) {
+      this.publishedLogSignatures.delete(sourceId);
+      this.seededLogSources.delete(sourceId);
+    }
   }
 
   private syncRegisteredHosts(registry: Registry): void {
@@ -435,20 +620,39 @@ class ProductionMonitor implements ProductionMonitorApi {
         this.lastHostObservation.delete(hostId);
         this.lastHostSuccessAt.delete(hostId);
         this.lastHostProbeDurationMs.delete(hostId);
+        this.lastHostAttemptAtMs.delete(hostId);
         this.connectedHosts.delete(hostId);
+        this.hostEpochs.delete(hostId);
+        this.lastHostBootIds.delete(hostId);
+        this.hostRetry.delete(hostId);
+        const cachedTransport = this.hostTransports.get(hostId);
+        if (cachedTransport) {
+          this.hostTransports.delete(hostId);
+          void cachedTransport.transport.close?.().catch(() => undefined);
+        }
         continue;
       }
       if (previousTarget !== JSON.stringify(host.target)) {
         this.lastHostObservation.delete(hostId);
         this.lastHostSuccessAt.delete(hostId);
         this.lastHostProbeDurationMs.delete(hostId);
+        this.lastHostAttemptAtMs.delete(hostId);
         this.connectedHosts.delete(hostId);
         this.hostEpochs.delete(hostId);
+        this.lastHostBootIds.delete(hostId);
+        this.hostRetry.delete(hostId);
+        const cachedTransport = this.hostTransports.get(hostId);
+        if (cachedTransport) {
+          this.hostTransports.delete(hostId);
+          void cachedTransport.transport.close?.().catch(() => undefined);
+        }
         for (const task of this.previousTasks.values()) {
           if (task.hostId === hostId) {
             this.previousTasks.delete(task.taskId);
             this.bindings.delete(task.taskId);
             this.lastTaskObservation.delete(task.taskId);
+            const meta = this.taskRegistrations.get(task.taskId);
+            if (meta) this.releaseSourceSignatures(meta.sourceIds);
           }
         }
         this.hostTargets.set(hostId, JSON.stringify(host.target));
@@ -468,6 +672,12 @@ class ProductionMonitor implements ProductionMonitorApi {
           errorCode: 'HOST_DISABLED',
         });
         this.connectedHosts.delete(host.hostId);
+        this.hostRetry.delete(host.hostId);
+        const cachedTransport = this.hostTransports.get(host.hostId);
+        if (cachedTransport) {
+          this.hostTransports.delete(host.hostId);
+          void cachedTransport.transport.close?.().catch(() => undefined);
+        }
       } else if (this.lastHostObservation.get(host.hostId)?.errorCode === 'HOST_DISABLED') {
         this.lastHostObservation.delete(host.hostId);
       }
@@ -476,29 +686,44 @@ class ProductionMonitor implements ProductionMonitorApi {
 
   private syncRegisteredTasks(registry: Registry): void {
     const current = new Map(registry.tasks.map((task) => [task.taskId, task]));
-    for (const [taskId, signature] of this.taskRegistrations) {
+    for (const [taskId, meta] of this.taskRegistrations) {
       const task = current.get(taskId);
-      if (!task || JSON.stringify(task) !== signature) {
+      if (!task || JSON.stringify(task) !== meta.signature) {
         this.taskRegistrations.delete(taskId);
         this.previousTasks.delete(taskId);
         this.bindings.delete(taskId);
         this.lastTaskObservation.delete(taskId);
+        this.releaseSourceSignatures(meta.sourceIds);
       }
     }
     for (const task of registry.tasks) {
       const signature = JSON.stringify(task);
-      if (!this.taskRegistrations.has(task.taskId)) this.taskRegistrations.set(task.taskId, signature);
+      if (!this.taskRegistrations.has(task.taskId)) {
+        this.taskRegistrations.set(task.taskId, {
+          signature,
+          sourceIds: task.sources.map((s) => s.sourceId),
+        });
+      }
     }
   }
 
   private async refreshHost(host: HostRegistration, tasks: TaskRegistration[], registry: Registry): Promise<void> {
     let transport: Transport | null = null;
     let hostObservation: HostObservation;
+    let batchTaskObservations: Map<string, TaskObservation> | null = null;
     const probeStartedAt = this.options.clock();
+    this.lastHostAttemptAtMs.set(host.hostId, probeStartedAt);
     const previousHost = this.lastHostObservation.get(host.hostId);
+
     try {
-      transport = await this.options.transportProvider(host, registry);
-      hostObservation = retainStaleGpu(await transport.probeHost(this.abort.signal), previousHost);
+      transport = await this.getHostTransport(host, registry);
+      if (transport.probeHostAndTasks) {
+        const batch = await transport.probeHostAndTasks(tasks, this.abort.signal);
+        hostObservation = retainStaleGpu(batch.host, previousHost);
+        batchTaskObservations = batch.tasks;
+      } else {
+        hostObservation = retainStaleGpu(await transport.probeHost(this.abort.signal), previousHost);
+      }
     } catch (error) {
       hostObservation = retainStaleGpu({
         hostId: host.hostId,
@@ -518,6 +743,7 @@ class ProductionMonitor implements ProductionMonitorApi {
     if (!connected) {
       const disconnected = disconnectedHost(hostObservation, iso(this.options.clock()));
       this.connectedHosts.delete(host.hostId);
+      this.recordHostFailure(host.hostId);
       this.lastHostObservation.set(host.hostId, disconnected);
       for (const task of tasks) {
         const taskObservation = unavailableTask(task, disconnected);
@@ -539,18 +765,26 @@ class ProductionMonitor implements ProductionMonitorApi {
       return;
     }
 
-    this.connectedHosts.add(host.hostId);
+    // Rotate host epoch BEFORE marking host as connected, and detect boot_id changes!
     this.ensureHostEpoch(host.hostId, hostObservation);
+    this.connectedHosts.add(host.hostId);
+    if (hostObservation.hostBootId) {
+      this.lastHostBootIds.set(host.hostId, hostObservation.hostBootId);
+    }
+    this.resetHostBackoff(host.hostId);
     this.lastHostObservation.set(host.hostId, hostObservation);
     if (hostObservation.observedAt) this.lastHostSuccessAt.set(host.hostId, hostObservation.observedAt);
+
     for (const task of tasks) {
       if (this.abort.signal.aborted) return;
       if (!transport) return;
-      const taskObservation = await transport.probeTask(task, this.abort.signal);
+      const taskObservation = batchTaskObservations?.get(task.taskId)
+        ?? await transport.probeTask(task, this.abort.signal);
       this.lastTaskObservation.set(task.taskId, taskObservation);
       await this.collectTask(transport, task, host.target.kind, hostObservation, taskObservation);
       await this.autoStart.evaluate(host, task, hostObservation, transport, this.abort.signal);
     }
+    this.lastHostAttemptAtMs.set(host.hostId, this.options.clock());
   }
 
   private initialBinding(taskId: string): BindingState {
@@ -560,7 +794,11 @@ class ProductionMonitor implements ProductionMonitorApi {
   private ensureHostEpoch(hostId: string, observation: HostObservation): void {
     const prior = this.hostEpochs.get(hostId);
     const reconnect = !this.connectedHosts.has(hostId);
-    if (!prior || reconnect) this.hostEpochs.set(hostId, randomUUID());
+    const previousBootId = this.lastHostBootIds.get(hostId);
+    const rebooted = Boolean(previousBootId && observation.hostBootId && previousBootId !== observation.hostBootId);
+    if (!prior || reconnect || rebooted) {
+      this.hostEpochs.set(hostId, randomUUID());
+    }
   }
 
   private async collectTask(
@@ -577,7 +815,6 @@ class ProductionMonitor implements ProductionMonitorApi {
 
     const logSources = task.sources.filter((source) => source.kind === 'log');
     for (const source of logSources) {
-      const observedSource = taskObservation.sources.find((item) => item.sourceId === source.sourceId);
       let cursor = await this.options.store.getCursor(source.sourceId);
       if (!cursor) {
         const initial = sourceObservation(taskObservation, source.sourceId);
@@ -595,13 +832,10 @@ class ProductionMonitor implements ProductionMonitorApi {
         continue;
       }
 
-      // Establish the observation window before reading, then advance it to
-      // the probed EOF after the transactional read. This lets supported new
-      // records acquire run bindings without assigning pre-observation bytes.
       bindingState = await this.applyBindings(task, taskObservation, bindingState, observedAt);
       const result = await this.refreshSource(transport, task, source.sourceId, taskObservation, cursor);
       cursor = result.cursor;
-      await this.publishCommittedLogs(source.sourceId, result.batches.flatMap((batch) => batch.events));
+      await this.publishCommittedLogs(source.sourceId, cursor.generation, result.batches.flatMap((batch) => batch.events));
       sourceGenerations[source.sourceId] = cursor.generation;
       sourceStates[source.sourceId] = {
         observedAt,
@@ -627,8 +861,6 @@ class ProductionMonitor implements ProductionMonitorApi {
         state: observed?.permission === 'missing' ? 'missing' : observed?.permission === 'denied' ? 'permission_error' : 'ready',
         errorCode: observed?.errorCode ?? null,
       };
-      // The same read-only probe supplies bytes, stat identity and parsed status.
-      // Feed this observation through the domain's existing identity validation.
       if (source.kind === 'status_json' && observed?.statusRawContent &&
           observed.observedAt && observed.fileIdentity?.dev && observed.fileIdentity.inode &&
           observed.eofBytes === String(Buffer.byteLength(observed.statusRawContent, 'utf8'))) {
@@ -707,7 +939,7 @@ class ProductionMonitor implements ProductionMonitorApi {
   ): Promise<{ cursor: CursorState; error: string | null; batches: CommittedLogBatch[] }> {
     let cursor = (await this.options.store.getCursor(sourceId)) ?? initialCursor;
     const batches: CommittedLogBatch[] = [];
-    let observed = taskObservation.sources.find((source) => source.sourceId === sourceId);
+    const observed = taskObservation.sources.find((source) => source.sourceId === sourceId);
     let attempts = 0;
     while (attempts++ < 64 && !this.abort.signal.aborted) {
       const current = await this.options.store.getCursor(sourceId);
@@ -785,9 +1017,7 @@ class ProductionMonitor implements ProductionMonitorApi {
         ranges: scan.candidates.map((candidate) => ({ startOffset: candidate.startOffset, endOffset: candidate.endOffset })),
       };
     } catch {
-      // Archive discovery is deliberately not expanded here. An inconclusive
-      // scan still permits a stable replacement to be sealed with an explicit
-      // unknown gap when old bytes cannot be recovered.
+      // An inconclusive scan still permits sealing a stable replacement with an explicit unknown gap.
     }
     const stable = observed && observed.fileIdentity && observed.eofBytes !== null && observed.observedAt
       ? sourceObservation({ ...({ sources: [observed] } as TaskObservation), taskId: task.taskId, hostId: task.hostId, observedAt: observed.observedAt, freshness: 'fresh', scanComplete: true, processScanError: null, phase: null, processes: [], errorCode: null }, sourceId, observed.eofBytes)
@@ -799,14 +1029,35 @@ class ProductionMonitor implements ProductionMonitorApi {
       newFile: stable ? { status: 'stable', observation: stable } : { status: 'unconfirmed' },
       observedAt: iso(this.options.clock()),
     });
-    if (decision.kind === 'seal') return decision.newCursor;
+    if (decision.kind === 'seal') {
+      // Release old generation signatures as soon as a generation is sealed.
+      this.publishedLogSignatures.delete(sourceId);
+      this.seededLogSources.delete(sourceId);
+      return decision.newCursor;
+    }
     return null;
   }
 
-  private async publishCommittedLogs(sourceId: string, events: LogEvent[]): Promise<void> {
+  private recordBoundedSignature(cache: BoundedSignatureCache, eventId: string, signature: string): void {
+    if (cache.entries.has(eventId)) cache.entries.delete(eventId);
+    cache.entries.set(eventId, signature);
+    while (cache.entries.size > MAX_PUBLISHED_SIGNATURES_PER_SOURCE) {
+      const oldest = cache.entries.keys().next().value;
+      if (oldest === undefined) break;
+      cache.entries.delete(oldest);
+    }
+  }
+
+  private async publishCommittedLogs(sourceId: string, generation: string, events: LogEvent[]): Promise<void> {
     if (this.stopped) return;
     const hasListeners = this.listeners.size > 0;
-    let seen = this.publishedLogSignatures.get(sourceId);
+    let cache = this.publishedLogSignatures.get(sourceId);
+    if (cache && cache.generation !== generation) {
+      // Generation rotated: release old generation memory immediately.
+      cache = { generation, entries: new Map() };
+      this.publishedLogSignatures.set(sourceId, cache);
+      this.seededLogSources.delete(sourceId);
+    }
     if (!this.seededLogSources.has(sourceId)) {
       const page = await this.options.store.getLogs({
         requestId: 'collector-seed-' + sourceId + '-' + randomUUID(),
@@ -815,18 +1066,24 @@ class ProductionMonitor implements ProductionMonitorApi {
         limit: PAGE_EVENT_LIMIT,
       });
       const currentIds = new Set(events.map((event) => event.eventId));
-      seen = new Map(page.events
-        .filter((event) => !hasListeners || !currentIds.has(event.eventId))
-        .map((event) => [event.eventId, eventSignature(event)]));
-      this.publishedLogSignatures.set(sourceId, seen);
+      cache = { generation, entries: new Map() };
+      for (const event of page.events) {
+        if (event.generation !== generation) continue;
+        if (hasListeners && currentIds.has(event.eventId)) continue;
+        this.recordBoundedSignature(cache, event.eventId, eventSignature(event));
+      }
+      this.publishedLogSignatures.set(sourceId, cache);
       this.seededLogSources.add(sourceId);
     }
-    if (!seen) seen = new Map();
+    if (!cache) {
+      cache = { generation, entries: new Map() };
+      this.publishedLogSignatures.set(sourceId, cache);
+    }
     const changed: LogEvent[] = [];
     for (const event of events) {
       const signature = eventSignature(event);
-      if (seen.get(event.eventId) === signature) continue;
-      seen.set(event.eventId, signature);
+      if (cache.entries.get(event.eventId) === signature) continue;
+      this.recordBoundedSignature(cache, event.eventId, signature);
       changed.push(event);
     }
     const batch = boundedLogBatch(changed);
@@ -842,8 +1099,6 @@ class ProductionMonitor implements ProductionMonitorApi {
     const cursor = await this.options.store.getCursor(source.sourceId);
     if (!observed?.fileIdentity || !observed.observedAt || !cursor) return {};
     const page = await this.options.store.getLogs({ requestId: `collector-sample-${task.taskId}-${randomUUID()}`, sourceId: source.sourceId, before: null, limit: PAGE_SIZE });
-    // Diagnostic lines may follow a valid progress record. Use a recent record
-    // from this file generation; keep the process/file/offset checks downstream.
     const event = [...page.events].reverse().find((item) =>
       item.generation === cursor.generation &&
       item.recordComplete === true && item.text && !item.displayTruncated &&
@@ -909,6 +1164,9 @@ class ProductionMonitor implements ProductionMonitorApi {
         if (!registration) return cached;
         const hostSnapshot = { ...cached };
         delete hostSnapshot.gpu;
+        delete hostSnapshot.nextRetryAt;
+        delete hostSnapshot.consecutiveFailures;
+        delete hostSnapshot.acceleratorAvailability;
         const lastSuccessAt = this.lastHostSuccessAt.get(cached.hostId) ?? cached.lastSuccessAt;
         const lastProbeDurationMs = this.lastHostProbeDurationMs.get(cached.hostId) ?? cached.lastProbeDurationMs;
         if (!registration.enabled) {
@@ -924,6 +1182,14 @@ class ProductionMonitor implements ProductionMonitorApi {
           };
         }
 
+        const retry = this.hostRetry.get(cached.hostId);
+        const retryFields = retry && retry.consecutiveFailures > 0
+          ? {
+            consecutiveFailures: retry.consecutiveFailures,
+            nextRetryAt: retry.nextRetryAtMs !== null ? iso(retry.nextRetryAtMs) : null,
+          }
+          : {};
+
         const observation = this.lastHostObservation.get(cached.hostId);
         if (!observation) {
           const wasConnected = cached.connection === 'connected';
@@ -935,6 +1201,7 @@ class ProductionMonitor implements ProductionMonitorApi {
             lastProbeDurationMs,
             scanComplete: wasConnected ? false : cached.scanComplete,
             errorCode: wasConnected ? cached.errorCode ?? 'CACHED_OFFLINE' : cached.errorCode,
+            ...retryFields,
           };
         }
 
@@ -949,6 +1216,8 @@ class ProductionMonitor implements ProductionMonitorApi {
           lastProbeDurationMs,
           scanComplete: observation.scanComplete,
           errorCode: observation.errorCode,
+          ...retryFields,
+          ...(observation.acceleratorAvailability ? { acceleratorAvailability: observation.acceleratorAvailability } : {}),
           ...(observation.gpu ? { gpu: structuredClone(observation.gpu) } : {}),
         };
       }),

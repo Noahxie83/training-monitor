@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useLayoutEffect, useRef } from "react";
 import { useMonitor } from "./hooks/useMonitor";
 import { Header } from "./components/Header";
 import { TaskFleetTree } from "./components/TaskFleetTree";
@@ -123,8 +123,26 @@ export function App() {
   }
 
   // Keyboard shortcuts: Ctrl+R, Ctrl+1~9, Esc with strict guards (I14)
-  useEffect(() => {
+  const shortcutStateRef = useRef({
+    orderedTasks,
+    refresh,
+    setActiveTaskId,
+    isSettingsOpen,
+    isEvidenceOpen,
+    taskEditor,
+  });
+  shortcutStateRef.current = {
+    orderedTasks,
+    refresh,
+    setActiveTaskId,
+    isSettingsOpen,
+    isEvidenceOpen,
+    taskEditor,
+  };
+
+  useLayoutEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const state = shortcutStateRef.current;
       // If modal or drawer is open, or during IME, or in text input, do not trigger global navigation shortcuts
       const activeEl = document.activeElement;
       const targetEl = e.target as HTMLElement | null;
@@ -146,33 +164,33 @@ export function App() {
       // Esc -> Close overlays
       if (e.key === "Escape") {
         if (isComposing) return;
-        if (isEvidenceOpen) {
+        if (state.isEvidenceOpen) {
           setIsEvidenceOpen(false);
           return;
         }
-        if (isSettingsOpen) {
+        if (state.isSettingsOpen) {
           setIsSettingsOpen(false);
           return;
         }
       }
 
-      if (isSettingsOpen || isEvidenceOpen || taskEditor || isInput || isComposing) {
+      if (state.isSettingsOpen || state.isEvidenceOpen || state.taskEditor || isInput || isComposing) {
         return;
       }
 
       // Ctrl+R -> Refresh
       if ((e.ctrlKey || e.metaKey) && (e.key === "r" || e.key === "R")) {
         e.preventDefault();
-        refresh();
+        state.refresh();
         return;
       }
 
       // Ctrl+1~9 -> Switch task
       if ((e.ctrlKey || e.metaKey) && /^[1-9]$/.test(e.key)) {
         const index = parseInt(e.key, 10) - 1;
-        if (index < orderedTasks.length && orderedTasks[index]) {
+        if (index < state.orderedTasks.length && state.orderedTasks[index]) {
           e.preventDefault();
-          setActiveTaskId(orderedTasks[index].taskId);
+          state.setActiveTaskId(state.orderedTasks[index].taskId);
         }
         return;
       }
@@ -180,7 +198,7 @@ export function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [orderedTasks, refresh, setActiveTaskId, isSettingsOpen, isEvidenceOpen, taskEditor]);
+  }, []);
 
   const activeTaskRegistration =
     registry?.tasks.find((t) => t.taskId === activeTaskId) ?? null;

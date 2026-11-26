@@ -9,8 +9,8 @@ const metric = {
 };
 
 const registry = {
-  version: 1, revision: 0,
-  hosts: [{ hostId: 'local-demo', label: 'Demo host', enabled: true, allowedRoots: ['/tmp/demo'], target: { kind: 'wsl', distribution: 'Ubuntu-26.04' } }],
+  version: 2, revision: 0,
+  hosts: [{ hostId: 'local-demo', label: 'Demo host', enabled: true, allowedRoots: ['/tmp/demo'], target: { kind: 'wsl', distribution: 'Ubuntu-24.04' } }],
   tasks: [{ taskId: 'demo-task', hostId: 'local-demo', label: 'Simulated task', enabled: true, algorithm: 'flow', allowedDirectories: ['/tmp/demo'], entryPaths: [], sources: [], checkpointDirectories: [] }],
 };
 
@@ -41,10 +41,46 @@ describe('shared contracts', () => {
     expect(() => validateRegistry({ ...registry, command: 'kill -9 1' })).toThrow();
   });
 
-  it('rejects invalid registration targets and paths', () => {
-    const invalid = structuredClone(registry);
-    (invalid.hosts[0] as any).target = { kind: 'ssh', alias: 'other-host' };
-    expect(() => validateRegistry(invalid)).toThrow();
+  it('accepts generalized ssh/wsl/local targets and rejects invalid targets, option injection, and unsafe paths', () => {
+    const validSsh = structuredClone(registry);
+    (validSsh.hosts[0] as any).target = {
+      kind: 'ssh',
+      alias: 'gpu-node-01',
+      hostname: '10.0.0.12',
+      user: 'researcher',
+      port: 2222,
+      identityFile: '~/.ssh/id_ed25519',
+      proxyJump: 'bastion',
+      pythonPath: '/opt/conda/bin/python',
+    };
+    (validSsh.hosts[0] as any).allowedRoots = [];
+    expect(validateRegistry(validSsh).hosts[0]?.target).toMatchObject({ kind: 'ssh', alias: 'gpu-node-01', port: 2222 });
+
+    const validLocalWin = structuredClone(registry);
+    (validLocalWin.hosts[0] as any).target = { kind: 'local' };
+    (validLocalWin.hosts[0] as any).allowedRoots = ['C:\\Projects\\train'];
+    (validLocalWin.tasks[0] as any).allowedDirectories = ['C:\\Projects\\train\\run1'];
+    expect(validateRegistry(validLocalWin).hosts[0]?.target).toEqual({ kind: 'local' });
+
+    const injected = structuredClone(registry);
+    (injected.hosts[0] as any).target = { kind: 'ssh', alias: '-oProxyCommand=id' };
+    expect(() => validateRegistry(injected)).toThrow('INVALID_REGISTRY');
+
+    const emptySsh = structuredClone(registry);
+    (emptySsh.hosts[0] as any).target = { kind: 'ssh' };
+    expect(() => validateRegistry(emptySsh)).toThrow('INVALID_REGISTRY');
+
+    const badPort = structuredClone(registry);
+    (badPort.hosts[0] as any).target = { kind: 'ssh', hostname: '10.0.0.1', port: 70000 };
+    expect(() => validateRegistry(badPort)).toThrow('INVALID_REGISTRY');
+
+    const badWsl = structuredClone(registry);
+    (badWsl.hosts[0] as any).target = { kind: 'wsl', distribution: '../escape' };
+    expect(() => validateRegistry(badWsl)).toThrow('INVALID_REGISTRY');
+
+    const relRoot = structuredClone(registry);
+    (relRoot.hosts[0] as any).allowedRoots = ['relative/path'];
+    expect(() => validateRegistry(relRoot)).toThrow('INVALID_REGISTRY');
   });
 
   it('rejects control fields and malformed bytes in cross-process log DTOs', () => {

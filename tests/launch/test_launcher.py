@@ -423,8 +423,9 @@ class LauncherTests(unittest.TestCase):
             stdout=types.SimpleNamespace(buffer=output))
         self.assertEqual(namespace["main"](), 0)
         frame = output.getvalue()
-        size = int.from_bytes(frame[:4], "big")
-        envelope = json.loads(frame[4:4 + size])
+        self.assertEqual(frame[:4], b"TMF1")
+        size = int.from_bytes(frame[4:8], "big")
+        envelope = json.loads(frame[8:8 + size])
         self.assertEqual(envelope, {
             "version": 1,
             "requestId": "frame-request",

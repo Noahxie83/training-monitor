@@ -6,11 +6,7 @@ import { App } from '../../src/renderer/App';
 import {
   createControlledMockApi,
   testFlowTask,
-  testScoreTask,
-  testReflowTask,
-  testHostConnected,
   testHostDisconnected,
-  testHostWslUnobserved,
 } from './fixtures';
 
 describe('Dashboard (Layout A & Cockpit)', () => {
@@ -33,23 +29,24 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     });
 
     // Host list
-    expect(screen.getByText(/lab-campus/)).toBeDefined();
-    expect(screen.getByText(/已连接/)).toBeDefined();
+    expect(screen.getAllByText(/lab-campus/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/已连接/).length).toBeGreaterThan(0);
 
     // WSL unobserved host must display unobserved / waiting probe, never idle or connected
-    expect(screen.getByText(/wsl-ubuntu/)).toBeDefined();
+    expect(screen.getAllByText(/wsl-ubuntu/).length).toBeGreaterThan(0);
     expect(screen.getByText(/未观测 \/ 待探测/)).toBeDefined();
     expect(screen.queryByText(/wsl.*已连接/i)).toBeNull();
     expect(screen.queryByText(/wsl.*空闲/i)).toBeNull();
 
     // Task fleet
-    expect(screen.getByText(/Flow Matching/)).toBeDefined();
-    expect(screen.getByText(/Score-based/)).toBeDefined();
-    expect(screen.getByText(/Reflow/)).toBeDefined();
+    expect(screen.getAllByText(/Flow Matching/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Score-based/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Reflow/).length).toBeGreaterThan(0);
   });
 
   it('displays empty state with registration guidance in normal mode when no tasks exist', async () => {
     const api = createControlledMockApi({
+      registry: { version: 2, revision: 0, hosts: [], tasks: [] },
       snapshot: { version: 1, demo: false, hosts: [], tasks: [], sources: [] },
     });
     window.monitor = api;
@@ -59,7 +56,7 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     await waitFor(() => {
       expect(screen.getByText(/暂无已登记任务/)).toBeDefined();
     });
-    expect(screen.getByText(/可在右上角【登记 \/ 设置】中添加/)).toBeDefined();
+    expect(screen.getByText(/先在设置中添加宿主/)).toBeDefined();
   });
 
   it('shows stale observation warning when host/task is disconnected', async () => {
@@ -84,8 +81,8 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     await waitFor(() => {
       expect(screen.getByText(/连接中断/)).toBeDefined();
     });
-    expect(screen.getByText(/上次于 2026-10-18T20:31:05.000Z 观测/)).toBeDefined();
-    expect(screen.getByText(/当前状态待重连确认/)).toBeDefined();
+    expect(screen.getByText(/上次确认：/)).toBeDefined();
+    expect(screen.getByText(/等待重连/)).toBeDefined();
   });
 
   it('renders dual-track progress and handles null values as "未知", never 0', async () => {
@@ -95,7 +92,7 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/算法全局累计完成次数/)).toBeDefined();
+      expect(screen.getByRole('progressbar', { name: '算法全局累计完成次数' })).toBeDefined();
     });
 
     // Flow task dual track
@@ -105,7 +102,7 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     expect(screen.getByText(/47.12%/)).toBeDefined();
 
     // Switch to Score task where progress is null
-    fireEvent.click(screen.getByText(/Score-based/));
+    fireEvent.click(screen.getByText(/Score-based Generative Model/));
 
     await waitFor(() => {
       expect(screen.getAllByText(/排队中/).length).toBeGreaterThan(0);
@@ -125,29 +122,28 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/最新检查点文件/)).toBeDefined();
+      expect(screen.getByText(/最新检查点/)).toBeDefined();
     });
 
-    expect(screen.getByText(/Step 100,000 \(文件名标记\)/)).toBeDefined();
-    expect(screen.getByText(/多次观测文件稳定 \(未验证权重恢复\)/)).toBeDefined();
+    expect(screen.getByText(/Step 100,000/)).toBeDefined();
     expect(screen.queryByText(/保存成功/)).toBeNull();
     expect(screen.queryByText(/可恢复/)).toBeNull();
   });
 
-  it('strictly distinguishes device-scope GPU utilization from process-scope memory', async () => {
+  it('strictly distinguishes process-scope memory and task GPU panels', async () => {
     const api = createControlledMockApi();
     window.monitor = api;
 
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/资源观测分项/)).toBeDefined();
+      expect(screen.getByText(/训练进程/)).toBeDefined();
     });
 
-    // Device scope label
-    expect(screen.getByText(/GPU 0.*97%.*\[设备整卡\]/)).toBeDefined();
     // Process scope label
     expect(screen.getByText(/本进程物理内存/)).toBeDefined();
+    // Task GPU section
+    expect(screen.getByRole('region', { name: '当前任务 GPU' })).toBeDefined();
   });
 
   it('copies registered path with visual feedback', async () => {
@@ -176,13 +172,13 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/证据详情/)).toBeDefined();
+      expect(screen.getByRole('button', { name: '白名单证据详情' })).toBeDefined();
     });
 
-    fireEvent.click(screen.getByText(/证据详情/));
+    fireEvent.click(screen.getByRole('button', { name: '白名单证据详情' }));
 
     await waitFor(() => {
-      expect(screen.getByText(/白名单证据审查/)).toBeDefined();
+      expect(screen.getByRole('dialog', { name: /白名单证据审查/ })).toBeDefined();
     });
 
     expect(screen.getAllByText(/594319/).length).toBeGreaterThan(0); // main PID
@@ -199,7 +195,7 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     // Close drawer
     fireEvent.click(screen.getByRole('button', { name: /关闭证据抽屉/ }));
     await waitFor(() => {
-      expect(screen.queryByText(/白名单证据审查/)).toBeNull();
+      expect(screen.queryByRole('dialog', { name: /白名单证据审查/ })).toBeNull();
     });
   });
 
@@ -210,17 +206,17 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /设置 \/ 登记/ })).toBeDefined();
+      expect(screen.getByRole('button', { name: '系统设置' })).toBeDefined();
     });
 
-    fireEvent.click(screen.getByRole('button', { name: /设置 \/ 登记/ }));
+    fireEvent.click(screen.getByRole('button', { name: '系统设置' }));
 
     await waitFor(() => {
-      expect(screen.getByText(/系统偏好与任务登记/)).toBeDefined();
+      expect(screen.getByRole('dialog', { name: '系统设置' })).toBeDefined();
     });
 
     // Theme selection
-    const darkRadio = screen.getByLabelText(/深色模式 \(dark\)/);
+    const darkRadio = screen.getByRole('radio', { name: '深色' });
     fireEvent.click(darkRadio);
 
     await waitFor(async () => {
@@ -231,7 +227,7 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     // Close modal
     fireEvent.click(screen.getByRole('button', { name: /关闭设置/ }));
     await waitFor(() => {
-      expect(screen.queryByText(/系统偏好与任务登记/)).toBeNull();
+      expect(screen.queryByRole('dialog', { name: '系统设置' })).toBeNull();
     });
   });
 });

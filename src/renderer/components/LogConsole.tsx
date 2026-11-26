@@ -1,6 +1,6 @@
 import { Icon } from './Icon';
-import React, { useRef, useEffect, useState } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import React, { useRef, useEffect, useLayoutEffect, useState } from "react";
+import { useVirtualizer, measureElement as defaultMeasureElement } from "@tanstack/react-virtual";
 import type { LogEvent, LogSourceSnapshot } from "../../shared/contracts";
 import { formatTimestamp, formatTimeOnly, formatBytes } from "../utils/format";
 
@@ -89,7 +89,7 @@ export function LogConsole({
   const lastMeasuredWrapLinesRef = useRef(isWrapLines);
 
   // Global Ctrl+F to focus search input (I14)
-  useEffect(() => {
+  useLayoutEffect(() => {
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
       // Do not steal focus if modal or dialog is open
       if (document.querySelector('[role="dialog"][aria-modal="true"]')) {
@@ -122,6 +122,10 @@ export function LogConsole({
     estimateSize: () => 26,
     overscan: 25,
     getItemKey: (index) => events[index]?.eventId ?? index,
+    measureElement: (element, entry, instance) => {
+      const height = defaultMeasureElement(element, entry, instance);
+      return height > 0 ? height : 26;
+    },
     initialRect: { width: 1000, height: 600 },
     observeElementRect: (instance, cb) => {
       const el = instance.scrollElement;
@@ -139,11 +143,14 @@ export function LogConsole({
     },
   });
 
+  const rowVirtualizerRef = useRef(rowVirtualizer);
+  rowVirtualizerRef.current = rowVirtualizer;
+
   // Capture visible anchor row and offset within row (I6)
   const captureAnchor = () => {
     const el = parentRef.current;
     if (!el || events.length === 0) return;
-    const virtualItems = rowVirtualizer.getVirtualItems();
+    const virtualItems = rowVirtualizerRef.current.getVirtualItems();
     if (virtualItems.length === 0) return;
     const scrollTop = el.scrollTop;
     const item =
@@ -168,18 +175,18 @@ export function LogConsole({
   useEffect(() => {
     if (lastMeasuredWrapLinesRef.current === isWrapLines) return;
     lastMeasuredWrapLinesRef.current = isWrapLines;
-    rowVirtualizer.measure();
+    rowVirtualizerRef.current.measure();
     if (isScrollLocked && anchorRef.current) {
       const anchor = anchorRef.current;
       const newIndex = events.findIndex((e) => e.eventId === anchor.eventId);
       if (newIndex >= 0) {
-        rowVirtualizer.scrollToIndex(newIndex, { align: "start" });
+        rowVirtualizerRef.current.scrollToIndex(newIndex, { align: "start" });
         if (anchor.offsetInRow > 0 && parentRef.current) {
           parentRef.current.scrollTop += anchor.offsetInRow;
         }
       }
     }
-  }, [isWrapLines, rowVirtualizer, isScrollLocked, events]);
+  }, [isWrapLines, isScrollLocked, events]);
 
   // Maintain reading position when locked and new events arrive or prepend (I6)
   useEffect(() => {
@@ -188,23 +195,23 @@ export function LogConsole({
     const newIndex = events.findIndex((e) => e.eventId === anchor.eventId);
     if (newIndex >= 0) {
       setIsAnchorEvictedState(false);
-      rowVirtualizer.scrollToIndex(newIndex, { align: "start" });
+      rowVirtualizerRef.current.scrollToIndex(newIndex, { align: "start" });
       if (anchor.offsetInRow > 0 && parentRef.current) {
         parentRef.current.scrollTop += anchor.offsetInRow;
       }
     } else {
       setIsAnchorEvictedState(true);
     }
-  }, [events, isScrollLocked, rowVirtualizer]);
+  }, [events, isScrollLocked]);
 
   // Tail-driven auto follow when unlocked and no active selection (I6)
   const currentTailId = events[events.length - 1]?.eventId ?? null;
   const currentTailText = events[events.length - 1]?.text ?? null;
   useEffect(() => {
     if (!isScrollLocked && !hasSelectionRef.current && events.length > 0) {
-      rowVirtualizer.scrollToIndex(events.length - 1, { align: "end" });
+      rowVirtualizerRef.current.scrollToIndex(events.length - 1, { align: "end" });
     }
-  }, [currentTailId, currentTailText, isScrollLocked, events.length, rowVirtualizer]);
+  }, [currentTailId, currentTailText, isScrollLocked, events.length]);
 
   // User scroll detection -> engage lock if scrolled up and record anchor (I6)
   const handleScroll = () => {

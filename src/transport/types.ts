@@ -1,9 +1,44 @@
-import type { HostRegistration, ProcessKey, Registry, ResourceMetric, TaskRegistration } from '../shared/contracts';
+import type {
+  AcceleratorAvailability,
+  HostRegistration,
+  ProcessKey,
+  Registry,
+  ResourceMetric,
+  TaskRegistration,
+} from '../shared/contracts';
 import type { ArchiveCandidateRef, ReadReply, SourceObservation } from '../logs/types';
 
-export type ProbePhase = 'wsl_list' | 'connect' | 'python_start' | 'probe' | 'process_scan' | 'frame' | 'validate' | 'source_read' | 'dispatch' | 'archive_scan';
+export type ProbePhase =
+  | 'wsl_list'
+  | 'connect'
+  | 'python_start'
+  | 'probe'
+  | 'process_scan'
+  | 'frame'
+  | 'validate'
+  | 'source_read'
+  | 'dispatch'
+  | 'archive_scan';
 export type ErrorScope = 'host' | 'task' | 'request' | 'source';
-export type TransportErrorCode = 'CONNECT_FAILED' | 'PROBE_TIMEOUT' | 'PROBE_CANCELLED' | 'RESPONSE_LIMIT' | 'STDERR_LIMIT' | 'PROTOCOL_INVALID' | 'REGISTRY_CHANGED' | 'SOURCE_MISSING' | 'SOURCE_PERMISSION' | 'READ_LIMIT_INVALID' | 'SCAN_INCOMPLETE';
+export type TransportErrorCode =
+  | 'CONNECT_FAILED'
+  | 'PROBE_TIMEOUT'
+  | 'PROBE_CANCELLED'
+  | 'RESPONSE_LIMIT'
+  | 'STDERR_LIMIT'
+  | 'PROTOCOL_INVALID'
+  | 'REGISTRY_CHANGED'
+  | 'SOURCE_MISSING'
+  | 'SOURCE_PERMISSION'
+  | 'READ_LIMIT_INVALID'
+  | 'SCAN_INCOMPLETE'
+  | 'SSH_HOST_KEY_UNKNOWN'
+  | 'SSH_AUTH_FAILED'
+  | 'SSH_CONNECTION_REFUSED'
+  | 'SSH_TIMEOUT'
+  | 'REMOTE_PYTHON_UNAVAILABLE'
+  | 'WSL_NOT_RUNNING'
+  | 'HOST_UNREACHABLE';
 
 export interface HostObservation {
   hostId: string;
@@ -15,12 +50,14 @@ export interface HostObservation {
   hostBootId: string | null;
   errorCode: string | null;
   errorScope?: ErrorScope | null;
+  acceleratorAvailability?: AcceleratorAvailability;
   gpu?: HostGpuObservation;
 }
 
 export interface HostGpuObservation {
   observedAt: string | null;
   state: 'available' | 'unavailable';
+  acceleratorAvailability?: AcceleratorAvailability;
   errorCode: string | null;
   metrics: ResourceMetric[];
 }
@@ -79,6 +116,11 @@ export interface ProcessGpuObservation {
   metrics: ResourceMetric[];
 }
 
+export interface BatchProbeObservation {
+  host: HostObservation;
+  tasks: Map<string, TaskObservation>;
+}
+
 export interface RegistrationReference { taskId: string; registryRevision: number; fingerprint: string }
 export interface CursorLabel { generation: string; revision: number; committedOffset: string }
 export interface SampleAnchor { startOffset: string; length: number; sha256: string }
@@ -95,9 +137,28 @@ export interface ReadRequest {
 
 export interface ReadResult { reply: ReadReply; isCurrentFile: boolean }
 
-export interface LaunchResult { status: 'started' | 'busy' | 'already_running' | 'failed'; pid: number | null; processKey: ProcessKey | null; startedAt: string | null; errorCode: string | null }
+export interface LaunchResult {
+  status: 'started' | 'busy' | 'already_running' | 'failed';
+  pid: number | null;
+  processKey: ProcessKey | null;
+  startedAt: string | null;
+  errorCode: string | null;
+}
 
-export interface ServerWaitResult { state: 'missing' | 'waiting' | 'countdown' | 'blocked' | 'starting' | 'started' | 'failed' | 'cancelled'; armId: string; configHash: string; idleElapsedSeconds: number; requiredIdleSeconds: number; lastCheckedAt: string | null; startedAt: string | null; pid: number | null; errorCode: string | null; message: string | null; sessionName: string | null; selectedDeviceId: string | null }
+export interface ServerWaitResult {
+  state: 'missing' | 'waiting' | 'countdown' | 'blocked' | 'starting' | 'started' | 'failed' | 'cancelled';
+  armId: string;
+  configHash: string;
+  idleElapsedSeconds: number;
+  requiredIdleSeconds: number;
+  lastCheckedAt: string | null;
+  startedAt: string | null;
+  pid: number | null;
+  errorCode: string | null;
+  message: string | null;
+  sessionName: string | null;
+  selectedDeviceId: string | null;
+}
 
 export interface Transport {
   ensureServerWait?(task: TaskRegistration, configHash: string, signal: AbortSignal): Promise<ServerWaitResult>;
@@ -107,9 +168,11 @@ export interface Transport {
   launchTask?(task: TaskRegistration, armId: string, configHash: string, signal: AbortSignal): Promise<LaunchResult>;
   probeHost(signal: AbortSignal): Promise<HostObservation>;
   probeTask(task: TaskRegistration, signal: AbortSignal): Promise<TaskObservation>;
+  probeHostAndTasks?(tasks: TaskRegistration[], signal: AbortSignal): Promise<BatchProbeObservation>;
   readLog(request: ReadRequest, signal: AbortSignal): Promise<ReadReply>;
   scanArchiveCandidates(sourceId: string, registration: RegistrationReference, anchors: SampleAnchor[], signal: AbortSignal): Promise<ArchiveCandidateScan>;
   createRegistrationReference(taskId: string): Promise<RegistrationReference>;
+  close?(): Promise<void>;
 }
 
 export interface ArchiveCandidateScan {
@@ -123,5 +186,9 @@ export interface ArchiveCandidateScan {
   observedAt: string;
 }
 
-export type SpawnLike = (command: string, args: string[], options: { shell: false; stdio: ['pipe', 'pipe', 'pipe']; windowsHide: true }) => any;
+export type SpawnLike = (
+  command: string,
+  args: string[],
+  options: { shell: false; stdio: ['pipe', 'pipe', 'pipe']; windowsHide: true; detached?: boolean },
+) => any;
 export interface TransportHostContext { hostId: string; host: HostRegistration; registry: Registry }

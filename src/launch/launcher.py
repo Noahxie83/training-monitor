@@ -26,6 +26,7 @@ except ImportError:
 
 
 VERSION = 1
+FRAME_MAGIC = b"TMF1"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_ARGUMENTS_CHARS = 8192
 MAX_ARGUMENTS = 256
@@ -38,6 +39,8 @@ PROBE_SOURCE_B64 = "__READONLY_PROBE_SOURCE_B64__"
 _PROBE = None
 _HEX64 = re.compile(r"[a-fA-F0-9]{64}\Z")
 _PYTHON_BASENAME = re.compile(r"python(?:3(?:\.\d+)?)?\Z")
+_MISSING_GPU_VALUE_RE = re.compile(r"^(?:\[?\s*(?:N/A|NA|Not Supported|Unknown)\s*\]?|-)$", re.IGNORECASE)
+_GPU_OR_MIG_UUID_RE = re.compile(r"(?:GPU|MIG)-[A-Za-z0-9._:/-]+\Z")
 
 
 class _LaunchError(Exception):
@@ -210,7 +213,8 @@ def _validate_request(request):
             raise _LaunchError("INVALID_REQUEST")
         _string(device.get("deviceId"), max_length=256)
         gpu_uuid = _string(device.get("uuid"), max_length=256)
-        if (not re.fullmatch(r"GPU-[A-Za-z0-9._:-]+\Z", gpu_uuid)
+        if (not _GPU_OR_MIG_UUID_RE.fullmatch(gpu_uuid)
+                or ".." in gpu_uuid
                 or gpu_uuid in seen_uuids or any(character.isspace() for character in gpu_uuid)):
             raise _LaunchError("INVALID_REQUEST")
         seen_uuids.add(gpu_uuid)
@@ -718,7 +722,7 @@ def _gpus_idle(probe, request):
         if not isinstance(metrics, tuple):
             return False
         utilization_text, used_text, total_text, free_text = metrics
-        if any(value is not None and value.upper() in {"N/A", "[N/A]", "UNKNOWN", "NOT SUPPORTED"} for value in metrics):
+        if any(value is not None and _MISSING_GPU_VALUE_RE.fullmatch(value.strip()) for value in metrics):
             return False
         try:
             utilization = float(utilization_text)
@@ -967,6 +971,7 @@ def _emit_frame(envelope):
             "sourceId": None,
             "payload": _failed("RESPONSE_LIMIT"),
         }, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    sys.stdout.buffer.write(FRAME_MAGIC)
     sys.stdout.buffer.write(len(payload).to_bytes(4, "big"))
     sys.stdout.buffer.write(payload)
     sys.stdout.buffer.flush()

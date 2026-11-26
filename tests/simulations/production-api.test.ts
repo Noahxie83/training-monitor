@@ -36,14 +36,14 @@ afterEach(async () => {
 
 function registry(enabled = true): Registry {
   return {
-    version: 1,
+    version: 2,
     revision: 1,
     hosts: [{
       hostId: 'host-a',
       label: 'Host A',
       enabled,
       allowedRoots: ['/allowed'],
-      target: { kind: 'ssh', alias: 'lab-campus' },
+      target: { kind: 'ssh', alias: 'gpu-node' },
     }],
     tasks: [{
       taskId: 'task-a',
@@ -306,6 +306,7 @@ describe('production monitor API core path', () => {
     const updates: MonitorSnapshot[] = [];
     api.subscribe((update) => { if (update.kind === 'snapshot') updates.push(update.snapshot); });
 
+    await api.requestRefresh({});
     let snapshot = await api.getSnapshot();
     expect(ssh.hostCalls).toBe(1);
     expect(wsl.hostCalls).toBe(1);
@@ -444,11 +445,11 @@ describe('production monitor API core path', () => {
       ],
     } as unknown as MonitorSnapshot;
     const registry: Registry = {
-      version: 1,
+      version: 2,
       revision: 2,
       hosts: [
-        { hostId: 'host-a', label: 'Host A', enabled: true, allowedRoots: ['/a'], target: { kind: 'ssh', alias: 'lab-campus' } },
-        { hostId: 'host-new', label: 'New host', enabled: false, allowedRoots: ['/b'], target: { kind: 'wsl', distribution: 'Ubuntu-26.04' } },
+        { hostId: 'host-a', label: 'Host A', enabled: true, allowedRoots: ['/a'], target: { kind: 'ssh', alias: 'gpu-node' } },
+        { hostId: 'host-new', label: 'New host', enabled: false, allowedRoots: ['/b'], target: { kind: 'wsl', distribution: 'Ubuntu-24.04' } },
       ],
       tasks: [
         { taskId: 'task-a', hostId: 'host-a', label: 'Task A', enabled: true, algorithm: 'flow', allowedDirectories: ['/a/run'], entryPaths: [], sources: [{ sourceId: 'current-source', path: '/a/run.log', kind: 'log' }], checkpointDirectories: [] },
@@ -621,6 +622,7 @@ describe('production monitor API core path', () => {
     expect((await api.getSnapshot()).sources[0]).toMatchObject({ state: 'permission_error' });
 
     transport.host = hostObservation('unobserved');
+    await api.requestRefresh({});
     const stale = await api.getSnapshot();
     expect(stale.hosts[0]).toMatchObject({ connection: 'disconnected', freshness: 'stale', observedAt: NOW });
     expect(stale.tasks[0]).toMatchObject({ freshness: 'stale', lifecycle: 'unknown' });
@@ -660,6 +662,7 @@ describe('production monitor API core path', () => {
       clock: () => Date.parse(NOW),
     }));
     await api.start();
+    await api.requestRefresh({});
     const snapshot = await api.getSnapshot();
     expect(base.hostCalls).toBe(1);
     expect(base.taskCalls).toBe(2);
@@ -729,6 +732,7 @@ describe('production monitor API core path', () => {
     }));
     try {
       await api.start();
+      await api.requestRefresh({});
       await api.getSnapshot();
       now = Date.parse(NOW) + 5_000;
       await tick();
@@ -753,9 +757,11 @@ describe('production monitor API core path', () => {
       transportProvider: () => transport, clock: () => Date.parse(NOW),
     }));
     await api.start();
+    await api.requestRefresh({});
     expect((await api.getSnapshot()).tasks[0]!.resources).toHaveLength(3);
-    currentRegistry.hosts[0]!.target = { kind: 'wsl', distribution: 'Ubuntu-26.04' };
+    currentRegistry.hosts[0]!.target = { kind: 'wsl', distribution: 'Ubuntu-24.04' };
     transport.host = hostObservation('unobserved');
+    await api.requestRefresh({});
     expect((await api.getSnapshot()).tasks[0]!.resources).toEqual([]);
     await api.stop();
     await client.close();

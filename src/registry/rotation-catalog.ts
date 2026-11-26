@@ -51,8 +51,10 @@ function isRegistered(record: RotationRecord, registry: Registry): { task: Regis
 }
 
 function componentWithin(root: string, candidate: string): boolean {
-  const relative = path.posix.relative(path.posix.resolve(root), path.posix.resolve(candidate));
-  return relative === '' || (!relative.startsWith('..') && !path.posix.isAbsolute(relative));
+  const isWin = /^[A-Za-z]:[\\/]/.test(root) || /^[A-Za-z]:[\\/]/.test(candidate);
+  const ops = isWin ? path.win32 : path.posix;
+  const relative = ops.relative(ops.resolve(root), ops.resolve(candidate));
+  return relative === '' || (!relative.startsWith('..') && !ops.isAbsolute(relative));
 }
 
 export async function loadRotationCatalog(filename: string, registryProvider: () => Promise<Registry>): Promise<RotationCatalogLoad> {

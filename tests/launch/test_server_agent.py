@@ -216,7 +216,7 @@ class ServerAgentTests(unittest.TestCase):
         ])
         self.assertIn("--", command)
         self.assertEqual(command[command.index("--") + 1:], [
-            "/usr/bin/python3",
+            agent._python_executable(),
             "-I",
             "-S",
             "-B",

@@ -1,5 +1,6 @@
 import type { HostRegistration, LogFormat, TaskRegistration } from "../../shared/contracts";
 import { taskAlgorithmName, taskLogFormat } from '../../shared/task-profile';
+import { isValidAbsolutePath } from '../../shared/validate';
 
 export interface TaskFormInputs {
   taskId: string;
@@ -30,9 +31,11 @@ export function parseAndValidateTaskForm(
       return { task: null, error: "该任务 ID 已存在" };
     }
   }
-  if (!fields.hostId || !availableHosts.some((h) => h.hostId === fields.hostId)) {
+  const selectedHost = availableHosts.find((h) => h.hostId === fields.hostId);
+  if (!fields.hostId || !selectedHost) {
     return { task: null, error: "任务所属宿主不存在，请先添加或选择宿主" };
   }
+  const allowWinPath = selectedHost.target.kind === 'local';
   const algorithmName = fields.algorithm.trim();
   if (algorithmName.length > 120 || /[\u0000-\u001f\u007f]/.test(algorithmName)) {
     return { task: null, error: '算法名称最多 120 个字符，不能包含控制字符' };
@@ -47,11 +50,11 @@ export function parseAndValidateTaskForm(
     .map((s) => s.trim())
     .filter(Boolean);
   if (dirs.length === 0) {
-    return { task: null, error: "工作目录不能为空，且必须以 / 开头" };
+    return { task: null, error: allowWinPath ? "工作目录不能为空，且必须为绝对路径" : "工作目录不能为空，且必须以 / 开头" };
   }
   for (const d of dirs) {
-    if (!d.startsWith("/")) {
-      return { task: null, error: "工作目录必须以 / 开头" };
+    if (!isValidAbsolutePath(d, allowWinPath)) {
+      return { task: null, error: allowWinPath ? "工作目录必须为绝对路径" : "工作目录必须以 / 开头" };
     }
   }
 
@@ -68,8 +71,8 @@ export function parseAndValidateTaskForm(
     .map((s) => s.trim())
     .filter(Boolean);
   for (const c of ckpts) {
-    if (!c.startsWith("/")) {
-      return { task: null, error: "检查点目录必须以 / 开头" };
+    if (!isValidAbsolutePath(c, allowWinPath)) {
+      return { task: null, error: allowWinPath ? "检查点目录必须为绝对路径" : "检查点目录必须以 / 开头" };
     }
   }
 

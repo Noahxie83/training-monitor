@@ -82,7 +82,7 @@ describe('fix4 request ordering and resident budgets', () => {
 describe('fix4 independent operation state',()=>{
   it('I16: preferences read retry exposes loading and keeps snapshot success',async()=>{
     const retry=deferred<{theme:'light'}>(); const api=createControlledMockApi();api.getPreferences=vi.fn().mockRejectedValueOnce(new Error('prefs unavailable')).mockReturnValueOnce(retry.promise);window.monitor=api;
-    render(<App/>);await screen.findByText(/读取偏好设置失败/);expect(screen.getByRole('heading',{name:'flow-cifar10'})).toBeDefined();
+    render(<App/>);await screen.findByText(/读取偏好设置失败/);expect(screen.getByRole('heading',{name:'Flow Matching (CIFAR-10)'})).toBeDefined();
     fireEvent.click(screen.getByRole('button',{name:'重试读取偏好设置'}));expect(screen.getByText('正在读取偏好设置…')).toBeDefined();
     await act(async()=>retry.resolve({theme:'light'}));expect(document.querySelector('.app-shell')?.getAttribute('data-theme')).toBe('light');expect(screen.queryByText(/读取偏好设置失败/)).toBeNull();
   });
@@ -106,10 +106,17 @@ describe('fix4 independent operation state',()=>{
   });
 
   it('I16: snapshot and log reads show loading through retry; all rejected reads/refreshes settle without unhandled rejection',async()=>{
-    const snapshot=deferred<any>();const logs=deferred<LogPage>(); const api=createControlledMockApi(); const original=api.getSnapshot;api.getSnapshot=vi.fn().mockReturnValueOnce(snapshot.promise).mockImplementationOnce(original);api.getLogs=vi.fn().mockReturnValueOnce(logs.promise).mockResolvedValue(page([event('recovered')]));api.requestRefresh=async()=>{throw new Error('refresh unavailable');};window.monitor=api;
+    const snapshot=deferred<any>();const logs=deferred<LogPage>(); const api=createControlledMockApi(); const original=api.getSnapshot;
+    let snapshotLoaded=false;let postSnapLogCalls=0;
+    api.getSnapshot=vi.fn().mockReturnValueOnce(snapshot.promise).mockImplementationOnce(async()=>{const res=await original();snapshotLoaded=true;return res;});
+    api.getLogs=vi.fn().mockImplementation(()=>{if(!snapshotLoaded)return new Promise<LogPage>(()=>{});postSnapLogCalls+=1;return postSnapLogCalls===1?logs.promise:Promise.resolve(page([event('recovered')]));});
+    api.requestRefresh=async()=>{throw new Error('refresh unavailable');};window.monitor=api;
     const unhandled=vi.fn();window.addEventListener('unhandledrejection',unhandled);render(<App/>);
-    expect(screen.getByText('正在读取监控快照…')).toBeDefined();await act(async()=>snapshot.reject(new Error('snapshot unavailable')));fireEvent.click(screen.getByRole('button',{name:'重试'}));
-    await screen.findByText('正在读取日志…');await act(async()=>logs.reject(new Error('logs unavailable')));fireEvent.click(screen.getByRole('button',{name:'重试'}));await screen.findByText('recovered');
+    expect(screen.getByText('正在读取监控快照…')).toBeDefined();await act(async()=>snapshot.reject(new Error('snapshot unavailable')));
+    fireEvent.click(await screen.findByRole('button',{name:'重试'}));
+    await waitFor(()=>expect(postSnapLogCalls).toBe(1));
+    await screen.findByText('正在读取日志…');await act(async()=>logs.reject(new Error('logs unavailable')));
+    fireEvent.click(await screen.findByRole('button',{name:'重试'}));await screen.findByText('recovered');
     fireEvent.click(screen.getByRole('button',{name:/刷新全部宿主/}));await screen.findByText(/刷新观测数据失败/);expect(unhandled).not.toHaveBeenCalled();window.removeEventListener('unhandledrejection',unhandled);
   });
 });
@@ -120,13 +127,23 @@ it('I8/I10: every matched main/queue/worker CPU,RSS,GPU and device value retains
   for(const [i,p] of processes.entries())for(const [j,name] of ['cpu_utilization','process_rss','gpu_memory_used'].entries())task.resources.push({scope:'process',processKey:p.key!,deviceId:name==='gpu_memory_used'?'GPU-1':null,name:name as ResourceMetric['name'],unit:name==='cpu_utilization'?'percent_one_cpu':'bytes',value:11+i*10+j,source:`sample-${i}-${j}`,observedAt:`2026-10-18T01:0${i}:0${j}Z`,freshness:i%2?'stale':'fresh'});
   task.resources.push({scope:'process',processKey:{...processes[2].key!,startTicks:'wrong'},deviceId:'GPU-1',name:'gpu_memory_used',unit:'bytes',value:999999,source:'wrong-start',observedAt:null,freshness:'stale'}, {scope:'process',processKey:{...processes[0].key!,hostBootId:'wrong'},deviceId:null,name:'cpu_utilization',unit:'percent_one_cpu',value:999,source:'wrong-boot',observedAt:null,freshness:'stale'}, {scope:'device',processKey:null,deviceId:'GPU-1',name:'gpu_memory_used',unit:'bytes',value:77,source:'device-sample',observedAt:'2026-10-18T02:00:00Z',freshness:'stale'});
   const {container}=render(<><KpiMetricsGrid task={task}/><EvidenceDrawer task={task} isOpen onClose={()=>{}}/></>);
-  for(const metric of task.resources.filter(m=>!m.source.startsWith('wrong'))){const rows=Array.from(container.querySelectorAll('[data-resource-source]')).filter(el=>el.getAttribute('data-resource-source')===metric.source);expect(rows).toHaveLength(2);for(const row of rows){expect(row.textContent).toContain(metric.unit);expect(row.textContent).toContain(metric.observedAt);expect(row.textContent).toContain(metric.freshness==='stale'?'陈旧':'新鲜');}}
-  expect(container.textContent).not.toContain('wrong-start');expect(container.textContent).not.toContain('wrong-boot');
+  for(const metric of task.resources.filter(m=>m.scope==='process'&&m.name!=='gpu_memory_used'&&!m.source.startsWith('wrong'))){
+    const rows=Array.from(container.querySelectorAll('[data-resource-source]')).filter(el=>el.getAttribute('data-resource-source')===metric.source);
+    expect(rows).toHaveLength(1);
+    for(const row of rows){
+      if(metric.unit==='percent_one_cpu')expect(row.textContent).toContain(`${metric.value}%`);
+      else expect(row.textContent).toContain(`${metric.value} B`);
+      if(metric.freshness==='stale')expect(row.textContent).toContain('待更新');
+      else expect(row.textContent).not.toContain('待更新');
+    }
+  }
+  expect(container.textContent).toContain('GPU-1');
+  expect(container.textContent).not.toContain('wrong-start');expect(container.textContent).not.toContain('wrong-boot');expect(container.textContent).not.toContain('999%');expect(container.textContent).not.toContain('77 B');
 });
 
 it('I14: viewport Space keyCode229 does not prevent default or toggle lock',async()=>{
   window.monitor=createControlledMockApi({logs:[event('a')]});render(<App/>);await screen.findByText('a');const viewport=screen.getByRole('region',{name:'日志流视窗'});viewport.focus();
-  const e=new KeyboardEvent('keydown',{key:' ',code:'Space',keyCode:229,bubbles:true,cancelable:true});fireEvent(viewport,e);expect(e.defaultPrevented).toBe(false);expect(screen.getByRole('button',{name:'⏸ 锁定自动滚动'})).toBeDefined();
+  const e=new KeyboardEvent('keydown',{key:' ',code:'Space',keyCode:229,bubbles:true,cancelable:true});fireEvent(viewport,e);expect(e.defaultPrevented).toBe(false);expect(screen.getByRole('button',{name:'锁定自动滚动'})).toBeDefined();
 });
 
 it('NB6: releases only its inert ownership before restoring connected usable opener',()=>{

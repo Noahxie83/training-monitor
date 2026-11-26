@@ -2,7 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type { DesktopApi, MonitorApi, MonitorUpdate } from '../shared/api';
 import type { Preferences, Registry } from '../shared/contracts';
 import { CHANNELS as c } from './channels';
-import { validateLogPage, validateLogQuery, validateLogSearchPage, validateLogSearchRequest, validateMonitorSnapshot, validateMonitorUpdate, validatePreferences, validateRefreshScope, validateRegistry } from '../shared/validate';
+import { validateDiscoveredSshHosts, validateDiscoveredWslDistros, validateLogPage, validateLogQuery, validateLogSearchPage, validateLogSearchRequest, validateMonitorSnapshot, validateMonitorUpdate, validatePreferences, validateRefreshScope, validateRegistry } from '../shared/validate';
 
 const sessionId = crypto.randomUUID();
 let sequence = 0;
@@ -64,5 +64,7 @@ const desktop: DesktopApi = {
     ipcRenderer.on(c.registryChanged, handler);
     return () => { ipcRenderer.removeListener(c.registryChanged, handler); };
   },
+  async discoverSshHosts() { return validateDiscoveredSshHosts(await ipcRenderer.invoke(c.discoverSsh)); },
+  async discoverWslDistros() { return validateDiscoveredWslDistros(await ipcRenderer.invoke(c.discoverWsl)); },
 };
 contextBridge.exposeInMainWorld('desktop', Object.freeze(desktop));

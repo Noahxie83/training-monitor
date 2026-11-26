@@ -19,14 +19,14 @@ function deferred<T>() {
 async function openSettings(api: ReturnType<typeof createControlledMockApi>) {
   window.monitor = api;
   render(<App />);
-  await screen.findByRole('heading', { name: 'flow-cifar10' });
+  await screen.findByRole('heading', { name: 'Flow Matching (CIFAR-10)' });
   await waitFor(() => expect(screen.queryByText('正在读取偏好设置…')).toBeNull());
-  fireEvent.click(screen.getByRole('button', { name: /⚙ 设置 \/ 登记/ }));
+  fireEvent.click(screen.getByRole('button', { name: '系统设置' }));
   return screen.getByRole('dialog');
 }
 
 function themeRadio(dialog: HTMLElement, theme: 'light' | 'dark') {
-  return within(dialog).getByRole('radio', { name: theme === 'light' ? /浅色模式/ : /深色模式/ }) as HTMLInputElement;
+  return within(dialog).getByRole('radio', { name: theme === 'light' ? '浅色' : '深色' }) as HTMLInputElement;
 }
 
 afterEach(cleanup);
@@ -62,7 +62,7 @@ describe('I16: actual App settings preference feedback recovery', () => {
     expect(within(dialog).queryByRole('alert')).toBeNull();
     expect(alertDuringRetry).toBeNull();
     expect(screen.queryByText('正在保存偏好设置…')).toBeNull();
-    expect(screen.getByRole('heading', { name: 'flow-cifar10' })).toBeDefined();
+    expect(screen.getByRole('heading', { name: 'Flow Matching (CIFAR-10)' })).toBeDefined();
   });
 
   // Break caught: an older preference completion replaces newer UI state.
@@ -106,7 +106,7 @@ describe('I16: actual App settings preference feedback recovery', () => {
       fireEvent.click(ui.getByRole('button', { name: '+ 添加宿主' }));
       fireEvent.click(ui.getByRole('button', { name: '确认添加宿主' }));
     } else {
-      fireEvent.click(ui.getByRole('button', { name: '保存登记配置' }));
+      fireEvent.click(ui.getByRole('button', { name: '保存宿主配置' }));
     }
     expect((await ui.findByRole('alert')).textContent).toContain(expectedError);
 

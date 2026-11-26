@@ -4,19 +4,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { TaskFleetTree } from '../../src/renderer/components/TaskFleetTree';
 import { formatTimestamp, formatTimeOnly } from '../../src/renderer/utils/format';
-import { testHostConnected, testFlowTask, testScoreTask } from './fixtures';
+import { testHostConnected, testFlowTask, testScoreTask, testRegistry } from './fixtures';
 
 afterEach(cleanup);
 
 describe('single sidebar and local observation time', () => {
   it('keeps the full task list after resizing and allows selecting a task', () => {
     const onSelectTask = vi.fn();
-    const { container } = render(<TaskFleetTree hosts={[testHostConnected]} tasks={[testFlowTask, testScoreTask]} activeTaskId={testFlowTask.taskId} onSelectTask={onSelectTask} />);
+    const { container } = render(<TaskFleetTree hosts={[testHostConnected]} tasks={[testFlowTask, testScoreTask]} registrations={testRegistry.tasks} activeTaskId={testFlowTask.taskId} onSelectTask={onSelectTask} />);
     fireEvent.resize(window);
     expect(container.querySelector('.task-fleet-panel')?.className).toBe('task-fleet-panel');
     expect(screen.queryByRole('combobox')).toBeNull();
     expect(screen.queryByRole('button', { name: /展开|精简/ })).toBeNull();
-    fireEvent.click(screen.getByText('Score-based').closest('button')!);
+    fireEvent.click(screen.getByText(testRegistry.tasks[1]!.label).closest('button')!);
     expect(onSelectTask).toHaveBeenCalledWith(testScoreTask.taskId);
   });
 

@@ -62,7 +62,7 @@ export interface PersistedObservation {
   observedAt: string;
   sourceGenerations: Record<string, string>;
   sourceStates: Record<string, PersistedSourceState>;
-  hostKind?: 'ssh' | 'wsl';
+  hostKind?: 'ssh' | 'wsl' | 'local';
   /** Domain projection computed from supported observations; never baseline authority. */
   taskSnapshot?: TaskSnapshot;
 }

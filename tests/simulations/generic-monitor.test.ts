@@ -11,8 +11,9 @@ describe('generic tasks through the production collector', () => {
     const monitor = await createLiveMonitor({ registry, initialLog: '[train] step=10 loss=0.2\n' });
     monitors.push(monitor);
     await monitor.api.start();
-    await monitor.api.getSnapshot();
+    await monitor.api.requestRefresh({});
     monitor.append('[train] step=11 loss=0.15\n');
+    await monitor.api.requestRefresh({});
     const snapshot = await monitor.api.getSnapshot();
     expect(snapshot.tasks[0]).toMatchObject({ lifecycle: 'running', progress: { lastStepIndex: 11,
       global: { completedCount: null, targetCount: null }, session: { completedCount: null, targetCount: null },
@@ -25,8 +26,9 @@ describe('generic tasks through the production collector', () => {
     const monitor = await createLiveMonitor({ registry, initialLog: '0/100 [00:00<?, 0it/s]\n' });
     monitors.push(monitor);
     await monitor.api.start();
-    await monitor.api.getSnapshot();
+    await monitor.api.requestRefresh({});
     monitor.append('25/100 [00:10<00:30, 2.5it/s]\n');
+    await monitor.api.requestRefresh({});
     const snapshot = await monitor.api.getSnapshot();
     expect(snapshot.tasks[0]).toMatchObject({ lifecycle: 'running', progress: {
       session: { completedCount: 25, targetCount: 100, fraction: 0.25, unit: 'completed_iterations', verified: true },

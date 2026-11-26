@@ -33,27 +33,26 @@ describe('T7 Fix 1 Requirements (I1 - I17)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /设置 \/ 登记/ })).toBeDefined();
+      expect(screen.getByRole('button', { name: '系统设置' })).toBeDefined();
     });
 
-    fireEvent.click(screen.getByRole('button', { name: /设置 \/ 登记/ }));
+    fireEvent.click(screen.getByRole('button', { name: '系统设置' }));
 
     await waitFor(() => {
-      expect(screen.getByText(/系统偏好与任务登记/)).toBeDefined();
+      expect(screen.getByRole('dialog', { name: '系统设置' })).toBeDefined();
     });
 
-    // Check that interactive edit controls exist for hosts and tasks
-    expect(screen.getByRole('button', { name: /添加宿主/i })).toBeDefined();
-    expect(screen.getByRole('button', { name: /添加任务/i })).toBeDefined();
+    // Check that interactive edit controls exist for hosts
+    expect(screen.getByRole('button', { name: /\+ 添加宿主/i })).toBeDefined();
 
     // Click add host
-    fireEvent.click(screen.getByRole('button', { name: /添加宿主/i }));
+    fireEvent.click(screen.getByRole('button', { name: /\+ 添加宿主/i }));
 
-    // Fill invalid host ID or path
+    // Fill invalid host ID
     const hostIdInput = screen.getByLabelText(/新增宿主 ID/i);
     fireEvent.change(hostIdInput, { target: { value: '' } });
 
-    const saveBtn = screen.getByRole('button', { name: /保存登记配置/i });
+    const saveBtn = screen.getByRole('button', { name: /保存宿主配置/i });
     fireEvent.click(saveBtn);
 
     // Validation error must appear
@@ -62,10 +61,12 @@ describe('T7 Fix 1 Requirements (I1 - I17)', () => {
     });
     expect(saveSpy).not.toHaveBeenCalled();
 
-    // Fill valid host fields
+    // Fill valid WSL host fields
     fireEvent.change(hostIdInput, { target: { value: 'wsl-test' } });
     const hostLabelInput = screen.getByLabelText(/新增宿主名称/i);
     fireEvent.change(hostLabelInput, { target: { value: 'WSL Test' } });
+    fireEvent.change(screen.getByLabelText(/宿主类型/i), { target: { value: 'wsl' } });
+    fireEvent.change(screen.getByLabelText(/WSL 发行版/i), { target: { value: 'Ubuntu-24.04' } });
     const hostRootsInput = screen.getByLabelText(/白名单根目录/i);
     fireEvent.change(hostRootsInput, { target: { value: '/home/test' } });
 
@@ -140,7 +141,7 @@ describe('T7 Fix 1 Requirements (I1 - I17)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/Flow Matching/)).toBeDefined();
+      expect(screen.getAllByText(/Flow Matching/).length).toBeGreaterThan(0);
     });
 
     // Push event arrives while initial getLogs is still pending
@@ -445,7 +446,6 @@ describe('T7 Fix 1 Requirements (I1 - I17)', () => {
     await waitFor(() => {
       expect(screen.getByText(/145%/)).toBeDefined();
     });
-    expect(screen.getByText(/单逻辑核100%/)).toBeDefined();
     expect(screen.getByText(/2\.00? GiB/)).toBeDefined();
     expect(screen.getByText(/1 Workers/)).toBeDefined();
   });

@@ -25,7 +25,7 @@ describe('collector scheduler', () => {
     scheduler.schedule(5_000, 'host-a', operation);
     scheduler.schedule(15_000, 'host-a', operation);
     scheduler.start();
-    await vi.advanceTimersByTimeAsync(15_000);
+    await vi.advanceTimersByTimeAsync(15_020);
     await scheduler.waitIdle();
 
     expect(runs.length).toBeGreaterThan(2);
@@ -33,21 +33,20 @@ describe('collector scheduler', () => {
     expect(scheduler.activeTimerCount()).toBe(2);
 
     scheduler.stop();
+    await vi.runAllTimersAsync();
     await scheduler.waitIdle();
     expect(scheduler.activeTimerCount()).toBe(0);
-    // The scheduler owns only polling timers. Drain the test operation's own
-    // 10ms delay before checking that no test timer remains.
-    await vi.runAllTimersAsync();
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('caps exponential backoff without creating an extra scheduling framework', async () => {
+  it('caps exponential backoff at 60s without creating an extra scheduling framework', async () => {
     const module = await import('../../src/collector/backoff');
     expect(module.nextBackoffMs, 'bounded collector backoff API must exist').toBeTypeOf('function');
     expect(module.nextBackoffMs(null)).toBe(5_000);
     expect(module.nextBackoffMs(5_000)).toBe(10_000);
     expect(module.nextBackoffMs(10_000)).toBe(20_000);
-    expect(module.nextBackoffMs(20_000)).toBe(30_000);
-    expect(module.nextBackoffMs(30_000)).toBe(30_000);
+    expect(module.nextBackoffMs(20_000)).toBe(40_000);
+    expect(module.nextBackoffMs(40_000)).toBe(60_000);
+    expect(module.nextBackoffMs(60_000)).toBe(60_000);
   });
 });

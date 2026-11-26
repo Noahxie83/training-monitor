@@ -18,10 +18,12 @@ describe('mixed progress and diagnostic lines', () => {
       expect(first.progress.session.targetCount).toBe(1000);
 
       fixture.append('RESULT job=a psnr=30.4 completed=3/20\n');
+      await fixture.api.requestRefresh({});
       const diagnostic = (await fixture.api.getSnapshot()).tasks[0]!;
       expect(diagnostic.progress.session.completedCount).toBe(145);
 
       fixture.append('HDPS 155/1000 [00:11<01:29, 10.0it/s]\nRESULT job=b completed=4/20\nSTEP job=c step=5/50\n');
+      await fixture.api.requestRefresh({});
       const advanced = (await fixture.api.getSnapshot()).tasks[0]!;
       expect(advanced.lifecycle).toBe('running');
       expect(advanced.progress.session.completedCount).toBe(155);
@@ -33,6 +35,7 @@ describe('mixed progress and diagnostic lines', () => {
     try {
       await fixture.api.start();
       fixture.append('RESULT job=a completed=1/20\n');
+      await fixture.api.requestRefresh({});
       const snapshot = (await fixture.api.getSnapshot()).tasks[0]!;
       expect(snapshot.lifecycle).not.toBe('running');
       expect(snapshot.progress.session.completedCount).toBeNull();

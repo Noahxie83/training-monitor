@@ -38,21 +38,29 @@ class ReadOnlyProbeTests(unittest.TestCase):
                 self.assertEqual(projected[name], values[name])
 
     def test_linux_gpu_probe_uses_only_aggregate_nvidia_smi_query(self):
-        completed = types.SimpleNamespace(returncode=0, stdout=b"0, GPU-a, 0, 512, 8192\n")
-        with mock.patch.object(probe.shutil, "which", return_value="/usr/bin/nvidia-smi"), \
-             mock.patch.object(probe.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(probe, "_find_nvidia_smi", return_value="/usr/bin/nvidia-smi"), \
+             mock.patch.object(probe, "_run_bounded_command", return_value=(b"0, GPU-a, 0, 512, 8192\n", None)) as run:
             result = probe._query_linux_gpu()
         self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["acceleratorAvailability"], "available")
         self.assertEqual(result["csv"], "0, GPU-a, 0, 512, 8192\n")
-        self.assertEqual(run.call_args.args[0], ["/usr/bin/nvidia-smi", "--query-gpu=index,uuid,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
-        self.assertEqual(run.call_args.kwargs["timeout"], 2)
-        self.assertNotIn("compute-apps", " ".join(run.call_args.args[0]))
+        self.assertEqual(run.call_args.args[0], "/usr/bin/nvidia-smi")
+        self.assertEqual(run.call_args.args[1], ["--query-gpu=index,uuid,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
+        self.assertEqual(run.call_args.kwargs["timeout_seconds"], 2.0)
+        self.assertEqual(run.call_args.kwargs["max_bytes"], 16 * 1024)
+        self.assertNotIn("compute-apps", " ".join(run.call_args.args[1]))
 
     def test_gpu_query_failure_is_independent_of_host_identity(self):
-        with mock.patch.object(probe.shutil, "which", return_value="/usr/bin/nvidia-smi"), \
-             mock.patch.object(probe.subprocess, "run", side_effect=probe.subprocess.TimeoutExpired("nvidia-smi", 2)):
+        with mock.patch.object(probe, "_find_nvidia_smi", return_value="/usr/bin/nvidia-smi"), \
+             mock.patch.object(probe, "_run_bounded_command", return_value=(None, "NVIDIA_SMI_TIMEOUT")):
             result = probe._query_linux_gpu()
-        self.assertEqual(result, {"status": "unavailable", "observedAt": None, "csv": None, "errorCode": "NVIDIA_SMI_TIMEOUT"})
+        self.assertEqual(result, {
+            "status": "unavailable",
+            "acceleratorAvailability": "unavailable",
+            "observedAt": None,
+            "csv": None,
+            "errorCode": "NVIDIA_SMI_TIMEOUT",
+        })
 
     def test_scanner_ignores_foreign_uid_and_pid_disappearing_before_identity(self):
         class Entry:
@@ -264,7 +272,8 @@ class ReadOnlyProbeTests(unittest.TestCase):
         namespace["sys"] = types.SimpleNamespace(stdout=type("Stdout", (), {"buffer": output})())
         self.assertEqual(namespace["main"](), 2)
         frame = output.getvalue()
-        envelope = json.loads(frame[4:4 + int.from_bytes(frame[:4], "big")])
+        self.assertEqual(frame[:4], b"TMF1")
+        envelope = json.loads(frame[8:8 + int.from_bytes(frame[4:8], "big")])
         self.assertEqual((envelope["requestId"], envelope["sourceId"]), ("req-error", "source-error"))
         self.assertEqual(envelope["payload"], {"errorCode": "PROBE_REQUEST_INVALID", "errorScope": "request", "phase": "dispatch"})
 
@@ -288,7 +297,8 @@ class ReadOnlyProbeTests(unittest.TestCase):
         namespace["sys"] = types.SimpleNamespace(stdout=type("Stdout", (), {"buffer": output})())
         self.assertEqual(namespace["main"](), 0)
         frame = output.getvalue()
-        envelope = json.loads(frame[4:4 + int.from_bytes(frame[:4], "big")])
+        self.assertEqual(frame[:4], b"TMF1")
+        envelope = json.loads(frame[8:8 + int.from_bytes(frame[4:8], "big")])
         self.assertEqual((envelope["requestId"], envelope["sourceId"]), ("req-rot-limit", "source-rot-limit"))
         self.assertEqual(envelope["payload"], {
             "scanComplete": False,
@@ -324,8 +334,9 @@ class ReadOnlyProbeTests(unittest.TestCase):
             namespace["sys"] = types.SimpleNamespace(stdout=type("Stdout", (), {"buffer": output})())
             result = namespace["main"]()
             frame = output.getvalue()
-            length = int.from_bytes(frame[:4], "big")
-            envelope = json.loads(frame[4:4 + length])
+            self.assertEqual(frame[:4], b"TMF1")
+            length = int.from_bytes(frame[4:8], "big")
+            envelope = json.loads(frame[8:8 + length])
             self.assertEqual(result, 0)
             self.assertEqual(envelope["requestId"], "req-fixed")
             self.assertIsNone(envelope["sourceId"])

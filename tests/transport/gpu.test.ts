@@ -20,6 +20,24 @@ describe('aggregate GPU CSV projection', () => {
     ]);
   });
 
+  test('handles NVIDIA [N/A], [Not Supported], NA, Unknown, -, and MIG-* UUIDs', () => {
+    const csv = [
+      '0, MIG-GPU-1234-abcd/0/0, [N/A], [Not Supported], 20480',
+      '1, GPU-5678, Unknown, -, NA',
+    ].join('\n');
+    expect(gpuDeviceMap(csv)).toEqual([
+      { index: 0, uuid: 'MIG-GPU-1234-abcd/0/0' },
+      { index: 1, uuid: 'GPU-5678' },
+    ]);
+    const result = projectGpuCsv(csv, '2026-11-05T00:00:00.000Z');
+    expect(result.state).toBe('available');
+    expect(result.acceleratorAvailability).toBe('available');
+    expect(result.metrics.map((m) => m.value)).toEqual([
+      null, null, 20480 * 1024 * 1024,
+      null, null, null,
+    ]);
+  });
+
   test('rejects invalid device values without turning them into zero', () => {
     const result = projectGpuCsv('0, GPU-a, 101, -1, 8192', '2026-11-05T00:00:00.000Z');
     expect(result.metrics.map((metric) => metric.value)).toEqual([null, null, 8192 * 1024 * 1024]);
@@ -55,5 +73,6 @@ describe('task-scoped GPU process projection', () => {
     ] }, [key], devices, at);
     expect(result.metrics).toEqual([]);
     expect(projectProcessGpu({ status: 'unavailable', errorCode: 'PROCESS_GPU_TIMEOUT' }, [key], devices, at)).toMatchObject({ state: 'unavailable', metrics: [], errorCode: 'PROCESS_GPU_TIMEOUT' });
+    expect(projectProcessGpu({ status: 'none', errorCode: null }, [key], [], at)).toMatchObject({ state: 'unavailable', metrics: [], errorCode: null });
   });
 });

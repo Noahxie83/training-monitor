@@ -183,7 +183,7 @@ test('copies registered path with visual feedback in real Electron window', asyn
   await page.evaluate(async () => {
     const reg = await window.monitor.getRegistry();
     await window.monitor.saveRegistry({
-      version: 1,
+      version: 2,
       revision: reg.revision,
       hosts: [
         {
@@ -191,7 +191,7 @@ test('copies registered path with visual feedback in real Electron window', asyn
           label: 'Demo Host',
           enabled: true,
           allowedRoots: ['/data'],
-          target: { kind: 'wsl', distribution: 'Ubuntu-26.04' },
+          target: { kind: 'ssh', alias: 'gpu-server-01' },
         },
       ],
       tasks: [

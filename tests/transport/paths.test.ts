@@ -36,15 +36,42 @@ describe('registered path boundaries', () => {
     await expect(openRegisteredFile(target, [allowed], { afterResolve: swap })).rejects.toMatchObject({ code: 'PATH_IDENTITY_CHANGED' });
   });
 
-  test('keeps the fixed command arguments independent of registered path text', async () => {
-    const { safeArgsFor } = await import('../../src/transport/commands');
-    const pathWithShellText = `/tmp/训练 run '$(touch injected)'`;
-    expect(safeArgsFor({ kind: 'ssh', alias: 'lab-campus' }, pathWithShellText)).toEqual([
-      '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
-      '--', 'lab-campus', '/usr/bin/python3 -I -S -B -',
+  test('keeps command arguments parameterized and independent of registered path text', async () => {
+    const { commandSpecFor, safeArgsFor } = await import('../../src/transport/commands');
+    const sshArgs = safeArgsFor({
+      kind: 'ssh',
+      hostname: '10.0.0.12',
+      user: 'alice',
+      port: 2222,
+      identityFile: '~/.ssh/id_ed25519',
+      proxyJump: 'bastion',
+    });
+    expect(sshArgs.slice(0, 15)).toEqual([
+      '-T',
+      '-o', 'BatchMode=yes',
+      '-o', 'StrictHostKeyChecking=yes',
+      '-o', 'ConnectTimeout=8',
+      '-o', 'ServerAliveInterval=15',
+      '-o', 'ServerAliveCountMax=2',
+      '-l', 'alice',
+      '-p', '2222',
     ]);
-    expect(safeArgsFor({ kind: 'wsl', distribution: 'Ubuntu-26.04' }, pathWithShellText)).toEqual([
-      '--distribution', 'Ubuntu-26.04', '--exec', '/usr/bin/python3', '-I', '-S', '-B', '-',
-    ]);
+    expect(sshArgs).toContain('-i');
+    expect(sshArgs).toContain('~/.ssh/id_ed25519');
+    expect(sshArgs).toContain('-J');
+    expect(sshArgs).toContain('bastion');
+    expect(sshArgs).toContain('--');
+    expect(sshArgs).toContain('10.0.0.12');
+    expect(sshArgs.at(-1)).toContain('sh -c');
+    expect(sshArgs.at(-1)).not.toContain('\\');
+
+    const wslArgs = safeArgsFor({ kind: 'wsl', distribution: 'Ubuntu-24.04', pythonPath: '/opt/venv/bin/python' });
+    expect(wslArgs.slice(0, 5)).toEqual(['--distribution', 'Ubuntu-24.04', '--exec', 'sh', '-c']);
+    expect(wslArgs.at(-1)).toBe('/opt/venv/bin/python');
+
+    const localSpec = commandSpecFor({ kind: 'local', pythonPath: '/usr/bin/python3' }, { serve: true });
+    expect(localSpec.command).toBe('/usr/bin/python3');
+    expect(localSpec.args.slice(0, 4)).toEqual(['-I', '-S', '-B', '-c']);
+    expect(localSpec.args).toContain('--serve');
   });
 });

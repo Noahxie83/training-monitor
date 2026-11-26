@@ -15,19 +15,65 @@ import sys
 import time
 
 VERSION = 1
+FRAME_MAGIC = b"TMF1"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_STDERR_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 256 * 1024
 MAX_READ_BYTES = 1024 * 1024
+MAX_PREAMBLE_JUNK_BYTES = 64 * 1024
 MAX_PROCESSES = 4096
 MAX_FDS_PER_PROCESS = 128
 MAX_PROCESS_GPU_DEVICES = 64
 MAX_PROCESS_GPU_ROWS = 4096
 MAX_PROCESS_GPU_OUTPUT_BYTES = 256 * 1024
+MAX_DEVICE_GPU_OUTPUT_BYTES = 16 * 1024
 SCAN_BUDGET_SECONDS = 0.75
+CLOCK_SKEW_TOLERANCE_US = 2_000_000
 LAUNCHER_OPEN_FLAG = getattr(os, "O_SYNC", 0) | getattr(os, "O_DSYNC", 0)
 SKIPPED_INTERPRETER_TOKENS = 8
 REQUEST_B64 = "__MONITOR_REQUEST_B64__"
+
+_MISSING_GPU_VALUE_RE = re.compile(r"^(?:\[?\s*(?:N/A|NA|Not Supported|Unknown)\s*\]?|-)$", re.IGNORECASE)
+_GPU_OR_MIG_UUID_RE = re.compile(r"^(?:GPU|MIG)-[A-Za-z0-9._:/-]+$")
+_TRUSTED_LINUX_NVIDIA_SMI = (
+    "/usr/bin/nvidia-smi",
+    "/usr/local/nvidia/bin/nvidia-smi",
+)
+
+
+def _is_missing_gpu_value(text):
+    if not isinstance(text, str):
+        return True
+    stripped = text.strip()
+    return not stripped or bool(_MISSING_GPU_VALUE_RE.fullmatch(stripped))
+
+
+def _is_valid_gpu_uuid(uuid):
+    return (
+        isinstance(uuid, str)
+        and 0 < len(uuid) <= 256
+        and ".." not in uuid
+        and bool(_GPU_OR_MIG_UUID_RE.fullmatch(uuid))
+    )
+
+
+def _find_nvidia_smi():
+    """Prefer trusted system paths before falling back to PATH."""
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+        program_files = os.environ.get("ProgramFiles") or r"C:\Program Files"
+        candidates = (
+            os.path.join(system_root, "System32", "nvidia-smi.exe"),
+            os.path.join(program_files, "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe"),
+        )
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return shutil.which("nvidia-smi.exe") or shutil.which("nvidia-smi")
+    for candidate in _TRUSTED_LINUX_NVIDIA_SMI:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("nvidia-smi")
 
 
 def path_is_within(root, candidate):
@@ -652,8 +698,8 @@ def scan_registered_processes(proc_root="/proc", boot_id=None, task=None, max_pr
     return {"scanComplete": scan_complete, "errorCode": None if scan_complete else (bounded["errorCode"] or "PROC_SCAN_INCOMPLETE"), "candidates": bounded["candidates"]}
 
 
-def _run_bounded_process_command(command, args, timeout_seconds=2.0):
-    """Capture a small stdout stream without retaining stderr or unbounded output."""
+def _run_bounded_command(command, args, timeout_seconds=2.0, max_bytes=MAX_PROCESS_GPU_OUTPUT_BYTES, max_rows=None):
+    """Capture a bounded stdout stream without retaining stderr or unbounded output."""
     timeout_seconds = min(max(float(timeout_seconds), 0.0), 2.0)
     deadline = time.monotonic() + timeout_seconds
     child = None
@@ -664,31 +710,66 @@ def _run_bounded_process_command(command, args, timeout_seconds=2.0):
         child = subprocess.Popen([command] + list(args), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if child.stdout is None:
             return None, "NVIDIA_SMI_UNAVAILABLE"
-        selector = selectors.DefaultSelector()
-        selector.register(child.stdout, selectors.EVENT_READ)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+        if os.name == "nt":
+            # Windows selectors cannot poll pipe FDs; read bounded chunks in a daemon thread.
+            import threading
+            state = {"error": None, "done": False}
+
+            def _reader():
+                nonlocal row_count
+                try:
+                    while True:
+                        chunk = child.stdout.read(min(8192, max_bytes + 1 - len(output)))
+                        if not chunk:
+                            break
+                        output.extend(chunk)
+                        if len(output) > max_bytes:
+                            state["error"] = "NVIDIA_SMI_RESPONSE_LIMIT"
+                            break
+                        if max_rows is not None:
+                            row_count += chunk.count(b"\n")
+                            if row_count > max_rows:
+                                state["error"] = "NVIDIA_SMI_RESPONSE_LIMIT"
+                                break
+                except OSError:
+                    state["error"] = "NVIDIA_SMI_FAILED"
+                finally:
+                    state["done"] = True
+
+            worker = threading.Thread(target=_reader, daemon=True)
+            worker.start()
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            if not state["done"]:
                 return None, "NVIDIA_SMI_TIMEOUT"
-            ready = selector.select(min(remaining, 0.05))
-            if not ready:
-                if child.poll() is not None:
-                    # Drain the pipe through EOF before waiting for process exit.
+            if state["error"]:
+                return None, state["error"]
+        else:
+            selector = selectors.DefaultSelector()
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, "NVIDIA_SMI_TIMEOUT"
+                ready = selector.select(min(remaining, 0.05))
+                if not ready:
+                    if child.poll() is not None:
+                        continue
                     continue
-                continue
-            chunk = os.read(child.stdout.fileno(), min(8192, MAX_PROCESS_GPU_OUTPUT_BYTES + 1 - len(output)))
-            if not chunk:
-                break
-            output.extend(chunk)
-            if len(output) > MAX_PROCESS_GPU_OUTPUT_BYTES:
+                chunk = os.read(child.stdout.fileno(), min(8192, max_bytes + 1 - len(output)))
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > max_bytes:
+                    return None, "NVIDIA_SMI_RESPONSE_LIMIT"
+                if max_rows is not None:
+                    row_count += chunk.count(b"\n")
+                    if row_count > max_rows:
+                        return None, "NVIDIA_SMI_RESPONSE_LIMIT"
+        if max_rows is not None:
+            if output and not output.endswith(b"\n"):
+                row_count += 1
+            if row_count > max_rows:
                 return None, "NVIDIA_SMI_RESPONSE_LIMIT"
-            row_count += chunk.count(b"\n")
-            if row_count > MAX_PROCESS_GPU_ROWS:
-                return None, "NVIDIA_SMI_RESPONSE_LIMIT"
-        if output and not output.endswith(b"\n"):
-            row_count += 1
-        if row_count > MAX_PROCESS_GPU_ROWS:
-            return None, "NVIDIA_SMI_RESPONSE_LIMIT"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None, "NVIDIA_SMI_TIMEOUT"
@@ -724,8 +805,20 @@ def _run_bounded_process_command(command, args, timeout_seconds=2.0):
                     pass
 
 
+def _run_bounded_process_command(command, args, timeout_seconds=2.0):
+    return _run_bounded_command(
+        command,
+        args,
+        timeout_seconds=timeout_seconds,
+        max_bytes=MAX_PROCESS_GPU_OUTPUT_BYTES,
+        max_rows=MAX_PROCESS_GPU_ROWS,
+    )
+
+
 def _query_process_gpu_csv():
-    executable = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
+    executable = _find_nvidia_smi()
+    if not executable:
+        return None, "NVIDIA_SMI_UNAVAILABLE"
     args = ["--query-compute-apps=pid,gpu_uuid,used_gpu_memory", "--format=csv,noheader,nounits"]
     return _run_bounded_process_command(executable, args, timeout_seconds=2.0)
 
@@ -740,14 +833,35 @@ def _gpu_device_map(value):
             return None
         uuid = device.get("uuid")
         index = device.get("index")
-        if (not isinstance(uuid, str) or len(uuid) > 128 or
-                not re.fullmatch(r"GPU-[A-Za-z0-9-]+", uuid) or
+        if (not _is_valid_gpu_uuid(uuid) or
                 type(index) is not int or index < 0 or index > 4095 or
                 uuid in by_uuid or index in seen_indexes):
             return None
         by_uuid[uuid] = "GPU " + str(index)
         seen_indexes.add(index)
     return by_uuid
+
+
+def _gpu_devices_from_csv(csv_text):
+    if not isinstance(csv_text, str) or len(csv_text) > MAX_DEVICE_GPU_OUTPUT_BYTES:
+        return []
+    devices = []
+    seen_indexes = set()
+    seen_uuids = set()
+    for line in csv_text.splitlines()[:MAX_PROCESS_GPU_DEVICES]:
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2 or not parts[0].isdecimal():
+            continue
+        index = int(parts[0])
+        uuid = parts[1]
+        if index < 0 or index > 4095 or not _is_valid_gpu_uuid(uuid):
+            continue
+        if index in seen_indexes or uuid in seen_uuids:
+            continue
+        seen_indexes.add(index)
+        seen_uuids.add(uuid)
+        devices.append({"index": index, "uuid": uuid})
+    return devices
 
 
 def _process_gpu_candidates(process_rows, boot_id):
@@ -818,22 +932,34 @@ def _nvml_process_samples(device_map, allowed_pids, since_us):
         query = library.nvmlDeviceGetProcessUtilization
         query.restype = ctypes.c_int
         query.argtypes = [ctypes.c_void_p, ctypes.POINTER(UtilizationSample), ctypes.POINTER(ctypes.c_uint), ctypes.c_ulonglong]
-        deadline = time.monotonic() + 0.3
+        per_gpu_budget = 0.15
+        total_budget = max(0.3, min(1.5, per_gpu_budget * max(1, len(device_map))))
+        total_deadline = time.monotonic() + total_budget
         for uuid, device_id in device_map.items():
-            if time.monotonic() > deadline:
+            now_mono = time.monotonic()
+            if now_mono > total_deadline:
                 break
+            device_deadline = min(total_deadline, now_mono + per_gpu_budget)
             handle = ctypes.c_void_p()
             if handle_for_uuid(uuid.encode("ascii"), ctypes.byref(handle)) != 0:
                 continue
             count = ctypes.c_uint(0)
             code = query(handle, None, ctypes.byref(count), since_us)
-            if code not in (0, 7) or not 0 < count.value <= 1024:
+            if code not in (0, 7) or not 0 < count.value <= 2048:
                 continue
-            buffer = (UtilizationSample * count.value)()
-            capacity = count.value
-            if query(handle, buffer, ctypes.byref(count), since_us) != 0 or count.value > capacity:
+            # Add headroom margin to avoid NVML_ERROR_INSUFFICIENT_SIZE races between count and fetch.
+            capacity = min(2048, max(count.value + 32, count.value * 2))
+            buffer = (UtilizationSample * capacity)()
+            out_count = ctypes.c_uint(capacity)
+            fetch_code = query(handle, buffer, ctypes.byref(out_count), since_us)
+            if fetch_code == 7 and time.monotonic() < device_deadline:
+                capacity = min(4096, max(out_count.value + 64, capacity * 2))
+                buffer = (UtilizationSample * capacity)()
+                out_count = ctypes.c_uint(capacity)
+                fetch_code = query(handle, buffer, ctypes.byref(out_count), since_us)
+            if fetch_code != 0 or out_count.value > capacity:
                 continue
-            for row in buffer[:count.value]:
+            for row in buffer[:out_count.value]:
                 if row.pid in allowed_pids:
                     result.append((row.pid, device_id, row.timestamp, row.sm))
         return result
@@ -859,12 +985,13 @@ def _process_gpu_utilization(candidates, device_map, pairs):
         relevant = {uuid: device for uuid, device in device_map.items() if any(pair[1] == device for pair in pairs)}
         samples = _nvml_process_samples(relevant, set(candidates), max(0, now_us - 5_000_000))
         latest = {}
+        upper_bound_us = now_us + CLOCK_SKEW_TOLERANCE_US
         for pid, device_id, timestamp, utilization in samples:
             if pid not in candidates or (pid, device_id) not in pairs:
                 continue
             birth_us = boot_us + int(candidates[pid]["startTicks"]) * 1_000_000 // hz
             if (type(utilization) is not int or not 0 <= utilization <= 100 or
-                    not max(now_us - 5_000_000, birth_us + 50_000) <= timestamp <= now_us):
+                    not max(now_us - 5_000_000, birth_us + 50_000) <= timestamp <= upper_bound_us):
                 continue
             old = latest.get((pid, device_id))
             if old is None or timestamp > old[0]:
@@ -945,7 +1072,7 @@ def _sample_process_gpu(proc_root, boot_id, process_rows, gpu_devices):
         if device_id is None:
             return _process_gpu_payload("unavailable", error_code="GPU_DEVICE_UNMAPPED", process_keys=process_keys)
         memory_text = columns[2]
-        if re.fullmatch(r"(?:N/A|NA|Not Supported|Unknown|-)", memory_text, re.IGNORECASE):
+        if _is_missing_gpu_value(memory_text):
             memory_bytes = None
         elif re.fullmatch(r"[0-9]+", memory_text):
             memory_mib = int(memory_text)
@@ -1117,16 +1244,280 @@ def scan_rotation_candidates(current_path, candidates, host_roots, task_director
     return {"scanComplete": True, "checkedCount": len(candidates), "errorCode": None, "candidates": matches}
 
 
+class AcceleratorCollector:
+    """Abstract accelerator collector supporting heterogeneous GPUs and CPU-only hosts."""
+
+    vendor = "unknown"
+
+    def is_available(self):
+        return False
+
+    def collect_devices(self, include_free=False):
+        raise NotImplementedError
+
+    def collect_process_usage(self, proc_root, boot_id, process_rows, gpu_devices):
+        return _process_gpu_payload("none", error_code=None)
+
+
+class NvidiaCollector(AcceleratorCollector):
+    vendor = "nvidia"
+
+    def __init__(self, executable=None):
+        self._executable = executable
+
+    def is_available(self):
+        return bool(self._executable or _find_nvidia_smi())
+
+    def collect_devices(self, include_free=False):
+        return _query_linux_gpu(include_free=include_free)
+
+    def collect_process_usage(self, proc_root, boot_id, process_rows, gpu_devices):
+        return _sample_process_gpu(proc_root, boot_id, process_rows, gpu_devices)
+
+
+class RocmCollector(AcceleratorCollector):
+    """Extension point for AMD ROCm hosts (rocm-smi)."""
+
+    vendor = "rocm"
+
+    def is_available(self):
+        return False
+
+    def collect_devices(self, include_free=False):
+        return {
+            "status": "none",
+            "acceleratorAvailability": "none",
+            "observedAt": None,
+            "csv": None,
+            "errorCode": None,
+        }
+
+
+class AppleMpsCollector(AcceleratorCollector):
+    """Extension point for Apple Silicon MPS hosts."""
+
+    vendor = "apple_mps"
+
+    def is_available(self):
+        return False
+
+    def collect_devices(self, include_free=False):
+        return {
+            "status": "none",
+            "acceleratorAvailability": "none",
+            "observedAt": None,
+            "csv": None,
+            "errorCode": None,
+        }
+
+
+class NoGpuFallbackCollector(AcceleratorCollector):
+    vendor = "none"
+
+    def is_available(self):
+        return True
+
+    def collect_devices(self, include_free=False):
+        return {
+            "status": "none",
+            "acceleratorAvailability": "none",
+            "observedAt": None,
+            "csv": None,
+            "errorCode": None,
+        }
+
+
+def select_accelerator_collector():
+    executable = _find_nvidia_smi()
+    if executable:
+        return NvidiaCollector(executable)
+    for collector_cls in (RocmCollector, AppleMpsCollector):
+        collector = collector_cls()
+        if collector.is_available():
+            return collector
+    return NoGpuFallbackCollector()
+
+
+def _read_host_boot_id(proc_root="/proc"):
+    if sys.platform.startswith("linux"):
+        with open(os.path.join(proc_root, "sys", "kernel", "random", "boot_id"), "r", encoding="ascii") as stream:
+            boot_id = stream.read(128).strip()
+        if not boot_id:
+            raise OSError("empty boot_id")
+        return boot_id
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(["sysctl", "-n", "kern.boottime"], stderr=subprocess.DEVNULL, timeout=1)
+            match = re.search(r"sec\s*=\s*(\d+)", out.decode("ascii", "replace"))
+            if match:
+                return "darwin-boot-" + match.group(1)
+        except Exception:
+            pass
+    if os.name == "nt":
+        try:
+            uptime_ms = ctypes.windll.kernel32.GetTickCount64()
+            boot_sec = int(time.time() - uptime_ms / 1000.0)
+            return "win32-boot-" + str(boot_sec // 60)
+        except Exception:
+            pass
+    import socket
+    return "local-host-" + hashlib.sha256(socket.gethostname().encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _probe_task_impl(request, boot_id_override=None, gpu_devices_override=None):
+    proc = request.get("proc", {})
+    proc_root = proc.get("root", "/proc")
+    boot_id = boot_id_override
+    if boot_id is None:
+        try:
+            with open(os.path.join(proc_root, "sys", "kernel", "random", "boot_id"), "r", encoding="ascii") as stream:
+                boot_id = stream.read(128).strip()
+        except OSError:
+            if not sys.platform.startswith("linux"):
+                try:
+                    boot_id = _read_host_boot_id(proc_root)
+                except OSError:
+                    boot_id = None
+    task = request.get("task", {})
+    host_roots = task.get("hostAllowedRoots", [])
+    task_dirs = task.get("allowedDirectories", [])
+    sources = []
+    for source in task.get("sources", [])[:64]:
+        if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+            continue
+        is_status = source.get("kind") == "status_json"
+        try:
+            result = open_readonly(source["path"], host_roots, task_dirs, limit_bytes=MAX_STATUS_BYTES + 1 if is_status else 0)
+        except Exception:
+            result = {"status": "error", "errorCode": "SOURCE_READ_FAILED"}
+        status = result.get("status")
+        row = {
+            "sourceId": source.get("sourceId"),
+            "kind": source.get("kind"),
+            "status": status,
+            "errorCode": result.get("errorCode"),
+            "errorScope": "source" if result.get("errorCode") else None,
+            "phase": "source_read" if result.get("errorCode") else None,
+            "fileIdentity": result.get("identity"),
+            "eofBytes": result.get("sizeBytes"),
+            "observedAt": time.time_ns() // 1_000_000,
+        }
+        if is_status and status == "ok":
+            try:
+                projection = project_status_json(result.get("data", b""), {
+                    "step", "target", "status", "updated_at", "checkpoint",
+                    "taskId", "hostId", "hostBootId", "pid", "startTicks", "sequence",
+                    "resume_checkpoint_index", "target_meaning",
+                })
+            except Exception:
+                projection = {"status": "error", "errorCode": "STATUS_JSON_INVALID"}
+            row["statusValues"] = projection.get("values") if projection.get("status") == "ok" else None
+            if projection.get("status") == "ok":
+                row["statusRawContent"] = result.get("data", b"").decode("utf-8")
+            if projection.get("status") != "ok":
+                row["errorCode"] = projection.get("errorCode")
+        sources.append(row)
+    source_observations = {}
+    source_rows_by_id = {row.get("sourceId"): row for row in sources if isinstance(row, dict)}
+    for source in task.get("sources", [])[:64]:
+        row = source_rows_by_id.get(source.get("sourceId")) if isinstance(source, dict) else None
+        if (isinstance(source, dict) and source.get("kind") == "log" and isinstance(row, dict)
+                and row.get("status") == "ok" and isinstance(row.get("fileIdentity"), dict)
+                and isinstance(row.get("eofBytes"), str)):
+            source_observations[source["path"]] = {"fileIdentity": row["fileIdentity"], "eofBytes": row["eofBytes"]}
+    scan_task = dict(task)
+    scan_task["sourceObservations"] = source_observations
+    scan = scan_registered_processes(proc_root, boot_id, scan_task)
+    process_rows = []
+    source_ids = {item.get("path"): item.get("sourceId") for item in task.get("sources", []) if isinstance(item, dict) and item.get("kind") == "log"}
+    for item in scan.get("candidates", []):
+        writer_ids = [source_ids[path] for path in item.get("writerSources", []) if path in source_ids]
+        writer_source_evidence = {source_ids[path]: evidence for path, evidence in item.get("writerSourceEvidence", {}).items() if path in source_ids}
+        entry = (isinstance(item.get("scriptEntry"), str) or isinstance(item.get("launcherEntry"), str)) and item.get("evidenceComplete") is True
+        role_evidence = ("exact_entry_and_direct_writer_fd" if writer_ids else "exact_script_entry") if entry else "none"
+        process_rows.append({
+            "processKey": item.get("processKey"),
+            "role": "unknown",
+            "roleEvidence": role_evidence,
+            "writerSourceIds": writer_ids,
+            "writerSourceEvidence": writer_source_evidence,
+            "writerEvidenceComplete": item.get("writerEvidenceComplete") is True and scan["scanComplete"],
+            "cwd": item.get("cwd"),
+            "scriptEntry": item.get("scriptEntry"),
+            "launcherEntry": item.get("launcherEntry"),
+            "interpreterFlags": item.get("interpreterFlags", []),
+            "evidenceComplete": item.get("evidenceComplete") is True and scan["scanComplete"],
+            "observedAt": time.time_ns() // 1_000_000,
+        })
+    complete = scan["scanComplete"] and len(task.get("sources", [])) <= 64
+    error_code = scan["errorCode"] or ("SOURCE_CANDIDATE_LIMIT" if len(task.get("sources", [])) > 64 else None)
+    payload = {
+        "scanComplete": complete,
+        "errorCode": error_code,
+        "errorScope": "task" if error_code else None,
+        "phase": "process_scan" if error_code else None,
+        "processes": process_rows,
+        "sources": sources,
+    }
+    if request.get("includeProcessGpu") is True:
+        try:
+            gpu_devices = gpu_devices_override if gpu_devices_override is not None else request.get("gpuDevices")
+            payload["processGpu"] = _sample_process_gpu(proc_root, boot_id, process_rows, gpu_devices)
+        except Exception:
+            payload["processGpu"] = _process_gpu_payload("unavailable", error_code="PROCESS_GPU_SAMPLE_FAILED")
+    return payload
+
+
+def _probe_host_impl(request):
+    proc = request.get("proc", {})
+    proc_root = proc.get("root", "/proc") if isinstance(proc, dict) else "/proc"
+    try:
+        boot_id = _read_host_boot_id(proc_root)
+        gpu = {"status": "skipped", "observedAt": None, "csv": None, "errorCode": None}
+        availability = None
+        if request.get("includeGpu") is not False:
+            gpu = _query_linux_gpu()
+            if isinstance(gpu, dict):
+                if gpu.get("status") == "ok":
+                    availability = "available"
+                elif gpu.get("status") == "none" or gpu.get("acceleratorAvailability") == "none":
+                    availability = "none"
+                else:
+                    availability = "unavailable"
+        result = {
+            "hostBootId": boot_id,
+            "scanComplete": True,
+            "errorCode": None,
+            "errorScope": None,
+            "phase": None,
+            "gpu": gpu,
+        }
+        if availability is not None:
+            result["acceleratorAvailability"] = availability
+        return result
+    except OSError:
+        return {
+            "hostBootId": None,
+            "scanComplete": False,
+            "errorCode": "HOST_IDENTITY_UNAVAILABLE",
+            "errorScope": "host",
+            "phase": "probe",
+        }
+
+
 def _dispatch(request):
     op = request.get("op")
+    if op == "shutdown":
+        return {"shutdown": True}
     if op == "probe_launch_readiness":
-        # First launches have no log yet. Readiness depends on process identity,
-        # not log existence or writer evidence.
         probe_request = dict(request, op="probe_task", includeProcessGpu=False)
         probe_request["task"] = dict(request.get("task", {}), sources=[])
         result = _dispatch(probe_request)
-        return {"scanComplete": result.get("scanComplete") is True,
-                "running": bool(result.get("processes")), "errorCode": result.get("errorCode")}
+        return {
+            "scanComplete": result.get("scanComplete") is True,
+            "running": bool(result.get("processes")),
+            "errorCode": result.get("errorCode"),
+        }
     if op == "read_log":
         payload = _read_log(request)
         if isinstance(payload, dict) and payload.get("errorCode"):
@@ -1134,83 +1525,42 @@ def _dispatch(request):
             payload.setdefault("phase", "source_read")
         return payload
     if op == "probe_task":
-        proc = request.get("proc", {})
-        boot_id = None
-        try:
-            with open(os.path.join(proc.get("root", "/proc"), "sys", "kernel", "random", "boot_id"), "r", encoding="ascii") as stream:
-                boot_id = stream.read(128).strip()
-        except OSError:
-            pass
-        task = request.get("task", {})
-        host_roots = task.get("hostAllowedRoots", [])
-        task_dirs = task.get("allowedDirectories", [])
-        sources = []
-        for source in task.get("sources", [])[:64]:
-            if not isinstance(source, dict) or not isinstance(source.get("path"), str):
-                continue
-            is_status = source.get("kind") == "status_json"
-            try:
-                result = open_readonly(source["path"], host_roots, task_dirs, limit_bytes=MAX_STATUS_BYTES + 1 if is_status else 0)
-            except Exception:
-                result = {"status": "error", "errorCode": "SOURCE_READ_FAILED"}
-            status = result.get("status")
-            row = {"sourceId": source.get("sourceId"), "kind": source.get("kind"), "status": status, "errorCode": result.get("errorCode"), "errorScope": "source" if result.get("errorCode") else None, "phase": "source_read" if result.get("errorCode") else None, "fileIdentity": result.get("identity"), "eofBytes": result.get("sizeBytes"), "observedAt": time.time_ns() // 1_000_000}
-            if is_status and status == "ok":
-                try:
-                    projection = project_status_json(result.get("data", b""), {
-                        "step", "target", "status", "updated_at", "checkpoint",
-                        "taskId", "hostId", "hostBootId", "pid", "startTicks", "sequence",
-                        "resume_checkpoint_index", "target_meaning",
-                    })
-                except Exception:
-                    projection = {"status": "error", "errorCode": "STATUS_JSON_INVALID"}
-                row["statusValues"] = projection.get("values") if projection.get("status") == "ok" else None
-                if projection.get("status") == "ok":
-                    row["statusRawContent"] = result.get("data", b"").decode("utf-8")
-                if projection.get("status") != "ok":
-                    row["errorCode"] = projection.get("errorCode")
-            sources.append(row)
-        source_observations = {}
-        source_rows_by_id = {row.get("sourceId"): row for row in sources if isinstance(row, dict)}
-        for source in task.get("sources", [])[:64]:
-            row = source_rows_by_id.get(source.get("sourceId")) if isinstance(source, dict) else None
-            if (isinstance(source, dict) and source.get("kind") == "log" and isinstance(row, dict)
-                    and row.get("status") == "ok" and isinstance(row.get("fileIdentity"), dict)
-                    and isinstance(row.get("eofBytes"), str)):
-                source_observations[source["path"]] = {"fileIdentity": row["fileIdentity"], "eofBytes": row["eofBytes"]}
-        scan_task = dict(task)
-        scan_task["sourceObservations"] = source_observations
-        scan = scan_registered_processes(proc.get("root", "/proc"), boot_id, scan_task)
-        process_rows = []
-        source_ids = {item.get("path"): item.get("sourceId") for item in task.get("sources", []) if isinstance(item, dict) and item.get("kind") == "log"}
-        for item in scan.get("candidates", []):
-            writer_ids = [source_ids[path] for path in item.get("writerSources", []) if path in source_ids]
-            writer_source_evidence = {source_ids[path]: evidence for path, evidence in item.get("writerSourceEvidence", {}).items() if path in source_ids}
-            entry = (isinstance(item.get("scriptEntry"), str) or isinstance(item.get("launcherEntry"), str)) and item.get("evidenceComplete") is True
-            role_evidence = ("exact_entry_and_direct_writer_fd" if writer_ids else "exact_script_entry") if entry else "none"
-            process_rows.append({"processKey": item.get("processKey"), "role": "unknown", "roleEvidence": role_evidence, "writerSourceIds": writer_ids, "writerSourceEvidence": writer_source_evidence, "writerEvidenceComplete": item.get("writerEvidenceComplete") is True and scan["scanComplete"], "cwd": item.get("cwd"), "scriptEntry": item.get("scriptEntry"), "launcherEntry": item.get("launcherEntry"), "interpreterFlags": item.get("interpreterFlags", []), "evidenceComplete": item.get("evidenceComplete") is True and scan["scanComplete"], "observedAt": time.time_ns() // 1_000_000})
-        complete = scan["scanComplete"] and len(task.get("sources", [])) <= 64
-        error_code = scan["errorCode"] or ("SOURCE_CANDIDATE_LIMIT" if len(task.get("sources", [])) > 64 else None)
-        payload = {"scanComplete": complete, "errorCode": error_code, "errorScope": "task" if error_code else None, "phase": "process_scan" if error_code else None, "processes": process_rows, "sources": sources}
-        if request.get("includeProcessGpu") is True:
-            try:
-                payload["processGpu"] = _sample_process_gpu(proc.get("root", "/proc"), boot_id, process_rows, request.get("gpuDevices"))
-            except Exception:
-                # GPU attribution is optional and must never alter process or log scan results.
-                payload["processGpu"] = _process_gpu_payload("unavailable", error_code="PROCESS_GPU_SAMPLE_FAILED")
-        return payload
+        return _probe_task_impl(request)
     if op == "probe_host":
-        try:
-            with open("/proc/sys/kernel/random/boot_id", "r", encoding="ascii") as stream:
-                boot_id = stream.read(128).strip()
-            gpu = {"status": "skipped", "observedAt": None, "csv": None, "errorCode": None}
-            if request.get("includeGpu") is not False:
-                gpu = _query_linux_gpu()
-            return {"hostBootId": boot_id, "scanComplete": True, "errorCode": None, "errorScope": None, "phase": None, "gpu": gpu}
-        except OSError:
-            return {"hostBootId": None, "scanComplete": False, "errorCode": "HOST_IDENTITY_UNAVAILABLE", "errorScope": "host", "phase": "probe"}
+        return _probe_host_impl(request)
+    if op == "probe_host_and_tasks":
+        host_payload = _probe_host_impl(request)
+        task_results = {}
+        if host_payload.get("scanComplete") is True and host_payload.get("hostBootId"):
+            gpu = host_payload.get("gpu")
+            gpu_devices = _gpu_devices_from_csv(gpu.get("csv")) if isinstance(gpu, dict) and gpu.get("status") == "ok" else []
+            include_process_gpu = bool(request.get("includeProcessGpu") is True and host_payload.get("acceleratorAvailability") != "none")
+            raw_tasks = request.get("tasks", [])
+            if isinstance(raw_tasks, list):
+                for task_item in raw_tasks[:64]:
+                    if not isinstance(task_item, dict) or not isinstance(task_item.get("taskId"), str):
+                        continue
+                    sub_request = {
+                        "op": "probe_task",
+                        "proc": request.get("proc", {}),
+                        "includeProcessGpu": include_process_gpu,
+                        "gpuDevices": gpu_devices,
+                        "task": task_item,
+                    }
+                    task_results[task_item["taskId"]] = _probe_task_impl(
+                        sub_request,
+                        boot_id_override=host_payload["hostBootId"],
+                        gpu_devices_override=gpu_devices,
+                    )
+        return {"host": host_payload, "tasks": task_results}
     if op == "scan_rotation":
-        payload = scan_rotation_candidates(request.get("currentPath"), request.get("candidates", []), request.get("hostAllowedRoots", []), request.get("taskAllowedDirectories", []), request.get("anchors", []))
+        payload = scan_rotation_candidates(
+            request.get("currentPath"),
+            request.get("candidates", []),
+            request.get("hostAllowedRoots", []),
+            request.get("taskAllowedDirectories", []),
+            request.get("anchors", []),
+        )
         if isinstance(payload, dict) and payload.get("errorCode"):
             payload.setdefault("errorScope", "source")
             payload.setdefault("phase", "archive_scan")
@@ -1219,55 +1569,147 @@ def _dispatch(request):
 
 
 def _query_linux_gpu(include_free=False):
-    """Read aggregate device counters only; never request process attribution."""
-    executable = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
+    """Read aggregate device counters only with bounded streaming reads and graceful CPU fallback."""
+    executable = _find_nvidia_smi()
+    if not executable:
+        return NoGpuFallbackCollector().collect_devices(include_free=include_free)
     fields = "index,uuid,utilization.gpu,memory.used,memory.total" + (",memory.free" if include_free else "")
-    args = [executable, "--query-gpu=" + fields, "--format=csv,noheader,nounits"]
-    try:
-        result = subprocess.run(args, capture_output=True, timeout=2, check=False)
-    except subprocess.TimeoutExpired:
-        return {"status": "unavailable", "observedAt": None, "csv": None, "errorCode": "NVIDIA_SMI_TIMEOUT"}
-    except OSError:
-        return {"status": "unavailable", "observedAt": None, "csv": None, "errorCode": "NVIDIA_SMI_UNAVAILABLE"}
-    if result.returncode != 0:
-        return {"status": "unavailable", "observedAt": None, "csv": None, "errorCode": "NVIDIA_SMI_FAILED"}
-    if len(result.stdout) > 16 * 1024:
-        return {"status": "unavailable", "observedAt": None, "csv": None, "errorCode": "NVIDIA_SMI_RESPONSE_LIMIT"}
-    return {"status": "ok", "observedAt": time.time_ns() // 1_000_000,
-            "csv": result.stdout.decode("utf-8", "replace"), "errorCode": None}
+    args = ["--query-gpu=" + fields, "--format=csv,noheader,nounits"]
+    output, error_code = _run_bounded_command(
+        executable,
+        args,
+        timeout_seconds=2.0,
+        max_bytes=MAX_DEVICE_GPU_OUTPUT_BYTES,
+    )
+    if error_code is not None:
+        return {
+            "status": "unavailable",
+            "acceleratorAvailability": "unavailable",
+            "observedAt": None,
+            "csv": None,
+            "errorCode": error_code,
+        }
+    return {
+        "status": "ok",
+        "acceleratorAvailability": "available",
+        "observedAt": time.time_ns() // 1_000_000,
+        "csv": output.decode("utf-8", "replace"),
+        "errorCode": None,
+    }
 
 
 def _emit_frame(envelope):
     payload = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(payload) > MAX_RESPONSE_BYTES:
-        payload = json.dumps({"version": VERSION, "requestId": envelope.get("requestId"), "sourceId": envelope.get("sourceId"), "payload": {"errorCode": "RESPONSE_LIMIT", "errorScope": "request", "phase": "frame"}}).encode("ascii")
+        payload = json.dumps({
+            "version": VERSION,
+            "requestId": envelope.get("requestId"),
+            "sourceId": envelope.get("sourceId"),
+            "payload": {"errorCode": "RESPONSE_LIMIT", "errorScope": "request", "phase": "frame"},
+        }).encode("ascii")
+    sys.stdout.buffer.write(FRAME_MAGIC)
     sys.stdout.buffer.write(len(payload).to_bytes(4, "big"))
     sys.stdout.buffer.write(payload)
     sys.stdout.buffer.flush()
 
 
+def _read_exact(stream, count):
+    buf = bytearray()
+    while len(buf) < count:
+        chunk = stream.read(count - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _read_frame(stream):
+    """Read next TMF1-framed JSON request from stdin; returns None on clean EOF."""
+    window = bytearray()
+    skipped = 0
+    while True:
+        byte = stream.read(1)
+        if not byte:
+            return None
+        window.extend(byte)
+        if len(window) > len(FRAME_MAGIC):
+            del window[0]
+            skipped += 1
+            if skipped > MAX_PREAMBLE_JUNK_BYTES:
+                raise ValueError("preamble limit exceeded")
+        if bytes(window) == FRAME_MAGIC:
+            break
+    header = _read_exact(stream, 4)
+    if header is None:
+        return None
+    length = int.from_bytes(header, "big")
+    if length <= 0 or length > MAX_RESPONSE_BYTES:
+        raise ValueError("invalid frame length")
+    body = _read_exact(stream, length)
+    if body is None:
+        return None
+    return json.loads(body.decode("utf-8"))
+
+
+def _handle_request(request):
+    if not isinstance(request, dict) or request.get("version") != VERSION:
+        raise ValueError("invalid request schema")
+    payload = _dispatch(request)
+    if isinstance(payload, dict) and payload.get("errorCode"):
+        if not isinstance(payload.get("errorScope"), str):
+            payload["errorScope"] = "request"
+        if not isinstance(payload.get("phase"), str):
+            payload["phase"] = "dispatch"
+    return {
+        "version": VERSION,
+        "requestId": request.get("requestId"),
+        "sourceId": request.get("sourceId"),
+        "payload": payload,
+    }
+
+
+def _serve_loop():
+    stream = sys.stdin.buffer
+    while True:
+        request = None
+        try:
+            request = _read_frame(stream)
+            if request is None:
+                return 0
+            envelope = _handle_request(request)
+            _emit_frame(envelope)
+            if isinstance(request, dict) and request.get("op") == "shutdown":
+                return 0
+        except Exception:
+            _emit_frame({
+                "version": VERSION,
+                "requestId": request.get("requestId") if isinstance(request, dict) else None,
+                "sourceId": request.get("sourceId") if isinstance(request, dict) else None,
+                "payload": {"errorCode": "PROBE_REQUEST_INVALID", "errorScope": "request", "phase": "dispatch"},
+            })
+            if request is None:
+                return 2
+
+
 def main():
+    if "--serve" in getattr(sys, "argv", [])[1:]:
+        return _serve_loop()
     if REQUEST_B64 == "__MONITOR_REQUEST_B64__":
         _emit_frame({"version": VERSION, "requestId": None, "sourceId": None, "payload": {"errorCode": "REQUEST_MISSING", "errorScope": "request", "phase": "decode"}})
         return 2
     request = None
     try:
         request = json.loads(base64.b64decode(REQUEST_B64, validate=True).decode("utf-8"))
-        if not isinstance(request, dict) or request.get("version") != VERSION:
-            raise ValueError("invalid request schema")
-        payload = _dispatch(request)
-        if isinstance(payload, dict) and payload.get("errorCode"):
-            if not isinstance(payload.get("errorScope"), str):
-                payload["errorScope"] = "request"
-            if not isinstance(payload.get("phase"), str):
-                payload["phase"] = "dispatch"
-        envelope = {"version": VERSION, "requestId": request.get("requestId"), "sourceId": request.get("sourceId"), "payload": payload}
+        envelope = _handle_request(request)
         _emit_frame(envelope)
         return 0
     except Exception:
-        _emit_frame({"version": VERSION, "requestId": request.get("requestId") if isinstance(request, dict) else None,
-                     "sourceId": request.get("sourceId") if isinstance(request, dict) else None,
-                     "payload": {"errorCode": "PROBE_REQUEST_INVALID", "errorScope": "request", "phase": "dispatch"}})
+        _emit_frame({
+            "version": VERSION,
+            "requestId": request.get("requestId") if isinstance(request, dict) else None,
+            "sourceId": request.get("sourceId") if isinstance(request, dict) else None,
+            "payload": {"errorCode": "PROBE_REQUEST_INVALID", "errorScope": "request", "phase": "dispatch"},
+        })
         return 2
 
 

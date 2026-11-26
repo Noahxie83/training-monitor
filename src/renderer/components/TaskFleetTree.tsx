@@ -121,7 +121,7 @@ export function TaskFleetTree({
             <div key={host.hostId} className={`fleet-host-group ${activeHostId === host.hostId ? 'is-selected-host' : ''}`} role="treeitem" aria-expanded="true">
               <div className="fleet-host-header">
                 <button type="button" className="fleet-host-select" onClick={() => onSelectHost?.(host.hostId)} aria-label={`选择宿主 ${host.hostId}`} aria-pressed={activeHostId === host.hostId}>
-                <Icon name={host.kind === "ssh" ? "server" : "terminal"} /><strong className="host-name" title={host.hostId}>{host.kind === "ssh" ? "远程服务器" : "本地 WSL"}</strong>
+                <Icon name={host.kind === "ssh" ? "server" : "terminal"} /><strong className="host-name" title={host.hostId}>{host.kind === "ssh" ? "远程服务器" : host.kind === "wsl" ? "本地 WSL" : "本机"}</strong>
                 <span className="host-kind-tag">{host.kind.toUpperCase()}</span>
                 <span
                   className={
@@ -156,7 +156,7 @@ export function TaskFleetTree({
                     const badge = getLifecycleBadge(task.lifecycle);
                     const isStale = task.freshness === "stale";
                     const registration = registrations.find(item => item.taskId === task.taskId);
-                    const label = registration?.label || ({ 'flow-cifar10': 'Flow Matching', 'score-based': 'Score-based', reflow: 'Reflow' } as Record<string, string>)[task.taskId] || task.taskId;
+                    const label = registration?.label || task.taskId;
 
                     let progressSummary = "待观测";
                     if (task.progress.global.completedCount !== null) {

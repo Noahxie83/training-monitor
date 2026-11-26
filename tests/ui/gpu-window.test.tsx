@@ -30,6 +30,8 @@ function setup() {
     onGpuHostSelected: listener => { hostListener = listener; return () => { hostListener = undefined; }; },
     onPreferencesChanged: listener => { preferencesListener = listener; return () => { preferencesListener = undefined; }; },
     onRegistryChanged: () => () => {},
+    discoverSshHosts: async () => [],
+    discoverWslDistros: async () => [],
   };
   return { api, snapshot, open, select: (id: string) => hostListener?.(id), theme: (value: Preferences) => preferencesListener?.(value) };
 }

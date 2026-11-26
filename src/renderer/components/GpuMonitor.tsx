@@ -28,8 +28,9 @@ export function GpuMonitor() {
     ? { ...metric, freshness: 'stale' as const } : metric);
   const hasSamples = resources.length > 0;
   const stale = hasSamples && resources.some(metric => metric.freshness !== 'fresh');
-  const connectionMessage = activeHost && (hostConnectionErrors[activeHost.hostId] || hostFailureMessage(activeHost.errorCode, activeHost.kind));
-  const gpuUnavailable = connected && gpu?.state === 'unavailable';
+  const connectionMessage = activeHost && (hostConnectionErrors[activeHost.hostId] || hostFailureMessage(activeHost.errorCode, activeHost.kind, registration));
+  const noGpuDevice = connected && (activeHost?.acceleratorAvailability === 'none' || gpu?.acceleratorAvailability === 'none');
+  const gpuUnavailable = connected && !noGpuDevice && gpu?.state === 'unavailable';
   const status = connecting ? '连接中…' : disabled ? '已停用' : connected ? '已连接' : activeHost?.connection === 'disconnected' ? '连接已断开' : '待连接';
 
   return <div className="app-shell gpu-monitor-page" data-theme={resolvedTheme}>
@@ -42,7 +43,7 @@ export function GpuMonitor() {
     </header>
     {!!snapshot?.hosts.length && <nav className="gpu-host-tabs" aria-label="选择设备">
       {snapshot.hosts.map(host => <button type="button" key={host.hostId} aria-pressed={host.hostId === activeHostId} onClick={() => selectHost(host.hostId)}>
-        <Icon name={host.kind === 'ssh' ? 'server' : 'terminal'} /><span>{host.hostId}</span><span className="gpu-host-kind">{host.kind === 'ssh' ? 'SSH' : '本机 WSL'}</span>
+        <Icon name={host.kind === 'ssh' ? 'server' : 'terminal'} /><span>{host.hostId}</span><span className="gpu-host-kind">{host.kind === 'ssh' ? 'SSH' : host.kind === 'wsl' ? '本机 WSL' : '本机'}</span>
       </button>)}
     </nav>}
     {error && <div role="alert" className="alert alert-danger gpu-monitor-alert"><span>{error}</span><button type="button" className="btn btn-secondary btn-sm" onClick={() => { void retrySnapshotLoad(); }}>重试读取</button></div>}
@@ -54,7 +55,7 @@ export function GpuMonitor() {
         </div>
         {(disabled || connectionMessage) && <p className="alert alert-warning" role="alert">{disabled ? '此宿主已停用，请在主窗口设置中启用。' : connectionMessage}</p>}
         {(stale || gpuUnavailable) && <p className="gpu-monitor-stale text-warning" role="status">{hasSamples ? '当前显示上次采样，等待更新。' : 'GPU 采样暂不可用，请稍后刷新。'}</p>}
-        {hasSamples ? <GpuDeviceMetrics resources={resources} /> : <div className="gpu-monitor-empty"><Icon name="monitor" /><h2>{isLoadingSnapshot ? '正在读取 GPU 数据…' : '暂无 GPU 数据'}</h2><p>{disabled ? '启用宿主后即可查看整卡使用情况。' : connected ? '等待设备采样，或点击立即刷新。' : '连接设备后即可查看利用率与显存。'}</p></div>}
+        {hasSamples ? <GpuDeviceMetrics resources={resources} /> : <div className="gpu-monitor-empty"><Icon name="monitor" /><h2>{isLoadingSnapshot ? '正在读取 GPU 数据…' : noGpuDevice ? '未检测到 GPU 设备' : '暂无 GPU 数据'}</h2><p>{disabled ? '启用宿主后即可查看整卡使用情况。' : noGpuDevice ? '该节点当前为纯 CPU 环境，宿主连接正常。' : connected ? '等待设备采样，或点击立即刷新。' : '连接设备后即可查看利用率与显存。'}</p></div>}
         {gpu?.observedAt && <p className="gpu-monitor-sample-time" title={formatTimestamp(gpu.observedAt)}>最近采样 {formatTimeOnly(gpu.observedAt)}{stale ? ' · 待更新' : ''}</p>}
       </> : <div className="gpu-monitor-empty"><Icon name="server" /><h2>{isLoadingSnapshot ? '正在读取设备…' : '暂无设备'}</h2><p>请在主窗口设置中添加宿主。</p></div>}
     </main>

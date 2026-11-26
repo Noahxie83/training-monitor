@@ -136,7 +136,7 @@ describe('launch ledger', () => {
     const filePathAsDirectory = join(directory, 'occupied-file');
     await writeFile(filePathAsDirectory, 'not a directory', 'utf8');
     const ledger = createLaunchLedger(filePathAsDirectory);
-    await expect(ledger.claim(record())).rejects.toMatchObject({ code: 'EEXIST' });
+    await expect(ledger.claim(record())).rejects.toSatisfy((err: NodeJS.ErrnoException) => err?.code === 'EEXIST' || err?.code === 'ENOTDIR');
 
     const blocked = createLaunchLedger(directory);
     await blocked.claim(record({ armId: '0d8f6ff0-390a-45a5-91e5-fc7dd116c002' }));

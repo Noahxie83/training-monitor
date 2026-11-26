@@ -60,7 +60,7 @@ export function Header({
           return (
             <button type="button" key={host.hostId} className={`host-pill ${statusClass}`} aria-label={`切换到 ${host.hostId}`} aria-pressed={activeHostId === host.hostId} onClick={() => onSelectHost?.(host.hostId)} title={`最近连接：${formatTimeOnly(host.lastSuccessAt)}${host.scanComplete ? '' : '，部分信息未读取'}`}>
               <span className="host-kind">
-                {host.kind === 'ssh' ? 'SSH' : 'WSL'}
+                {host.kind === 'ssh' ? 'SSH' : host.kind === 'wsl' ? 'WSL' : 'LOCAL'}
               </span>
               <span className="host-id">{host.hostId}</span>
               <span className="host-status-indicator"></span>

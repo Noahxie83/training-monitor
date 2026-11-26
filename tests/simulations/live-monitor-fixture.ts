@@ -14,9 +14,9 @@ const IDENTITY = { dev: '1', inode: '2' };
 
 export function liveRegistry(enabled = true): Registry {
   return {
-    version: 1,
+    version: 2,
     revision: 1,
-    hosts: [{ hostId: 'host-a', label: 'Host A', enabled, allowedRoots: ['/allowed'], target: { kind: 'ssh', alias: 'lab-campus' } }],
+    hosts: [{ hostId: 'host-a', label: 'Host A', enabled, allowedRoots: ['/allowed'], target: { kind: 'ssh', alias: 'gpu-node' } }],
     tasks: [{
       taskId: 'task-a', hostId: 'host-a', label: 'Task A', enabled, algorithm: 'flow',
       allowedDirectories: ['/allowed/task-a'], entryPaths: ['/allowed/task-a/train.py'],
