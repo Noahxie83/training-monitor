@@ -1,23 +1,31 @@
-import React, { useState } from "react";
+import React, { useCallback, useState } from 'react';
 import type {
-  TaskSnapshot,
-  HostSnapshot,
-  LogSourceSnapshot,
   AutoStartConfig,
-} from "../../shared/contracts";
-import { getLifecycleBadge } from "../utils/lifecycle";
-import { formatTimestamp } from "../utils/format";
-import { DualProgressBar } from "./DualProgressBar";
-import { KpiMetricsGrid } from "./KpiMetricsGrid";
-import { ResourceMetrics } from "./ResourceMetrics";
-import { Icon } from "./Icon";
-import { LogConsole } from "./LogConsole";
-import { useLogBuffer } from "../hooks/useLogBuffer";
-import { AutoStartPanel } from "./AutoStartPanel";
+  HostRegistration,
+  HostSnapshot,
+  JobControlAction,
+  LogSourceSnapshot,
+  TaskRegistration,
+  TaskSnapshot,
+} from '../../shared/contracts';
+import { getLifecycleBadge } from '../utils/lifecycle';
+import { formatTimestamp } from '../utils/format';
+import { useI18n } from '../i18n';
+import { DualProgressBar } from './DualProgressBar';
+import { KpiMetricsGrid } from './KpiMetricsGrid';
+import { ResourceMetrics } from './ResourceMetrics';
+import { TrainingChart } from './TrainingChart';
+import { Icon } from './Icon';
+import { LogConsole } from './LogConsole';
+import { useLogBuffer } from '../hooks/useLogBuffer';
+import { AutoStartPanel } from './AutoStartPanel';
+import { JobControlModal } from './JobControlModal';
 
 interface TaskCockpitProps {
   task: TaskSnapshot | null;
   host: HostSnapshot | null;
+  hostRegistration?: HostRegistration | null;
+  taskRegistration?: TaskRegistration | null;
   sources: LogSourceSnapshot[];
   onOpenEvidence: () => void;
   onRefresh: () => void;
@@ -37,6 +45,8 @@ interface TaskCockpitProps {
 export function TaskCockpit({
   task,
   host,
+  hostRegistration,
+  taskRegistration,
   sources,
   onOpenEvidence,
   onRefresh,
@@ -52,11 +62,28 @@ export function TaskCockpit({
   autoStartBusy = false,
   autoStartError,
 }: TaskCockpitProps) {
+  const { locale, t } = useI18n();
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
+  const [terminalNote, setTerminalNote] = useState<string | null>(null);
+  const [rightTab, setRightTab] = useState<'gpu' | 'curves'>('gpu');
+  const [hasChartData, setHasChartData] = useState(false);
+  const [userChoseTab, setUserChoseTab] = useState(false);
+  const [jobControlAction, setJobControlAction] = useState<JobControlAction | null>(null);
 
-  // Hook for active task logs (I2, I3, I4, I11)
   const logBuffer = useLogBuffer(task?.taskId ?? null, sources);
+
+  const handleChartHasData = useCallback(
+    (hasData: boolean) => {
+      setHasChartData(hasData);
+      if (hasData && !userChoseTab) {
+        setRightTab('curves');
+      } else if (!hasData && !userChoseTab) {
+        setRightTab('gpu');
+      }
+    },
+    [userChoseTab],
+  );
 
   const handleCopyPath = async () => {
     if (!task) return;
@@ -66,107 +93,231 @@ export function TaskCockpit({
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (err: any) {
-      setCopyError("复制失败: " + (err?.message || "无可用路径"));
+      setCopyError(t('cockpit.copyPathFailed', { reason: err?.message || '' }));
       setTimeout(() => setCopyError(null), 3000);
     }
   };
 
-  // Normal mode empty state (I1)
+  const handleOpenTerminal = async () => {
+    if (!task || !host) return;
+    setTerminalNote(null);
+    const sessionName = task.autoStart?.sessionName;
+    if (window.desktop?.openSshTerminal) {
+      try {
+        const res = await window.desktop.openSshTerminal({
+          hostId: host.hostId,
+          ...(sessionName ? { command: `tmux -L training-monitor-$(id -u) attach-session -t =${sessionName}` } : {}),
+        });
+        if (!res.ok && window.desktop?.copyCommand) {
+          await window.desktop.copyCommand({
+            kind: sessionName ? 'tmux_attach' : 'ssh',
+            hostId: host.hostId,
+            taskId: task.taskId,
+          });
+          setTerminalNote(t('app.copied'));
+          setTimeout(() => setTerminalNote(null), 2000);
+        }
+      } catch {
+        // Ignore terminal open errors gracefully
+      }
+    } else if (window.desktop?.copyCommand) {
+      try {
+        await window.desktop.copyCommand({
+          kind: sessionName ? 'tmux_attach' : 'ssh',
+          hostId: host.hostId,
+          taskId: task.taskId,
+        });
+        setTerminalNote(t('app.copied'));
+        setTimeout(() => setTerminalNote(null), 2000);
+      } catch {
+        // Ignore
+      }
+    }
+  };
+
   if (!task) {
     return (
-      <main className="cockpit-container cockpit-empty" role="main" aria-label="训练监控主工作区">
+      <main className="cockpit-container cockpit-empty" role="main" aria-label={t('cockpit.emptyMainAria')}>
         <div className="empty-state-card">
-          <div className="empty-icon"><Icon name="folder" /></div>
-          <h2 className="empty-title">暂无已登记任务</h2>
+          <div className="empty-icon">
+            <Icon name="folder" size={22} />
+          </div>
+          <h2 className="empty-title">{t('cockpit.emptyTitle')}</h2>
           <p className="empty-text">
-            {host ? `为 ${host.hostId} 添加任务，开始查看训练进度和日志。` : '添加一个任务，开始查看训练进度和日志。'}
+            {host
+              ? t('cockpit.emptyDescWithHost', { hostId: host.hostId })
+              : t('cockpit.emptyDescNoHost')}
           </p>
           {onOpenSettings && (
-            <button
-              type="button"
-              className="btn btn-primary"
-              aria-label="添加第一个任务"
-              onClick={onOpenSettings}
-              style={{ marginTop: 12 }}
-            >
-              <Icon name="plus" /> 添加任务
-            </button>
+            <div className="empty-actions">
+              <button
+                type="button"
+                className="btn btn-primary"
+                aria-label={t('cockpit.addFirstTaskAria')}
+                onClick={onOpenSettings}
+              >
+                <Icon name="plus" size={14} />
+                <span>{t('sidebar.addTask')}</span>
+              </button>
+            </div>
           )}
         </div>
       </main>
     );
   }
 
-  const badge = getLifecycleBadge(task.lifecycle);
-  const isDisconnected = host?.connection === "disconnected";
-  const isStale = task.freshness === "stale";
+  const badge = getLifecycleBadge(task.lifecycle, locale);
+  const isDisconnected = host?.connection === 'disconnected';
+  const isStale = task.freshness === 'stale';
   const showStaleWarning = isDisconnected || isStale;
 
-  // Warning text strictly separating disconnected from task stale (I8)
-  let warningMessage = "";
-  if (isDisconnected) {
-    warningMessage = "连接中断；上次确认：" + formatTimestamp(task.statusObservedAt) + "（本地时间），状态：" + badge.text + "；等待重连。";
-  } else if (isStale) {
-    warningMessage = "任务状态待更新；上次确认：" + formatTimestamp(task.statusObservedAt) + "（本地时间），状态：" + badge.text + "。";
+  const warningMessage = isDisconnected
+    ? t('cockpit.disconnectedWarning', { time: formatTimestamp(task.statusObservedAt), status: badge.text })
+    : isStale
+      ? t('cockpit.staleWarning', { time: formatTimestamp(task.statusObservedAt), status: badge.text })
+      : '';
+
+  const attribution =
+    task.attributionConfidence ??
+    (task.processes.main ? 'confirmed_process' : task.processes.workers.length > 0 ? 'inferred_tree' : 'log_only');
+  const attributionLabel = t(`confidence.${attribution}`);
+  const allowJobControl = hostRegistration?.allowJobControl === true;
+  const activePids = [
+    ...(task.processes.main ? [task.processes.main.pid] : []),
+    ...task.processes.workers.map((w) => w.pid),
+  ];
+
+  const sourcePathById: Record<string, string> = {};
+  for (const s of taskRegistration?.sources ?? []) {
+    sourcePathById[s.sourceId] = s.path;
   }
 
+  const showAutoStart = Boolean(autoStartConfig && onConfigureAutoStart);
+
   return (
-    <main className="cockpit-container" role="main" aria-label="训练任务监控视窗">
-      {/* Top Header of Selected Task */}
+    <main
+      className={`cockpit-container ${showAutoStart ? 'has-autostart' : ''}`}
+      role="main"
+      aria-label={t('cockpit.mainAria')}
+    >
+      {/* Row 1: Task Title & Action Bar */}
       <div className="cockpit-header">
         <div className="cockpit-title-row">
           <div className="cockpit-ident">
-            <h2 className="cockpit-task-title">{taskLabel || task.taskId}</h2>
-            
-            <span className={"task-badge " + badge.className}>
-              <span className="lifecycle-dot" />{badge.text}
-            </span>
-            <p className="cockpit-location">{task.hostId}<span aria-hidden="true">/</span>{task.taskId}{algorithmName && <span className="cockpit-algorithm" title="算法名称">{algorithmName}</span>}</p>
+            <div className="cockpit-title-line">
+              <h2 className="cockpit-task-title">{taskLabel || task.taskId}</h2>
+              <span className={`task-badge ${badge.className}`}>
+                <span className={`lifecycle-dot ${badge.pulse ? 'is-pulsing' : ''}`} />
+                {badge.text}
+              </span>
+              <span className={`confidence-badge ${attribution === 'confirmed_process' ? 'is-confirmed' : ''}`}>
+                <Icon name="shield" size={11} />
+                <span>{attributionLabel}</span>
+              </span>
+            </div>
+            <p className="cockpit-location">
+              <span>
+                {hostRegistration?.label || task.hostId} / {task.taskId}
+              </span>
+              {algorithmName && (
+                <span className="cockpit-algorithm" title={t('cockpit.algorithmTitle')}>
+                  {algorithmName}
+                </span>
+              )}
+              {taskRegistration?.allowedDirectories[0] && (
+                <span className="text-muted" title={taskRegistration.allowedDirectories[0]}>
+                  {taskRegistration.allowedDirectories[0]}
+                </span>
+              )}
+            </p>
           </div>
 
           <div className="cockpit-action-buttons">
-            {copyError && <span className="text-danger" style={{ fontSize: 12 }}>{copyError}</span>}
+            {copyError && (
+              <span className="text-danger" style={{ fontSize: 12 }}>
+                {copyError}
+              </span>
+            )}
+            {terminalNote && (
+              <span className="text-success" style={{ fontSize: 12 }}>
+                {terminalNote}
+              </span>
+            )}
+            {(window.desktop?.openSshTerminal || window.desktop?.copyCommand) && host && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={() => void handleOpenTerminal()}
+                title={t('cockpit.openTerminalTitle')}
+              >
+                <Icon name="terminal" size={13} />
+                <span>{t('cockpit.openTerminal')}</span>
+              </button>
+            )}
             {onConfigureAutoStart && (
               <button
                 type="button"
-                className="btn btn-secondary"
+                className="btn btn-secondary btn-sm"
                 onClick={onConfigureAutoStart}
-                aria-label="配置 GPU 空闲自动启动"
-                title="配置 GPU 空闲自动启动"
+                aria-label={t('cockpit.autoStartBtnAria')}
+                title={t('cockpit.autoStartBtnAria')}
               >
-                <Icon name="play" />空闲自动启动
+                <Icon name="clock" size={13} />
+                <span>{t('cockpit.autoStartBtn')}</span>
               </button>
+            )}
+            {allowJobControl && (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-danger btn-sm"
+                  onClick={() => setJobControlAction('stop')}
+                >
+                  <Icon name="stop" size={12} />
+                  <span>{t('cockpit.jobControlStop')}</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => setJobControlAction('restart')}
+                >
+                  <Icon name="restart" size={12} />
+                  <span>{t('cockpit.jobControlRestart')}</span>
+                </button>
+              </>
             )}
             <button
               type="button"
-              className={"btn btn-secondary " + (copied ? "btn-copied" : "")}
-              onClick={handleCopyPath}
-              aria-label={copied ? "已复制" : "复制路径"}
+              className={`btn btn-secondary btn-sm ${copied ? 'btn-copied' : ''}`}
+              onClick={() => void handleCopyPath()}
+              aria-label={copied ? t('app.copied') : t('cockpit.copyPath')}
             >
-              <Icon name={copied ? "check" : "copy"} />{copied ? "已复制" : "复制路径"}
+              <Icon name={copied ? 'check' : 'copy'} size={13} />
+              <span>{copied ? t('app.copied') : t('cockpit.copyPath')}</span>
             </button>
             <button
               type="button"
-              className="btn btn-secondary"
+              className="btn btn-secondary btn-sm"
               onClick={onOpenEvidence}
-              aria-label="白名单证据详情"
-              title="白名单证据详情"
+              aria-label={t('cockpit.taskDetailsAria')}
+              title={t('cockpit.taskDetailsTitle')}
             >
-              <Icon name="info" />任务详情
+              <Icon name="info" size={13} />
+              <span>{t('cockpit.taskDetails')}</span>
             </button>
           </div>
         </div>
 
-        {/* Disconnected / Stale Warning Banner (I8) */}
         {showStaleWarning && (
           <div className="cockpit-warning-banner" role="alert">
-            <Icon name="warning" />
+            <Icon name="warning" size={14} />
             <span className="warning-text">{warningMessage}</span>
           </div>
         )}
       </div>
 
-      {autoStartConfig && onConfigureAutoStart && (
+      {/* Optional Row: Compact 2-row AutoStart Status Strip */}
+      {showAutoStart && autoStartConfig && onConfigureAutoStart && (
         <AutoStartPanel
           config={autoStartConfig}
           status={task.autoStart ?? null}
@@ -180,18 +331,66 @@ export function TaskCockpit({
         />
       )}
 
-      {/* Progress & KPIs Grid */}
-      <div className="cockpit-workspace">
-      <div className="cockpit-metrics-section">
-        <DualProgressBar task={task} algorithm={algorithm} />
-        <KpiMetricsGrid task={task} />
-      </div>
-      <section className="cockpit-resource-panel" aria-label="资源使用"><ResourceMetrics task={task} /></section>
+      {/* Row 2: Unified 2-Column Telemetry Cards (NO dark-mode layout mutation!) */}
+      <div className="cockpit-telemetry-grid">
+        <div className="telemetry-card">
+          <DualProgressBar task={task} algorithm={algorithm} />
+          <KpiMetricsGrid task={task} />
+        </div>
 
-      {/* Virtualized Log Console */}
+        <section className="telemetry-card cockpit-right-card" aria-label={t('cockpit.telemetryPanelAria')}>
+          <div className="section-heading right-tabs-bar">
+            <div className="segmented-control" role="tablist">
+              <button
+                type="button"
+                role="tab"
+                className={`segmented-btn ${rightTab === 'curves' ? 'is-active' : ''}`}
+                aria-selected={rightTab === 'curves'}
+                onClick={() => {
+                  setUserChoseTab(true);
+                  setRightTab('curves');
+                }}
+              >
+                <Icon name="chart" size={13} />
+                <span>{t('cockpit.tabCurves')}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                className={`segmented-btn ${rightTab === 'gpu' ? 'is-active' : ''}`}
+                aria-selected={rightTab === 'gpu'}
+                onClick={() => {
+                  setUserChoseTab(true);
+                  setRightTab('gpu');
+                }}
+              >
+                <Icon name="gpu" size={13} />
+                <span>{t('cockpit.tabGpuProcess')}</span>
+              </button>
+            </div>
+          </div>
+
+          <div className={`cockpit-right-split ${hasChartData ? 'is-wide-split' : ''}`}>
+            <div className={`right-pane ${rightTab !== 'curves' ? 'is-hidden-tab' : ''}`}>
+              <TrainingChart
+                taskId={task.taskId}
+                refreshTick={task.progress.observedAt ?? task.statusObservedAt}
+                onHasDataChange={handleChartHasData}
+              />
+            </div>
+
+            <div className={`right-pane ${rightTab !== 'gpu' ? 'is-hidden-tab' : ''}`}>
+              <ResourceMetrics task={task} />
+            </div>
+          </div>
+        </section>
+      </div>
+
+      {/* Row 3: Terminal-grade Virtualized Log Console — ALWAYS visible above the fold */}
       <div className="cockpit-logs-section">
         <LogConsole
           sources={logBuffer.sources}
+          sourcePathById={sourcePathById}
           activeSource={logBuffer.activeSource}
           activeSourceId={logBuffer.activeSourceId}
           onSelectSource={logBuffer.setActiveSourceId}
@@ -204,7 +403,13 @@ export function TaskCockpit({
           onResumeAutoScroll={logBuffer.resumeAutoScroll}
           onToggleScrollLock={logBuffer.toggleScrollLock}
           searchQuery={logBuffer.searchQuery}
+          searchMode={logBuffer.searchMode}
+          searchCaseSensitive={logBuffer.searchCaseSensitive}
+          levelFilter={logBuffer.levelFilter}
           onSearchChange={logBuffer.executeSearch}
+          onSearchModeChange={logBuffer.setSearchMode}
+          onSearchCaseSensitiveChange={logBuffer.setSearchCaseSensitive}
+          onLevelFilterChange={logBuffer.setLevelFilter}
           onClearSearch={logBuffer.clearSearch}
           isSearching={logBuffer.isSearching}
           isWrapLines={logBuffer.isWrapLines}
@@ -227,7 +432,17 @@ export function TaskCockpit({
           onReloadFromLatest={logBuffer.reloadFromLatest}
         />
       </div>
-      </div>
+
+      {jobControlAction && (
+        <JobControlModal
+          taskId={task.taskId}
+          taskLabel={taskLabel || task.taskId}
+          action={jobControlAction}
+          pids={activePids}
+          onClose={() => setJobControlAction(null)}
+          onCompleted={() => onRefresh()}
+        />
+      )}
     </main>
   );
 }

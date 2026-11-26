@@ -23,7 +23,14 @@ test('shows task-owned GPU usage in the task and all cards only on the host over
     await page.screenshot({ path: path.resolve('test-results/process-gpu-task-light.png') });
     await page.getByRole('button', { name: '切换到深色主题' }).click();
     await expect(page.locator('.app-shell')).toHaveAttribute('data-theme', 'dark');
-    await page.evaluate(async () => { await Promise.all(document.getAnimations().map(animation => animation.finished.catch(() => {}))); });
+    await page.evaluate(async () => {
+      await Promise.all(
+        document
+          .getAnimations()
+          .filter((animation) => animation.effect?.getComputedTiming().iterations !== Infinity)
+          .map((animation) => animation.finished.catch(() => {})),
+      );
+    });
     await page.screenshot({ path: path.resolve('test-results/process-gpu-task-dark.png') });
 
     await page.getByRole('button', { name: '选择宿主 lab-campus' }).click();

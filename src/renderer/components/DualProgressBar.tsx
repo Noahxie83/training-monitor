@@ -1,104 +1,146 @@
-import React from "react";
-import type { TaskSnapshot } from "../../shared/contracts";
-import { formatNumber, formatPercent, formatTimeOnly } from "../utils/format";
+import React from 'react';
+import type { ProgressUnit, TaskSnapshot } from '../../shared/contracts';
+import { formatNumber, formatPercent, formatTimeOnly } from '../utils/format';
+import { useI18n } from '../i18n';
 
 interface DualProgressBarProps {
   task: TaskSnapshot;
   algorithm?: string;
 }
 
+function unitSuffix(unit: ProgressUnit | undefined, t: (k: string) => string): string {
+  switch (unit) {
+    case 'epoch':
+      return t('progress.unitEpoch');
+    case 'token':
+      return t('progress.unitToken');
+    case 'sample':
+      return t('progress.unitSample');
+    case 'step':
+      return t('progress.unitStep');
+    default:
+      return '';
+  }
+}
+
 export function DualProgressBar({ task }: DualProgressBarProps) {
+  const { t } = useI18n();
   const { progress } = task;
 
-  // Global counts
   const globalCompleted = progress.global.completedCount;
   const globalTarget = progress.global.targetCount;
   const globalFraction = progress.global.fraction;
   const globalPercentWidth =
-    globalFraction !== null
-      ? Math.min(100, Math.max(0, Math.round(globalFraction * 1000) / 10))
-      : 0;
+    globalFraction !== null ? Math.min(100, Math.max(0, Math.round(globalFraction * 1000) / 10)) : 0;
 
-  // Session counts
-  const sessionCompleted = progress.session.completedCount;
-  const sessionTarget = progress.session.targetCount;
-  const sessionFraction = progress.session.fraction;
+  const sessionView = progress.resumedSession ?? progress.session;
+  const sessionCompleted = sessionView.completedCount;
+  const sessionTarget = sessionView.targetCount;
+  const sessionFraction = sessionView.fraction;
   const sessionPercentWidth =
-    sessionFraction !== null
-      ? Math.min(100, Math.max(0, Math.round(sessionFraction * 1000) / 10))
-      : 0;
+    sessionFraction !== null ? Math.min(100, Math.max(0, Math.round(sessionFraction * 1000) / 10)) : 0;
+
+  // Show dual track ONLY when resumed-session offset evidence exists
+  const hasResumeEvidence =
+    progress.resumeCheckpointIndex !== null ||
+    progress.baselineEvidenceId !== null ||
+    progress.resumedSession != null ||
+    (sessionCompleted !== null &&
+      globalCompleted !== null &&
+      (sessionCompleted !== globalCompleted || sessionTarget !== globalTarget));
+
+  const primaryTrack =
+    globalCompleted !== null || globalTarget !== null || hasResumeEvidence ? progress.global : sessionView;
+  const primaryCompleted = primaryTrack.completedCount;
+  const primaryTarget = primaryTrack.targetCount;
+  const primaryFraction = primaryTrack.fraction;
+  const primaryWidth =
+    primaryFraction !== null ? Math.min(100, Math.max(0, Math.round(primaryFraction * 1000) / 10)) : 0;
+  const primaryUnit = unitSuffix(progress.unit ?? primaryTrack.unit, t);
+
+  const freshnessMeta = progress.observedAt
+    ? progress.freshness === 'stale'
+      ? t('progress.lastRecordedAt', { time: formatTimeOnly(progress.observedAt) })
+      : t('progress.updatedAt', { time: formatTimeOnly(progress.observedAt) })
+    : t('progress.pending');
 
   return (
-    <section className="dual-progress-panel" aria-label="双轨进度严格解耦看板">
-      <div className="section-heading"><h3>训练进度</h3><span className="text-muted">{progress.observedAt ? `${progress.freshness === 'stale' ? '上次记录 ' : '更新于 '}${formatTimeOnly(progress.observedAt)}` : '待观测'}</span></div>
-      {/* Track 1: Global Cumulative */}
+    <section className="dual-progress-panel" aria-label={t('progress.ariaLabel')}>
+      <div className="section-heading">
+        <h3>{t('progress.title')}</h3>
+        <span className="section-heading-meta tabular-num">{freshnessMeta}</span>
+      </div>
+
+      {/* Track 1: Overall Progress */}
       <div className="progress-track-block">
         <div className="progress-track-header">
-          <span className="track-title">累计进度</span>
+          <span className="track-title">
+            {t('progress.globalTrack')}
+            {primaryUnit ? ` · ${primaryUnit}` : ''}
+          </span>
           <span className="track-values">
-            {globalCompleted !== null && globalTarget !== null ? (
+            {primaryCompleted !== null && primaryTarget !== null ? (
               <>
                 <strong className="tabular-num">
-                  {formatNumber(globalCompleted)} / {formatNumber(globalTarget)}
-                </strong>{" "}
-                <span className="track-percent tabular-num">
-                  ({formatPercent(globalFraction)})
-                </span>
+                  {formatNumber(primaryCompleted)} / {formatNumber(primaryTarget)}
+                </strong>
+                <span className="track-percent tabular-num">({formatPercent(primaryFraction)})</span>
               </>
+            ) : primaryFraction !== null ? (
+              <strong className="tabular-num">{formatPercent(primaryFraction)}</strong>
             ) : (
-              <span className="text-muted">未知 / —</span>
+              <span className="text-muted">{t('progress.unknownPair')}</span>
             )}
           </span>
         </div>
         <div
           className="progress-bar-rail"
           role="progressbar"
-          aria-label="算法全局累计完成次数"
-          aria-valuenow={globalFraction !== null ? Math.round(globalFraction * 100) : undefined}
+          aria-label={t('progress.globalAria')}
+          aria-valuenow={primaryFraction !== null ? Math.round(primaryFraction * 100) : undefined}
           aria-valuemin={0}
           aria-valuemax={100}
         >
           <div
-            className={"progress-bar-fill progress-fill-global " + (globalFraction === null ? "fill-empty" : "")}
-            style={{ width: globalPercentWidth + "%" }}
+            className={`progress-bar-fill progress-fill-global ${primaryFraction === null ? 'fill-empty' : ''}`}
+            style={{ width: `${hasResumeEvidence ? globalPercentWidth : primaryWidth}%` }}
           />
         </div>
       </div>
 
-      {/* Track 2: Current Session */}
-      <div className="progress-track-block">
-        <div className="progress-track-header">
-          <span className="track-title">本轮进度</span>
-          <span className="track-values">
-            {sessionCompleted !== null && sessionTarget !== null ? (
-              <>
-                <strong className="tabular-num">
-                  {formatNumber(sessionCompleted)} / {formatNumber(sessionTarget)}
-                </strong>{" "}
-                <span className="track-percent tabular-num">
-                  ({formatPercent(sessionFraction)})
-                </span>
-              </>
-            ) : (
-              <span className="text-muted">未知 / —</span>
-            )}
-          </span>
-        </div>
-        <div
-          className="progress-bar-rail"
-          role="progressbar"
-          aria-label="本段续训实际完成次数"
-          aria-valuenow={sessionFraction !== null ? Math.round(sessionFraction * 100) : undefined}
-          aria-valuemin={0}
-          aria-valuemax={100}
-        >
+      {/* Track 2: Resumed Session — rendered ONLY when resume offset evidence exists */}
+      {hasResumeEvidence && (
+        <div className="progress-track-block">
+          <div className="progress-track-header">
+            <span className="track-title">{t('progress.sessionTrack')}</span>
+            <span className="track-values">
+              {sessionCompleted !== null && sessionTarget !== null ? (
+                <>
+                  <strong className="tabular-num">
+                    {formatNumber(sessionCompleted)} / {formatNumber(sessionTarget)}
+                  </strong>
+                  <span className="track-percent tabular-num">({formatPercent(sessionFraction)})</span>
+                </>
+              ) : (
+                <span className="text-muted">{t('progress.unknownPair')}</span>
+              )}
+            </span>
+          </div>
           <div
-            className={"progress-bar-fill progress-fill-session " + (sessionFraction === null ? "fill-empty" : "")}
-            style={{ width: sessionPercentWidth + "%" }}
-          />
+            className="progress-bar-rail"
+            role="progressbar"
+            aria-label={t('progress.sessionAria')}
+            aria-valuenow={sessionFraction !== null ? Math.round(sessionFraction * 100) : undefined}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            <div
+              className={`progress-bar-fill progress-fill-session ${sessionFraction === null ? 'fill-empty' : ''}`}
+              style={{ width: `${sessionPercentWidth}%` }}
+            />
+          </div>
         </div>
-      </div>
-
+      )}
     </section>
   );
 }

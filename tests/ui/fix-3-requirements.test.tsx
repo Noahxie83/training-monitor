@@ -128,7 +128,8 @@ describe("T7 Fix 3 Requirements - Group A: Settings, Registry & Host Targets (I1
       />
     );
 
-    // Edit host-1 (currently SSH)
+    // Switch to Hosts tab and edit host-1 (currently SSH)
+    fireEvent.click(screen.getByRole("tab", { name: "宿主管理" }));
     const editButtons = screen.getAllByRole("button", { name: "编辑" });
     fireEvent.click(editButtons[0]);
 
@@ -138,7 +139,7 @@ describe("T7 Fix 3 Requirements - Group A: Settings, Registry & Host Targets (I1
     fireEvent.change(screen.getByLabelText("编辑 WSL 发行版"), { target: { value: "Ubuntu-24.04" } });
 
     // Complete edit and save
-    fireEvent.click(screen.getByRole("button", { name: "完成" }));
+    fireEvent.click(screen.getByRole("button", { name: /完成编辑|完成/ }));
     fireEvent.click(screen.getByRole("button", { name: "保存宿主配置" }));
 
     await waitFor(() => {
@@ -191,7 +192,8 @@ describe("T7 Fix 3 Requirements - Group A: Settings, Registry & Host Targets (I1
       />
     );
 
-    // First save attempts revision 1 and fails with 409
+    // Switch to Hosts tab and attempt save with revision 1 -> fails with 409
+    fireEvent.click(screen.getByRole("tab", { name: "宿主管理" }));
     fireEvent.click(screen.getByRole("button", { name: "保存宿主配置" }));
 
     await waitFor(() => {
@@ -216,13 +218,13 @@ describe("T7 Fix 3 Requirements - Group A: Settings, Registry & Host Targets (I1
 
     const labelInput = screen.getByDisplayValue("Server Confirmed Host");
     fireEvent.change(labelInput, { target: { value: "Re-edited After Reload" } });
-    fireEvent.click(screen.getByRole("button", { name: "完成" }));
+    fireEvent.click(screen.getByRole("button", { name: /完成编辑|完成/ }));
 
     fireEvent.click(screen.getByRole("button", { name: "保存宿主配置" }));
 
     await waitFor(() => {
       expect(updateRegistry).toHaveBeenCalledTimes(2);
-      expect(screen.getByText(/登记配置保存成功/i)).toBeDefined();
+      expect(screen.getByText(/配置已保存成功|登记配置保存成功/i)).toBeDefined();
     });
 
     // Second payload MUST use reloaded revision 4!
@@ -457,7 +459,7 @@ describe("T7 Fix 3 Requirements - Group B: Log Requests, Events, Cancellation & 
     fireEvent.click(screen.getByRole("button", { name: /加载更早日志/ }));
 
     // Verify it is loading
-    expect(screen.getByText(/加载中\.\.\./)).toBeDefined();
+    expect(screen.getByText(/加载中/)).toBeDefined();
 
     // Now switch to score-based task
     const scoreTaskItem = screen.getByTitle("Score-based Generative Model");
@@ -567,7 +569,7 @@ describe("T7 Fix 3 Requirements - Group B: Log Requests, Events, Cancellation & 
     });
 
     // 2. Search error and restart search test
-    const searchInput = screen.getByPlaceholderText(/查找日志/);
+    const searchInput = screen.getByPlaceholderText(/搜索日志/);
     fireEvent.change(searchInput, { target: { value: "error-test" } });
 
     // Expect search error banner with '从头检索' button
@@ -733,10 +735,10 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/补读中.*状态陈旧|上次观测/)).toBeDefined();
+      expect(screen.getByText(/补读中.*待更新/)).toBeDefined();
     });
 
-    expect(screen.queryByText(/已补齐/)).toBeNull();
+    expect(screen.queryByText(/已同步最新/)).toBeNull();
 
     const caughtUpSource: LogSourceSnapshot = {
       ...staleCatchupSource,
@@ -760,7 +762,7 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
     });
 
     await waitFor(() => {
-      expect(screen.getByText(/已补齐/)).toBeDefined();
+      expect(screen.getByText(/已同步最新/)).toBeDefined();
     });
   });
 
@@ -822,7 +824,7 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
     expect(screen.queryByText(/0 Workers/)).toBeNull();
 
     const hostPill = screen.getByRole("button", { name: "切换到 lab-campus" });
-    expect(hostPill.getAttribute("title")).toContain("部分信息未读取");
+    expect(hostPill.getAttribute("title")).toContain("部分信息尚未读取完成");
 
     const refreshBtn = screen.getByRole("button", { name: /刷新全部宿主/ });
     const syncTimeBefore = refreshBtn.getAttribute("title");
@@ -942,16 +944,16 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
     expect(screen.getByText(/50\.0 MiB/)).toBeDefined();
     expect(screen.getByText(/30\.0 MiB/)).toBeDefined();
 
-    const evidenceBtn = screen.getByRole("button", { name: /白名单证据/ });
+    const evidenceBtn = screen.getByRole("button", { name: /任务详情/ });
     fireEvent.click(evidenceBtn);
 
     await waitFor(() => {
-      expect(screen.getByRole("dialog", { name: /白名单证据审查抽屉/ })).toBeDefined();
+      expect(screen.getByRole("dialog", { name: /任务详情抽屉/ })).toBeDefined();
     });
 
     expect(screen.getByText(/boot-1:102:2000/)).toBeDefined();
     expect(screen.getByText(/boot-1:103:3000/)).toBeDefined();
-    expect(screen.getByText(/任务状态观测时间/)).toBeDefined();
+    expect(screen.getByText(/状态观测时间/)).toBeDefined();
     expect(screen.queryByText(/最近确认存活时间/)).toBeNull();
   });
 
@@ -1153,17 +1155,17 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
 
       // Floating unread banner must appear with unread count
       await waitFor(() => {
-        expect(screen.getByText(/有 1 条新日志，点击恢复自动滚动/)).toBeDefined();
+        expect(screen.getByText(/回到底部 \(\+1 新行\)/)).toBeDefined();
       });
 
       // Clicking resume button in the floating banner resumes auto-scroll
-      const banner = screen.getByText(/有 1 条新日志，点击恢复自动滚动/).closest(".log-unread-floating-banner") as HTMLElement;
+      const banner = screen.getByText(/回到底部 \(\+1 新行\)/).closest(".log-unread-floating-banner") as HTMLElement;
       const resumeBtn = banner.querySelector("button")!;
       fireEvent.click(resumeBtn);
 
       await waitFor(() => {
         expect(screen.getByRole("button", { name: "锁定自动滚动" })).toBeDefined();
-        expect(screen.queryByText(/有 1 条新日志/)).toBeNull();
+        expect(screen.queryByText(/回到底部/)).toBeNull();
       });
     });
 

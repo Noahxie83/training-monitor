@@ -6,6 +6,7 @@ import { useLogBuffer } from '../../src/renderer/hooks/useLogBuffer';
 import { useMonitor } from '../../src/renderer/hooks/useMonitor';
 import { App } from '../../src/renderer/App';
 import { KpiMetricsGrid } from '../../src/renderer/components/KpiMetricsGrid';
+import { ResourceMetrics } from '../../src/renderer/components/ResourceMetrics';
 import { EvidenceDrawer } from '../../src/renderer/components/EvidenceDrawer';
 import { useFocusTrap } from '../../src/renderer/hooks/useFocusTrap';
 import type { LogEvent, ResourceMetric } from '../../src/shared/contracts';
@@ -126,7 +127,7 @@ it('I8/I10: every matched main/queue/worker CPU,RSS,GPU and device value retains
   const processes=[task.processes.main!,task.processes.queue!,...task.processes.workers];
   for(const [i,p] of processes.entries())for(const [j,name] of ['cpu_utilization','process_rss','gpu_memory_used'].entries())task.resources.push({scope:'process',processKey:p.key!,deviceId:name==='gpu_memory_used'?'GPU-1':null,name:name as ResourceMetric['name'],unit:name==='cpu_utilization'?'percent_one_cpu':'bytes',value:11+i*10+j,source:`sample-${i}-${j}`,observedAt:`2026-10-18T01:0${i}:0${j}Z`,freshness:i%2?'stale':'fresh'});
   task.resources.push({scope:'process',processKey:{...processes[2].key!,startTicks:'wrong'},deviceId:'GPU-1',name:'gpu_memory_used',unit:'bytes',value:999999,source:'wrong-start',observedAt:null,freshness:'stale'}, {scope:'process',processKey:{...processes[0].key!,hostBootId:'wrong'},deviceId:null,name:'cpu_utilization',unit:'percent_one_cpu',value:999,source:'wrong-boot',observedAt:null,freshness:'stale'}, {scope:'device',processKey:null,deviceId:'GPU-1',name:'gpu_memory_used',unit:'bytes',value:77,source:'device-sample',observedAt:'2026-10-18T02:00:00Z',freshness:'stale'});
-  const {container}=render(<><KpiMetricsGrid task={task}/><EvidenceDrawer task={task} isOpen onClose={()=>{}}/></>);
+  const {container}=render(<><KpiMetricsGrid task={task}/><ResourceMetrics task={task}/><EvidenceDrawer task={task} isOpen onClose={()=>{}}/></>);
   for(const metric of task.resources.filter(m=>m.scope==='process'&&m.name!=='gpu_memory_used'&&!m.source.startsWith('wrong'))){
     const rows=Array.from(container.querySelectorAll('[data-resource-source]')).filter(el=>el.getAttribute('data-resource-source')===metric.source);
     expect(rows).toHaveLength(1);

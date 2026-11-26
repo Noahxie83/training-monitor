@@ -1,30 +1,31 @@
-import { useState, useEffect, useRef, useCallback } from "react";
-import type { LogEvent, LogSourceSnapshot } from "../../shared/contracts";
+import { useState, useEffect, useRef, useCallback } from 'react';
+import type { LogEvent, LogSourceSnapshot } from '../../shared/contracts';
+import type { LogLevelFilter } from '../../shared/api';
 import {
   UI_EVENT_LIMIT,
   UI_TEXT_BUDGET_BYTES,
   EVENT_PREVIEW_BYTES,
   PAGE_EVENT_LIMIT,
-} from "../../shared/budgets";
+} from '../../shared/budgets';
+import { isSafeRegexPattern } from '../../shared/validate';
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder("utf-8", { fatal: false });
+const textDecoder = new TextDecoder('utf-8', { fatal: false });
 
 let globalRequestSeq = 0;
 function nextRequestId(prefix: string) {
   globalRequestSeq += 1;
-  return prefix + "-" + Date.now() + "-" + globalRequestSeq;
+  return `${prefix}-${Date.now()}-${globalRequestSeq}`;
 }
 
-// Clean UTF-8 code point boundary truncation (M1)
 function truncateUtf8(bytes: Uint8Array, maxBytes: number): Uint8Array {
   if (bytes.byteLength <= maxBytes) return bytes;
   let cut = maxBytes;
-  while (cut > 0 && (bytes[cut] & 0xc0) === 0x80) {
+  while (cut > 0 && (bytes[cut]! & 0xc0) === 0x80) {
     cut--;
   }
   if (cut > 0) {
-    const lead = bytes[cut];
+    const lead = bytes[cut]!;
     let seqLen = 1;
     if ((lead & 0xe0) === 0xc0) seqLen = 2;
     else if ((lead & 0xf0) === 0xe0) seqLen = 3;
@@ -65,20 +66,21 @@ function computeTotalBytes(events: LogEvent[]): number {
   return bytes;
 }
 
-export function useLogBuffer(
-  taskId: string | null,
-  sources: LogSourceSnapshot[] = [],
-) {
+export type UiLogLevelFilter = 'all' | 'error' | 'warn' | 'info';
+
+export function useLogBuffer(taskId: string | null, sources: LogSourceSnapshot[] = []) {
   const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
   const [events, publishEvents] = useState<LogEvent[]>([]);
   const [isScrollLocked, setIsScrollLocked] = useState<boolean>(false);
   const [unreadCount, setUnreadCount] = useState<number>(0);
-  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [searchMode, setSearchModeState] = useState<'literal' | 'regex'>('literal');
+  const [searchCaseSensitive, setSearchCaseSensitiveState] = useState<boolean>(false);
+  const [levelFilter, setLevelFilterState] = useState<UiLogLevelFilter>('all');
   const [searchResults, publishSearchResults] = useState<LogEvent[] | null>(null);
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const [isWrapLines, setIsWrapLines] = useState<boolean>(true);
 
-  // Pagination states (I4)
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [truncatedByBudget, setTruncatedByBudget] = useState<boolean>(false);
   const [searchContinuation, setSearchContinuation] = useState<string | null>(null);
@@ -95,7 +97,15 @@ export function useLogBuffer(
   const activePageRequestIdRef = useRef<string | null>(null);
   const activeEarlierRequestIdRef = useRef<string | null>(null);
 
-  // Epoch tracking (I2, I3)
+  const searchModeRef = useRef<'literal' | 'regex'>(searchMode);
+  const searchCaseRef = useRef<boolean>(searchCaseSensitive);
+  const levelFilterRef = useRef<UiLogLevelFilter>(levelFilter);
+  const searchQueryRef = useRef<string>(searchQuery);
+  searchModeRef.current = searchMode;
+  searchCaseRef.current = searchCaseSensitive;
+  levelFilterRef.current = levelFilter;
+  searchQueryRef.current = searchQuery;
+
   const epochCounterRef = useRef<number>(0);
   const currentEpochRef = useRef<{
     taskId: string | null;
@@ -109,36 +119,32 @@ export function useLogBuffer(
   const searchResultsRef = useRef<LogEvent[] | null>(null);
   const [residentEvicted, setResidentEvicted] = useState(false);
 
-  // Both views keep references to one canonical event per ID. Only this writer
-  // owns resident text and releases entries removed from either membership.
-  const commitResident = useCallback((target: "live" | "search", incoming: LogEvent[] | null) => {
-    let live = target === "live" ? (incoming ?? []) : eventsRef.current;
-    let search = target === "search" ? incoming : searchResultsRef.current;
+  const commitResident = useCallback((target: 'live' | 'search', incoming: LogEvent[] | null) => {
+    let live = target === 'live' ? (incoming ?? []) : eventsRef.current;
+    let search = target === 'search' ? incoming : searchResultsRef.current;
     const canonical = new Map<string, LogEvent>();
-    const other = target === "live" ? search : live;
+    const other = target === 'live' ? search : live;
     for (const ev of other ?? []) canonical.set(ev.eventId, ev);
     for (const ev of incoming ?? []) canonical.set(ev.eventId, ev);
-    const ids = (list: LogEvent[]) => [...new Set(list.map(ev => ev.eventId))];
+    const ids = (list: LogEvent[]) => [...new Set(list.map((ev) => ev.eventId))];
     let liveIds = ids(live);
     let searchIds = search === null ? null : ids(search);
     const activeIds = searchIds ?? liveIds;
     const activeSet = new Set(activeIds);
-    // Evict hidden live first; each new search page stays usable. Then evict
-    // the old edge of the active view if its own text/count exceeds the cap.
-    const evictionOrder = [...liveIds.filter(id => !activeSet.has(id)), ...activeIds];
+    const evictionOrder = [...liveIds.filter((id) => !activeSet.has(id)), ...activeIds];
     const retained = new Set([...liveIds, ...(searchIds ?? [])]);
-    let bytes = computeTotalBytes([...retained].map(id => canonical.get(id)!));
+    let bytes = computeTotalBytes([...retained].map((id) => canonical.get(id)!));
     let evicted = false;
     for (const id of evictionOrder) {
       if (retained.size <= UI_EVENT_LIMIT && bytes <= UI_TEXT_BUDGET_BYTES) break;
       if (!retained.delete(id)) continue;
-      bytes -= textEncoder.encode(canonical.get(id)?.text ?? "").byteLength;
+      bytes -= textEncoder.encode(canonical.get(id)?.text ?? '').byteLength;
       evicted = true;
     }
-    liveIds = liveIds.filter(id => retained.has(id));
-    searchIds = searchIds?.filter(id => retained.has(id)) ?? null;
-    live = liveIds.map(id => canonical.get(id)!);
-    search = searchIds?.map(id => canonical.get(id)!) ?? null;
+    liveIds = liveIds.filter((id) => retained.has(id));
+    searchIds = searchIds?.filter((id) => retained.has(id)) ?? null;
+    live = liveIds.map((id) => canonical.get(id)!);
+    search = searchIds?.map((id) => canonical.get(id)!) ?? null;
     eventsRef.current = live;
     searchResultsRef.current = search;
     bytesRef.current = computeTotalBytes(live);
@@ -146,25 +152,26 @@ export function useLogBuffer(
     publishSearchResults(search);
     if (evicted) setResidentEvicted(true);
   }, []);
-  const setEvents = useCallback((value: LogEvent[]) => commitResident("live", value), [commitResident]);
-  const setSearchResults = useCallback((value: LogEvent[] | null | ((prev: LogEvent[] | null) => LogEvent[])) => {
-    commitResident("search", typeof value === "function" ? value(searchResultsRef.current) : value);
-  }, [commitResident]);
 
-  // Available sources for current task
+  const setEvents = useCallback((value: LogEvent[]) => commitResident('live', value), [commitResident]);
+  const setSearchResults = useCallback(
+    (value: LogEvent[] | null | ((prev: LogEvent[] | null) => LogEvent[])) => {
+      commitResident('search', typeof value === 'function' ? value(searchResultsRef.current) : value);
+    },
+    [commitResident],
+  );
+
   const taskSources = sources.filter((s) => s.taskId === taskId);
   const activeSource = taskSources.find((s) => s.sourceId === activeSourceId) ?? taskSources[0] ?? null;
   const effectiveSourceId = activeSource?.sourceId ?? null;
   const currentGeneration = activeSource?.generation ?? null;
 
-  // Reset when task changes
   useEffect(() => {
     if (effectiveSourceId !== activeSourceId) {
       setActiveSourceId(effectiveSourceId);
     }
   }, [effectiveSourceId, activeSourceId]);
 
-  // Cancel in-flight search on unmount or task switch (I2)
   useEffect(() => {
     return () => {
       if (activeSearchRequestIdRef.current) {
@@ -178,9 +185,7 @@ export function useLogBuffer(
     };
   }, [taskId]);
 
-  // Epoch-guarded log subscription & initial fetch (I2, I3)
   useEffect(() => {
-    // Increment epoch
     epochCounterRef.current += 1;
     const epochId = epochCounterRef.current;
     currentEpochRef.current = {
@@ -190,7 +195,6 @@ export function useLogBuffer(
       epochId,
     };
 
-    // Cancel in-flight requests
     if (activeSearchRequestIdRef.current) {
       Promise.resolve(window.monitor.cancelRequest(activeSearchRequestIdRef.current)).catch(() => {});
       activeSearchRequestIdRef.current = null;
@@ -209,13 +213,12 @@ export function useLogBuffer(
     setInitialFetchError(null);
     setResidentEvicted(false);
 
-    // Immediately isolate and clear buffer on source/task switch (I2, I3)
     setEvents([]);
     eventsRef.current = [];
     bytesRef.current = 0;
     setUnreadCount(0);
     setSearchResults(null);
-    setSearchQuery("");
+    setSearchQuery('');
     setIsSearching(false);
     setSearchContinuation(null);
     setNextBefore(null);
@@ -227,10 +230,9 @@ export function useLogBuffer(
     }
     setIsLoadingInitial(true);
 
-    const pageRequestId = nextRequestId("page");
+    const pageRequestId = nextRequestId('page');
     activePageRequestIdRef.current = pageRequestId;
 
-    // Fetch initial page
     window.monitor
       .getLogs({
         requestId: pageRequestId,
@@ -239,43 +241,39 @@ export function useLogBuffer(
         limit: PAGE_EVENT_LIMIT,
       })
       .then((page) => {
-        // Discard if epoch changed or cancelled
         if (currentEpochRef.current.epochId !== epochId || activePageRequestIdRef.current !== pageRequestId) return;
         setNextBefore(page.nextBefore);
         setTruncatedByBudget(page.truncatedByBudget);
 
-        // Sanitize page events
-        const sanitizedPage = page.events.filter((e) => e.taskId === currentEpochRef.current.taskId && e.sourceId === currentEpochRef.current.sourceId && (!currentEpochRef.current.generation || e.generation === currentEpochRef.current.generation)).map((e) => sanitizeLogEvent(e).event).reverse();
+        const sanitizedPage = page.events
+          .filter(
+            (e) =>
+              e.taskId === currentEpochRef.current.taskId &&
+              e.sourceId === currentEpochRef.current.sourceId &&
+              (!currentEpochRef.current.generation || e.generation === currentEpochRef.current.generation),
+          )
+          .map((e) => sanitizeLogEvent(e).event)
+          .reverse();
 
-        // Merge initial page with live events that arrived before or during fetch (I3)
         const liveEvents = eventsRef.current;
         const liveMap = new Map(liveEvents.map((e) => [e.eventId, e]));
         const merged: LogEvent[] = [];
         const seen = new Set<string>();
 
         for (const pe of sanitizedPage) {
-          if (liveMap.has(pe.eventId)) {
-            merged.push(liveMap.get(pe.eventId)!);
-          } else {
-            merged.push(pe);
-          }
+          if (liveMap.has(pe.eventId)) merged.push(liveMap.get(pe.eventId)!);
+          else merged.push(pe);
           seen.add(pe.eventId);
         }
-
         for (const le of liveEvents) {
-          if (!seen.has(le.eventId)) {
-            merged.push(le);
-          }
+          if (!seen.has(le.eventId)) merged.push(le);
         }
 
-        // Budget enforcement (I11)
         let totalBytes = computeTotalBytes(merged);
         if (merged.length > UI_EVENT_LIMIT || totalBytes > UI_TEXT_BUDGET_BYTES) setResidentEvicted(true);
         while (merged.length > UI_EVENT_LIMIT || totalBytes > UI_TEXT_BUDGET_BYTES) {
           const dropped = merged.shift();
-          if (dropped?.text) {
-            totalBytes -= textEncoder.encode(dropped.text).byteLength;
-          }
+          if (dropped?.text) totalBytes -= textEncoder.encode(dropped.text).byteLength;
         }
 
         setEvents(merged);
@@ -284,42 +282,32 @@ export function useLogBuffer(
         if (currentEpochRef.current.epochId !== epochId || activePageRequestIdRef.current !== pageRequestId) return;
         const msg = err?.message || String(err);
         if (/cancelled|abort/i.test(msg)) return;
-        setInitialFetchError("读取初始日志失败: " + msg);
-      }).finally(() => {
+        setInitialFetchError('读取初始日志失败: ' + msg);
+      })
+      .finally(() => {
         if (currentEpochRef.current.epochId === epochId && activePageRequestIdRef.current === pageRequestId) {
           setIsLoadingInitial(false);
           activePageRequestIdRef.current = null;
         }
       });
 
-    // Subscribe to new log events
     const unsubscribe = window.monitor.subscribe((update) => {
-      if (update.kind !== "logs" || update.sourceId !== effectiveSourceId) {
-        return;
-      }
-      if (currentEpochRef.current.epochId !== epochId) {
-        return;
-      }
+      if (update.kind !== 'logs' || update.sourceId !== effectiveSourceId) return;
+      if (currentEpochRef.current.epochId !== epochId) return;
 
-      let current = [...eventsRef.current];
+      const current = [...eventsRef.current];
       let totalBytes = bytesRef.current;
       let newArrivedCount = 0;
 
       for (const raw of update.events) {
-        if (taskId && raw.taskId !== taskId) {
-          continue;
-        }
-        if (effectiveSourceId && raw.sourceId !== effectiveSourceId) {
-          continue;
-        }
-        if (currentGeneration && raw.generation !== currentGeneration) {
-          continue;
-        }
+        if (taskId && raw.taskId !== taskId) continue;
+        if (effectiveSourceId && raw.sourceId !== effectiveSourceId) continue;
+        if (currentGeneration && raw.generation !== currentGeneration) continue;
         const { event, bytes } = sanitizeLogEvent(raw);
         const existingIndex = current.findIndex((e) => e.eventId === event.eventId);
 
         if (existingIndex >= 0) {
-          const oldBytes = textEncoder.encode(current[existingIndex]?.text ?? "").byteLength;
+          const oldBytes = textEncoder.encode(current[existingIndex]?.text ?? '').byteLength;
           totalBytes = totalBytes - oldBytes + bytes;
           current[existingIndex] = event;
         } else {
@@ -329,13 +317,10 @@ export function useLogBuffer(
         }
       }
 
-      // Enforce caps: 10,000 lines & 8 MiB text budget (I11)
       if (current.length > UI_EVENT_LIMIT || totalBytes > UI_TEXT_BUDGET_BYTES) setResidentEvicted(true);
       while (current.length > UI_EVENT_LIMIT || totalBytes > UI_TEXT_BUDGET_BYTES) {
         const dropped = current.shift();
-        if (dropped?.text) {
-          totalBytes -= textEncoder.encode(dropped.text).byteLength;
-        }
+        if (dropped?.text) totalBytes -= textEncoder.encode(dropped.text).byteLength;
       }
 
       setEvents(current);
@@ -356,15 +341,14 @@ export function useLogBuffer(
         activeEarlierRequestIdRef.current = null;
       }
     };
-  }, [taskId, effectiveSourceId, currentGeneration]);
+  }, [taskId, effectiveSourceId, currentGeneration, setEvents, setSearchResults]);
 
-  // Load earlier logs pagination (I4)
   const loadEarlierLogs = useCallback(async () => {
     if (!nextBefore || !effectiveSourceId || isLoadingEarlier) return;
 
     setIsLoadingEarlier(true);
     setPagingError(null);
-    const requestId = nextRequestId("page-earlier");
+    const requestId = nextRequestId('page-earlier');
     activeEarlierRequestIdRef.current = requestId;
     const pageEpochId = currentEpochRef.current.epochId;
     try {
@@ -375,19 +359,21 @@ export function useLogBuffer(
         limit: PAGE_EVENT_LIMIT,
       });
 
-      if (
-        currentEpochRef.current.epochId !== pageEpochId ||
-        activeEarlierRequestIdRef.current !== requestId
-      ) {
-        return;
-      }
+      if (currentEpochRef.current.epochId !== pageEpochId || activeEarlierRequestIdRef.current !== requestId) return;
 
       setNextBefore(page.nextBefore);
       setTruncatedByBudget(page.truncatedByBudget);
 
-      const sanitizedEarlier = page.events.filter((e) => e.taskId === currentEpochRef.current.taskId && e.sourceId === currentEpochRef.current.sourceId && (!currentEpochRef.current.generation || e.generation === currentEpochRef.current.generation)).map((e) => sanitizeLogEvent(e).event).reverse();
+      const sanitizedEarlier = page.events
+        .filter(
+          (e) =>
+            e.taskId === currentEpochRef.current.taskId &&
+            e.sourceId === currentEpochRef.current.sourceId &&
+            (!currentEpochRef.current.generation || e.generation === currentEpochRef.current.generation),
+        )
+        .map((e) => sanitizeLogEvent(e).event)
+        .reverse();
 
-      // Prepend earlier logs, deduplicate by eventId
       const current = [...eventsRef.current];
       const existingIds = new Set(current.map((e) => e.eventId));
       const prepended = sanitizedEarlier.filter((e) => !existingIds.has(e.eventId));
@@ -395,29 +381,21 @@ export function useLogBuffer(
       const merged = [...prepended, ...current];
       let totalBytes = computeTotalBytes(merged);
 
-      // Enforce 10,000 / 8 MiB budget (I11)
       if (merged.length > UI_EVENT_LIMIT || totalBytes > UI_TEXT_BUDGET_BYTES) setResidentEvicted(true);
       while (merged.length > UI_EVENT_LIMIT || totalBytes > UI_TEXT_BUDGET_BYTES) {
         const dropped = merged.pop();
-        if (dropped?.text) {
-          totalBytes -= textEncoder.encode(dropped.text).byteLength;
-        }
+        if (dropped?.text) totalBytes -= textEncoder.encode(dropped.text).byteLength;
       }
 
       setEvents(merged);
     } catch (err: any) {
-      if (
-        currentEpochRef.current.epochId !== pageEpochId ||
-        activeEarlierRequestIdRef.current !== requestId
-      ) {
-        return;
-      }
-      const msg = err?.message || "未知错误";
-      if (msg.includes("STALE_CONTINUATION")) {
+      if (currentEpochRef.current.epochId !== pageEpochId || activeEarlierRequestIdRef.current !== requestId) return;
+      const msg = err?.message || '未知错误';
+      if (msg.includes('STALE_CONTINUATION')) {
         setNextBefore(null);
-        setPagingError("分页游标已失效（STALE_CONTINUATION），请从最新位置重新加载");
+        setPagingError('历史日志位置已过期，请从最新位置重新加载');
       } else {
-        setPagingError("加载历史日志失败: " + msg);
+        setPagingError('加载历史日志失败: ' + msg);
       }
     } finally {
       if (activeEarlierRequestIdRef.current === requestId) {
@@ -425,7 +403,7 @@ export function useLogBuffer(
         activeEarlierRequestIdRef.current = null;
       }
     }
-  }, [nextBefore, effectiveSourceId, isLoadingEarlier]);
+  }, [nextBefore, effectiveSourceId, isLoadingEarlier, setEvents]);
 
   const cancelEarlierLogs = useCallback(() => {
     if (activeEarlierRequestIdRef.current) {
@@ -435,18 +413,16 @@ export function useLogBuffer(
     setIsLoadingEarlier(false);
   }, []);
 
-  // Reload initial logs from latest (I4)
   const reloadFromLatest = useCallback(() => {
     setPagingError(null);
     setInitialFetchError(null);
     setNextBefore(null);
     if (!effectiveSourceId) return;
 
-    // Weak identity membership must not retain old text while this request is pending.
     const atRequest = new WeakSet(eventsRef.current);
     setIsLoadingInitial(true);
     const epochId = currentEpochRef.current.epochId;
-    const pageRequestId = nextRequestId("page-reload");
+    const pageRequestId = nextRequestId('page-reload');
     activePageRequestIdRef.current = pageRequestId;
 
     window.monitor
@@ -457,70 +433,66 @@ export function useLogBuffer(
         limit: PAGE_EVENT_LIMIT,
       })
       .then((page) => {
-        if (
-          currentEpochRef.current.epochId !== epochId ||
-          activePageRequestIdRef.current !== pageRequestId
-        ) {
-          return;
-        }
+        if (currentEpochRef.current.epochId !== epochId || activePageRequestIdRef.current !== pageRequestId) return;
         setNextBefore(page.nextBefore);
         setTruncatedByBudget(page.truncatedByBudget);
-        const sanitizedPage = page.events.filter((e) => e.taskId === currentEpochRef.current.taskId && e.sourceId === currentEpochRef.current.sourceId && (!currentEpochRef.current.generation || e.generation === currentEpochRef.current.generation)).map((e) => sanitizeLogEvent(e).event).reverse();
+        const sanitizedPage = page.events
+          .filter(
+            (e) =>
+              e.taskId === currentEpochRef.current.taskId &&
+              e.sourceId === currentEpochRef.current.sourceId &&
+              (!currentEpochRef.current.generation || e.generation === currentEpochRef.current.generation),
+          )
+          .map((e) => sanitizeLogEvent(e).event)
+          .reverse();
 
-        // Merge initial page with live events that arrived before or during fetch (I3)
-        const pageIds = new Set(sanitizedPage.map(e => e.eventId));
-        const liveEvents = eventsRef.current.filter(e => pageIds.has(e.eventId) || !atRequest.has(e));
+        const pageIds = new Set(sanitizedPage.map((e) => e.eventId));
+        const liveEvents = eventsRef.current.filter((e) => pageIds.has(e.eventId) || !atRequest.has(e));
         const liveMap = new Map(liveEvents.map((e) => [e.eventId, e]));
         const merged: LogEvent[] = [];
         const seen = new Set<string>();
 
         for (const pe of sanitizedPage) {
-          if (liveMap.has(pe.eventId)) {
-            merged.push(liveMap.get(pe.eventId)!);
-          } else {
-            merged.push(pe);
-          }
+          if (liveMap.has(pe.eventId)) merged.push(liveMap.get(pe.eventId)!);
+          else merged.push(pe);
           seen.add(pe.eventId);
         }
-
         for (const le of liveEvents) {
-          if (!seen.has(le.eventId)) {
-            merged.push(le);
-          }
+          if (!seen.has(le.eventId)) merged.push(le);
         }
 
         let totalBytes = computeTotalBytes(merged);
         if (merged.length > UI_EVENT_LIMIT || totalBytes > UI_TEXT_BUDGET_BYTES) setResidentEvicted(true);
         while (merged.length > UI_EVENT_LIMIT || totalBytes > UI_TEXT_BUDGET_BYTES) {
           const dropped = merged.shift();
-          if (dropped?.text) {
-            totalBytes -= textEncoder.encode(dropped.text).byteLength;
-          }
+          if (dropped?.text) totalBytes -= textEncoder.encode(dropped.text).byteLength;
         }
 
         setEvents(merged);
       })
       .catch((err: any) => {
-        if (
-          currentEpochRef.current.epochId !== epochId ||
-          activePageRequestIdRef.current !== pageRequestId
-        ) {
-          return;
-        }
+        if (currentEpochRef.current.epochId !== epochId || activePageRequestIdRef.current !== pageRequestId) return;
         const msg = err?.message || String(err);
         if (/cancelled|abort/i.test(msg)) return;
-        setInitialFetchError("读取初始日志失败: " + msg);
-      }).finally(() => {
+        setInitialFetchError('读取初始日志失败: ' + msg);
+      })
+      .finally(() => {
         if (currentEpochRef.current.epochId === epochId && activePageRequestIdRef.current === pageRequestId) {
           setIsLoadingInitial(false);
           activePageRequestIdRef.current = null;
         }
       });
-  }, [effectiveSourceId]);
+  }, [effectiveSourceId, setEvents]);
 
-  // Search handling with epoch & cancellation (I2, I4)
-  const executeSearch = useCallback(
-    async (query: string) => {
+  const runSearch = useCallback(
+    async (
+      query: string,
+      opts?: { mode?: 'literal' | 'regex'; caseSensitive?: boolean; level?: UiLogLevelFilter },
+    ) => {
+      const mode = opts?.mode ?? searchModeRef.current;
+      const caseSensitive = opts?.caseSensitive ?? searchCaseRef.current;
+      const level = opts?.level ?? levelFilterRef.current;
+
       setSearchQuery(query);
       setPagingError(null);
       setSearchError(null);
@@ -535,30 +507,55 @@ export function useLogBuffer(
         return;
       }
 
+      if (mode === 'regex' && !isSafeRegexPattern(query)) {
+        setSearchError('正则表达式语法无效或过于复杂');
+        setIsSearching(false);
+        return;
+      }
+
       if (activeSearchRequestIdRef.current) {
         Promise.resolve(window.monitor.cancelRequest(activeSearchRequestIdRef.current)).catch(() => {});
       }
 
-      const requestId = nextRequestId("search");
+      const requestId = nextRequestId('search');
       activeSearchRequestIdRef.current = requestId;
       setIsSearching(true);
       const searchEpochId = currentEpochRef.current.epochId;
 
-      try {
-        const page = await window.monitor.searchLogs({
-          requestId,
-          sourceIds: [effectiveSourceId],
-          literal: query,
-          continuation: null,
-        });
+      const reqPayload: {
+        requestId: string;
+        sourceIds: string[];
+        literal: string;
+        continuation: string | null;
+        mode?: 'literal' | 'regex';
+        caseSensitive?: boolean;
+        level?: LogLevelFilter | null;
+      } = {
+        requestId,
+        sourceIds: [effectiveSourceId],
+        literal: query,
+        continuation: null,
+      };
+      if (mode === 'regex') reqPayload.mode = 'regex';
+      if (caseSensitive) reqPayload.caseSensitive = true;
+      if (level !== 'all') reqPayload.level = level;
 
-        // Ensure this response matches active request and active epoch (I2)
+      try {
+        const page = await window.monitor.searchLogs(reqPayload);
+
         if (
           !page.cancelled &&
           activeSearchRequestIdRef.current === requestId &&
           currentEpochRef.current.epochId === searchEpochId
         ) {
-          const sanitized = page.events.filter((e) => e.taskId === currentEpochRef.current.taskId && e.sourceId === currentEpochRef.current.sourceId && (!currentEpochRef.current.generation || e.generation === currentEpochRef.current.generation)).map((e) => sanitizeLogEvent(e).event);
+          const sanitized = page.events
+            .filter(
+              (e) =>
+                e.taskId === currentEpochRef.current.taskId &&
+                e.sourceId === currentEpochRef.current.sourceId &&
+                (!currentEpochRef.current.generation || e.generation === currentEpochRef.current.generation),
+            )
+            .map((e) => sanitizeLogEvent(e).event);
           setSearchResults(sanitized);
           setSearchContinuation(page.continuation);
         }
@@ -567,12 +564,12 @@ export function useLogBuffer(
           activeSearchRequestIdRef.current === requestId &&
           currentEpochRef.current.epochId === searchEpochId
         ) {
-          const msg = err?.message || "未知错误";
-          if (msg.includes("STALE_CONTINUATION")) {
+          const msg = err?.message || '未知错误';
+          if (msg.includes('STALE_CONTINUATION')) {
             setSearchContinuation(null);
-            setSearchError("搜索分页游标已失效（STALE_CONTINUATION），请重新开始搜索");
+            setSearchError('搜索分页位置已过期，请重新开始搜索');
           } else {
-            setSearchError("日志搜索失败: " + msg);
+            setSearchError('日志搜索失败: ' + msg);
           }
         }
       } finally {
@@ -581,41 +578,96 @@ export function useLogBuffer(
         }
       }
     },
-    [effectiveSourceId]
+    [effectiveSourceId, setSearchResults],
   );
 
-  // Search pagination (I4)
+  const executeSearch = useCallback(
+    async (query: string) => runSearch(query),
+    [runSearch],
+  );
+
+  const setSearchMode = useCallback(
+    (mode: 'literal' | 'regex') => {
+      setSearchModeState(mode);
+      searchModeRef.current = mode;
+      if (searchQueryRef.current.trim()) {
+        void runSearch(searchQueryRef.current, { mode });
+      }
+    },
+    [runSearch],
+  );
+
+  const setSearchCaseSensitive = useCallback(
+    (caseSensitive: boolean) => {
+      setSearchCaseSensitiveState(caseSensitive);
+      searchCaseRef.current = caseSensitive;
+      if (searchQueryRef.current.trim()) {
+        void runSearch(searchQueryRef.current, { caseSensitive });
+      }
+    },
+    [runSearch],
+  );
+
+  const setLevelFilter = useCallback(
+    (level: UiLogLevelFilter) => {
+      setLevelFilterState(level);
+      levelFilterRef.current = level;
+      if (searchQueryRef.current.trim()) {
+        void runSearch(searchQueryRef.current, { level });
+      }
+    },
+    [runSearch],
+  );
+
   const loadMoreSearchResults = useCallback(async () => {
     if (!searchContinuation || !effectiveSourceId || !searchQuery || isSearching) return;
 
-    const requestId = nextRequestId("search-more");
+    const requestId = nextRequestId('search-more');
     activeSearchRequestIdRef.current = requestId;
     setIsSearching(true);
     const searchEpochId = currentEpochRef.current.epochId;
 
+    const reqPayload: {
+      requestId: string;
+      sourceIds: string[];
+      literal: string;
+      continuation: string | null;
+      mode?: 'literal' | 'regex';
+      caseSensitive?: boolean;
+      level?: LogLevelFilter | null;
+    } = {
+      requestId,
+      sourceIds: [effectiveSourceId],
+      literal: searchQuery,
+      continuation: searchContinuation,
+    };
+    if (searchModeRef.current === 'regex') reqPayload.mode = 'regex';
+    if (searchCaseRef.current) reqPayload.caseSensitive = true;
+    if (levelFilterRef.current !== 'all') reqPayload.level = levelFilterRef.current;
+
     try {
-      const page = await window.monitor.searchLogs({
-        requestId,
-        sourceIds: [effectiveSourceId],
-        literal: searchQuery,
-        continuation: searchContinuation,
-      });
+      const page = await window.monitor.searchLogs(reqPayload);
 
       if (
         !page.cancelled &&
         activeSearchRequestIdRef.current === requestId &&
         currentEpochRef.current.epochId === searchEpochId
       ) {
-        const sanitized = page.events.filter((e) => e.taskId === currentEpochRef.current.taskId && e.sourceId === currentEpochRef.current.sourceId && (!currentEpochRef.current.generation || e.generation === currentEpochRef.current.generation)).map((e) => sanitizeLogEvent(e).event);
+        const sanitized = page.events
+          .filter(
+            (e) =>
+              e.taskId === currentEpochRef.current.taskId &&
+              e.sourceId === currentEpochRef.current.sourceId &&
+              (!currentEpochRef.current.generation || e.generation === currentEpochRef.current.generation),
+          )
+          .map((e) => sanitizeLogEvent(e).event);
         setSearchResults((prev) => {
           const curr = prev ? [...prev] : [];
           for (const ev of sanitized) {
-            const index = curr.findIndex(e => e.eventId === ev.eventId);
+            const index = curr.findIndex((e) => e.eventId === ev.eventId);
             if (index >= 0) curr[index] = ev;
             else curr.push(ev);
           }
-          // The shared writer owns eviction and its visible notice, including
-          // the exact-capacity continuation boundary.
           return curr;
         });
         setSearchContinuation(page.continuation);
@@ -625,12 +677,12 @@ export function useLogBuffer(
         activeSearchRequestIdRef.current === requestId &&
         currentEpochRef.current.epochId === searchEpochId
       ) {
-        const msg = err?.message || "未知错误";
-        if (msg.includes("STALE_CONTINUATION")) {
+        const msg = err?.message || '未知错误';
+        if (msg.includes('STALE_CONTINUATION')) {
           setSearchContinuation(null);
-          setSearchError("搜索分页游标已失效（STALE_CONTINUATION），请重新开始搜索");
+          setSearchError('搜索分页位置已过期，请重新开始搜索');
         } else {
-          setSearchError("加载更多搜索结果失败: " + msg);
+          setSearchError('加载更多搜索结果失败: ' + msg);
         }
       }
     } finally {
@@ -638,24 +690,23 @@ export function useLogBuffer(
         setIsSearching(false);
       }
     }
-  }, [searchContinuation, effectiveSourceId, searchQuery, isSearching]);
+  }, [searchContinuation, effectiveSourceId, searchQuery, isSearching, setSearchResults]);
 
-  // Clear search (I2)
   const clearSearch = useCallback(() => {
     if (activeSearchRequestIdRef.current) {
       Promise.resolve(window.monitor.cancelRequest(activeSearchRequestIdRef.current)).catch(() => {});
       activeSearchRequestIdRef.current = null;
     }
-    setSearchQuery("");
+    setSearchQuery('');
     setSearchResults(null);
     setIsSearching(false);
     setSearchContinuation(null);
     setSearchError(null);
-  }, []);
+  }, [setSearchResults]);
 
   const restartSearch = useCallback(() => {
     if (searchQuery.trim()) {
-      executeSearch(searchQuery);
+      void executeSearch(searchQuery);
     }
   }, [searchQuery, executeSearch]);
 
@@ -673,7 +724,7 @@ export function useLogBuffer(
   }, []);
 
   const activeEvents = searchResults !== null ? searchResults : events;
-  const resident = new Map([...events, ...(searchResults ?? [])].map(e => [e.eventId, e]));
+  const resident = new Map([...events, ...(searchResults ?? [])].map((e) => [e.eventId, e]));
   const totalCount = resident.size;
   const totalBytes = computeTotalBytes([...resident.values()]);
 
@@ -691,6 +742,12 @@ export function useLogBuffer(
     resumeAutoScroll,
     toggleScrollLock,
     searchQuery,
+    searchMode,
+    setSearchMode,
+    searchCaseSensitive,
+    setSearchCaseSensitive,
+    levelFilter,
+    setLevelFilter,
     executeSearch,
     restartSearch,
     clearSearch,

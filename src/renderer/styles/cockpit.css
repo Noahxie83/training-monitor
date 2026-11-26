@@ -1,0 +1,885 @@
+/* Unified Light & Dark Task Cockpit — ZERO theme-switched layout mutations */
+.cockpit-container {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(280px, 1fr);
+  gap: 12px;
+  padding: 14px 20px 14px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.cockpit-container.has-autostart {
+  grid-template-rows: auto auto auto minmax(250px, 1fr);
+}
+
+.cockpit-container.cockpit-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Task title & actions header */
+.cockpit-header {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cockpit-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.cockpit-ident {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.cockpit-title-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.cockpit-task-title {
+  font-size: var(--text-page-title);
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.cockpit-location {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  min-width: 0;
+}
+
+.cockpit-algorithm {
+  font-family: var(--font-sans);
+  padding: 1px 7px;
+  border-radius: var(--radius-xs);
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cockpit-action-buttons {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.cockpit-warning-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--status-warning-border);
+  background-color: var(--status-warning-bg);
+  color: var(--status-warning);
+  font-size: var(--text-meta);
+}
+
+/* Compact 2-row AutoStart Status Strip */
+.auto-start-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--card-shadow);
+}
+
+.auto-start-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.auto-start-panel-ident {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.auto-start-panel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.auto-start-phase {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  border: 1px solid var(--status-neutral-border);
+  background-color: var(--status-neutral-bg);
+  color: var(--status-neutral);
+}
+
+.auto-start-phase-enabled,
+.auto-start-phase-started {
+  color: var(--status-running);
+  background-color: var(--status-running-bg);
+  border-color: var(--status-running-border);
+}
+
+.auto-start-phase-countdown,
+.auto-start-phase-waiting,
+.auto-start-phase-starting {
+  color: var(--status-warning);
+  background-color: var(--status-warning-bg);
+  border-color: var(--status-warning-border);
+}
+
+.auto-start-phase-blocked {
+  color: var(--text-secondary);
+  background-color: var(--status-neutral-bg);
+  border-color: var(--border-strong);
+}
+
+.auto-start-phase-failed {
+  color: var(--status-danger);
+  background-color: var(--status-danger-bg);
+  border-color: var(--status-danger-border);
+}
+
+.auto-start-summary-inline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.auto-start-summary-chip {
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  background-color: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.auto-start-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.auto-start-row-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.auto-start-countdown-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 220px;
+}
+
+.auto-start-countdown {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.auto-start-countdown strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.auto-start-countdown-rail {
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background-color: var(--bg-inset);
+  overflow: hidden;
+}
+
+.auto-start-countdown-fill {
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background-color: var(--status-warning);
+  transition: width var(--transition-bar);
+}
+
+.auto-start-note {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.auto-start-note-started { color: var(--status-running); }
+.auto-start-note-blocked { color: var(--status-warning); }
+.auto-start-note-failed { color: var(--status-danger); }
+
+.auto-start-session {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.auto-start-session summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.auto-start-session-code-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.auto-start-session code {
+  flex: 1;
+  min-width: 0;
+  display: block;
+  padding: 6px 10px;
+  border-radius: var(--radius-xs);
+  background-color: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* Telemetry 2-column adaptive row */
+.cockpit-telemetry-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  align-items: stretch;
+}
+
+.telemetry-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+  min-width: 0;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--card-shadow);
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 22px;
+}
+
+.section-heading h3 {
+  font-size: var(--text-section);
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.section-heading-meta {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* DualProgressBar (adaptive single / dual track) */
+.dual-progress-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.progress-track-block {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.progress-track-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--text-meta);
+}
+
+.track-title {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.track-values {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.track-values strong {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.track-percent {
+  color: var(--accent-primary);
+  font-weight: 600;
+  font-size: 11.5px;
+}
+
+.progress-bar-rail {
+  height: 6px;
+  width: 100%;
+  border-radius: var(--radius-pill);
+  background-color: var(--bg-inset);
+  overflow: hidden;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background-color: var(--accent-primary);
+  transition: width var(--transition-bar);
+}
+
+.progress-fill-session {
+  background-color: var(--status-running);
+}
+
+.fill-empty {
+  width: 0;
+}
+
+/* 4-cell Hero KPI grid */
+.training-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.execution-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.kpi-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  min-width: 0;
+}
+
+.kpi-cell dt {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kpi-cell dd {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  color: var(--text-primary);
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kpi-cell dd small {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-secondary);
+  margin-left: 3px;
+  letter-spacing: 0;
+}
+
+.kpi-sub {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Checkpoint compact row */
+.checkpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.checkpoint-label {
+  color: var(--text-muted);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.checkpoint-file {
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  max-width: 44%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.checkpoint-meta-chip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.checkpoint-time {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* Right Telemetry Card: Interactive Training Chart + Task GPU / Process Tree */
+.cockpit-right-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.cockpit-right-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+}
+
+@media (min-width: 1440px) {
+  .cockpit-telemetry-grid {
+    grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.38fr);
+  }
+  .cockpit-right-card .right-tabs-bar {
+    display: none;
+  }
+  .cockpit-right-split.is-wide-split {
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  }
+  .cockpit-right-split.is-wide-split .right-pane {
+    display: flex;
+  }
+  .cockpit-right-split.is-wide-split .right-pane + .right-pane {
+    padding-left: 12px;
+    border-left: 1px solid var(--border-subtle);
+  }
+}
+
+.right-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.right-pane.is-hidden-tab {
+  display: none;
+}
+
+/* Interactive SVG Training Chart */
+.training-chart-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-height: 128px;
+}
+
+.chart-controls-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chart-metric-chips {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.chart-metric-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-subtle);
+  background-color: var(--bg-inset);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.chart-metric-chip.is-active {
+  border-color: var(--border-strong);
+  background-color: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+.chart-swatch {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.chart-svg-box {
+  position: relative;
+  flex: 1;
+  min-height: 116px;
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  overflow: hidden;
+  display: flex;
+}
+
+.chart-plot-layout {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px 4px 6px;
+  gap: 6px;
+}
+
+.chart-y-axis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding: 2px 0 18px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  min-width: 44px;
+}
+
+.chart-canvas-col {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+}
+
+.chart-svg-stage {
+  position: relative;
+  flex: 1;
+  min-height: 82px;
+}
+
+.chart-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.chart-x-axis {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  line-height: 1.2;
+  color: var(--text-muted);
+  padding: 0 2px;
+}
+
+.chart-tooltip {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  padding: 4px 8px;
+  border-radius: var(--radius-xs);
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--card-shadow);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.chart-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 16px;
+  height: 100%;
+  min-height: 116px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+/* Task GPU & Process Tree Pane */
+.task-gpu-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.task-gpu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  max-height: 168px;
+}
+
+.task-gpu-device {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+}
+
+.task-gpu-badge {
+  font-size: 10.5px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+}
+
+.task-gpu-process + .task-gpu-process {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.task-gpu-updated {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.task-gpu-empty {
+  padding: 12px 10px;
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: var(--text-meta);
+}
+
+.process-resource-section {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 8px;
+  font-size: 11.5px;
+}
+
+.process-resource-section summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.process-resource-section[open] summary {
+  margin-bottom: 6px;
+}
+
+.kpi-detail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 0;
+  font-size: 11.5px;
+}
+
+.kpi-detail-label {
+  color: var(--text-muted);
+}
+
+.kpi-detail-val {
+  color: var(--text-primary);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+/* Logs section fills remaining vertical viewport */
+.cockpit-logs-section {
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Adaptive breakpoint <= 1050px: stay 2 compact columns down to 780px so logs ALWAYS remain >= 200px tall at 960x650 */
+@media (max-width: 1050px) {
+  .cockpit-container {
+    padding: 8px 12px;
+    gap: 7px;
+  }
+  .cockpit-action-buttons .btn {
+    height: 24px;
+    padding: 0 7px;
+    font-size: 11.5px;
+  }
+  .cockpit-telemetry-grid {
+    grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr);
+    gap: 8px;
+  }
+  .execution-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 5px;
+  }
+  .kpi-cell {
+    padding: 5px 8px;
+  }
+  .kpi-cell dd {
+    font-size: 14px;
+  }
+  .telemetry-card {
+    padding: 9px 11px;
+    gap: 6px;
+  }
+  .cockpit-task-title {
+    font-size: 17px;
+  }
+}
+
+@media (max-width: 780px) {
+  .cockpit-telemetry-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-height: 700px) {
+  .cockpit-container {
+    grid-template-rows: auto auto minmax(240px, 1fr);
+    padding: 8px 12px;
+    gap: 6px;
+  }
+  .cockpit-container.has-autostart {
+    grid-template-rows: auto auto auto minmax(240px, 1fr);
+  }
+  .telemetry-card {
+    padding: 8px 11px;
+    gap: 5px;
+  }
+  .auto-start-panel {
+    padding: 6px 10px;
+    gap: 4px;
+  }
+  .dual-progress-panel {
+    gap: 5px;
+  }
+  .training-facts {
+    gap: 5px;
+  }
+  .checkpoint-row {
+    padding-top: 5px;
+  }
+  .task-gpu-list {
+    max-height: 112px;
+  }
+  .training-chart-wrap {
+    min-height: 98px;
+  }
+  .chart-svg-box,
+  .chart-empty {
+    min-height: 86px;
+  }
+}

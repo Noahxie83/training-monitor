@@ -102,6 +102,8 @@ describe('I16: actual App settings preference feedback recovery', () => {
     const dialog = await openSettings(api);
     const ui = within(dialog);
     const expectedError = kind === 'validation' ? '宿主 ID 不能为空' : '409 registry revision conflict';
+    // Trigger registry error on Hosts tab, then switch to Appearance tab for theme retry
+    fireEvent.click(ui.getByRole('tab', { name: '宿主管理' }));
     if (kind === 'validation') {
       fireEvent.click(ui.getByRole('button', { name: '+ 添加宿主' }));
       fireEvent.click(ui.getByRole('button', { name: '确认添加宿主' }));
@@ -110,6 +112,7 @@ describe('I16: actual App settings preference feedback recovery', () => {
     }
     expect((await ui.findByRole('alert')).textContent).toContain(expectedError);
 
+    fireEvent.click(ui.getByRole('tab', { name: '外观与语言' }));
     fireEvent.click(themeRadio(dialog, 'light'));
     await act(async () => failedSave.reject(new Error('theme save unavailable')));
     expect(ui.getByRole('alert').textContent).toContain(expectedError);
@@ -123,6 +126,9 @@ describe('I16: actual App settings preference feedback recovery', () => {
     expect(screen.queryByText('正在保存偏好设置…')).toBeNull();
     expect(document.querySelectorAll('.global-error-banner')).toHaveLength(0);
     if (kind === 'conflict') expect(ui.getByRole('button', { name: '重新加载最新配置' })).toBeDefined();
-    else expect(ui.getByLabelText('新增宿主 ID:')).toBeDefined();
+    else {
+      fireEvent.click(ui.getByRole('tab', { name: '宿主管理' }));
+      expect(ui.getByLabelText('新增宿主 ID')).toBeDefined();
+    }
   });
 });

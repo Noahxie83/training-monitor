@@ -42,6 +42,9 @@ describe('T7 Fix 1 Requirements (I1 - I17)', () => {
       expect(screen.getByRole('dialog', { name: '系统设置' })).toBeDefined();
     });
 
+    // Switch to Hosts tab in tabbed SettingsModal
+    fireEvent.click(screen.getByRole('tab', { name: '宿主管理' }));
+
     // Check that interactive edit controls exist for hosts
     expect(screen.getByRole('button', { name: /\+ 添加宿主/i })).toBeDefined();
 
@@ -63,11 +66,11 @@ describe('T7 Fix 1 Requirements (I1 - I17)', () => {
 
     // Fill valid WSL host fields
     fireEvent.change(hostIdInput, { target: { value: 'wsl-test' } });
-    const hostLabelInput = screen.getByLabelText(/新增宿主名称/i);
+    const hostLabelInput = screen.getByLabelText(/显示名称/i);
     fireEvent.change(hostLabelInput, { target: { value: 'WSL Test' } });
     fireEvent.change(screen.getByLabelText(/宿主类型/i), { target: { value: 'wsl' } });
     fireEvent.change(screen.getByLabelText(/WSL 发行版/i), { target: { value: 'Ubuntu-24.04' } });
-    const hostRootsInput = screen.getByLabelText(/白名单根目录/i);
+    const hostRootsInput = screen.getByLabelText(/允许监控的根目录/i);
     fireEvent.change(hostRootsInput, { target: { value: '/home/test' } });
 
     // Save valid registry
@@ -115,10 +118,10 @@ describe('T7 Fix 1 Requirements (I1 - I17)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByPlaceholderText(/查找日志 \(Ctrl\+F\)/)).toBeDefined();
+      expect(screen.getByPlaceholderText(/搜索日志 \(Ctrl\+F\)/)).toBeDefined();
     });
 
-    const searchInput = screen.getByPlaceholderText(/查找日志 \(Ctrl\+F\)/);
+    const searchInput = screen.getByPlaceholderText(/搜索日志 \(Ctrl\+F\)/);
     fireEvent.change(searchInput, { target: { value: 'error' } });
 
     // Esc in search input should clear query and cancel search
@@ -338,8 +341,9 @@ describe('T7 Fix 1 Requirements (I1 - I17)', () => {
     // Must NOT state "连接中断" when host is connected!
     expect(screen.queryByText(/连接中断/)).toBeNull();
 
-    // Stale rate and ETA must have [上次观测]
-    expect(screen.getAllByText(/\[上次观测\]/).length).toBeGreaterThan(0);
+    // Stale rate and ETA must show 待更新 instead of stale numeric rate/ETA
+    expect(screen.getAllByText(/待更新/).length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText(/12\.5/)).toBeNull();
   });
 
   // I9: Exact algorithm check & no Flow formula for Reflow
@@ -447,7 +451,7 @@ describe('T7 Fix 1 Requirements (I1 - I17)', () => {
       expect(screen.getByText(/145%/)).toBeDefined();
     });
     expect(screen.getByText(/2\.00? GiB/)).toBeDefined();
-    expect(screen.getByText(/1 Workers/)).toBeDefined();
+    expect(screen.getAllByText(/1 Workers/).length).toBeGreaterThan(0);
   });
 
   // I17: Dual progress bar DOM/CSS alignment

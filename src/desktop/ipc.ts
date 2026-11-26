@@ -5,6 +5,7 @@ import type { CopyCommandRequest, MonitorApi, OpenSshTerminalRequest } from '../
 import type { Registry, SaveRegistryOptions } from '../shared/contracts';
 import { MONITOR_API_KEYS } from '../shared/api';
 import { CHANNELS } from './channels';
+import { syncWindowTheme } from './window';
 import { discoverSshHosts, discoverWslDistros } from '../transport/discovery';
 import { buildHelperCommand, openLocalSshTerminal } from './notifications';
 import {
@@ -110,6 +111,7 @@ export function registerMonitorIpc(api: MonitorApi, windows?: { openGpuWindow: (
     [CHANNELS.savePrefs, async (event, arg) => {
       assertSender(event);
       const preferences = validatePreferences(await api.savePreferences(validatePreferences(arg)));
+      syncWindowTheme(preferences.theme);
       for (const window of BrowserWindow.getAllWindows()) {
         if (!window.isDestroyed()) window.webContents.send(CHANNELS.preferencesChanged, preferences);
       }

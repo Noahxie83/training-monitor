@@ -47,7 +47,7 @@ describe('host navigation and explicit connection', () => {
     fireEvent.click(await screen.findByRole('button', { name: '选择宿主 wsl-ubuntu' }));
     expect(screen.getByRole('button', { name: '选择宿主 wsl-ubuntu' }).getAttribute('aria-pressed')).toBe('true');
     expect(screen.getByRole('heading', { name: '暂无已登记任务' })).toBeDefined();
-    expect(screen.getByText(/为 wsl-ubuntu 添加任务/)).toBeDefined();
+    expect(screen.getByText(/为 wsl-ubuntu/)).toBeDefined();
     expect(screen.queryByRole('heading', { name: /Flow Matching/ })).toBeNull();
   });
 
@@ -55,7 +55,7 @@ describe('host navigation and explicit connection', () => {
     setup({ localTask: true });
     fireEvent.click(await screen.findByText('Reflow 2-rectified Flow'));
     await screen.findByRole('heading', { name: 'Reflow 2-rectified Flow' });
-    fireEvent.click(screen.getByRole('button', { name: '切换到 wsl-ubuntu' }));
+    fireEvent.click(screen.getByRole('button', { name: '选择宿主 wsl-ubuntu' }));
     await screen.findByRole('main', { name: '宿主首页' });
     expect(screen.queryByRole('heading', { name: '本地实验' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '查看 lab-campus' }));
@@ -89,7 +89,11 @@ describe('host navigation and explicit connection', () => {
         ? { ...host, connection: 'connected', freshness: 'fresh', scanComplete: true, observedAt: '2026-11-05T00:00:00Z', lastSuccessAt: '2026-11-05T00:00:00Z', errorCode: null } : host) } });
       finish();
     });
-    await waitFor(() => expect(within(panel).getByRole('status').textContent).toBe('已连接'));
+    await waitFor(() => {
+      // Once connected & healthy, inline alert strip auto-collapses and header shows 已连接
+      expect(screen.queryByRole('region', { name: 'wsl-ubuntu连接状态' })).toBeNull();
+      expect(screen.getByRole('button', { name: 'wsl-ubuntu 连接诊断' }).textContent).toContain('已连接');
+    });
     expect(screen.getByRole('button', { name: '选择宿主 wsl-ubuntu' }).getAttribute('aria-pressed')).toBe('true');
   });
 
@@ -119,6 +123,6 @@ describe('host navigation and explicit connection', () => {
     fireEvent.click(await screen.findByRole('button', { name: '选择宿主 wsl-ubuntu' }));
     fireEvent.click(screen.getByRole('button', { name: '添加第一个任务' }));
     const dialog = screen.getByRole('dialog', { name: '添加任务' });
-    expect((within(dialog).getByRole('combobox', { name: '宿主' }) as HTMLSelectElement).value).toBe('wsl-ubuntu');
+    expect((within(dialog).getByRole('combobox', { name: '所属宿主' }) as HTMLSelectElement).value).toBe('wsl-ubuntu');
   });
 });

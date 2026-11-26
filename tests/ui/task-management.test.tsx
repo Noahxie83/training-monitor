@@ -27,7 +27,7 @@ async function openMenu(label: string) {
 describe('main-page task management', () => {
   it('hides deleted cached tasks, remains empty after a late snapshot, and keeps the add entry on the main page', async () => {
     const { api, staleSnapshot } = setup(true);
-    await screen.findByRole('button', { name: '添加任务', exact: true });
+    await waitFor(() => expect(screen.getAllByRole('button', { name: '添加任务', exact: true }).length).toBeGreaterThan(0));
     expect(screen.getByRole('heading', { name: '暂无已登记任务' })).toBeDefined();
     expect(screen.queryByText('Flow Matching')).toBeNull();
     act(() => api.emitUpdate({ kind: 'snapshot', snapshot: staleSnapshot }));
@@ -39,10 +39,10 @@ describe('main-page task management', () => {
     const { save } = setup(true);
     fireEvent.click(await screen.findByRole('button', { name: '向 wsl-ubuntu 添加任务' }));
     const dialog = screen.getByRole('dialog', { name: '添加任务' });
-    expect((within(dialog).getByLabelText('宿主') as HTMLSelectElement).value).toBe('wsl-ubuntu');
+    expect((within(dialog).getByLabelText('所属宿主') as HTMLSelectElement).value).toBe('wsl-ubuntu');
     fireEvent.change(within(dialog).getByLabelText('任务 ID'), { target: { value: 'new-task' } });
     fireEvent.change(within(dialog).getByLabelText('任务名称'), { target: { value: '本地实验' } });
-    fireEvent.change(within(dialog).getByRole('textbox', { name: '算法名称（选填）' }), { target: { value: 'Transformer / 自定义算法' } });
+    fireEvent.change(within(dialog).getByRole('textbox', { name: '算法 / 模型名称（选填）' }), { target: { value: 'Transformer / 自定义算法' } });
     fireEvent.change(within(dialog).getByLabelText('工作目录'), { target: { value: '/home/user/run' } });
     fireEvent.change(within(dialog).getByLabelText('脚本入口'), { target: { value: 'train.py' } });
     fireEvent.change(within(dialog).getByLabelText('日志路径'), { target: { value: '/home/user/run/train.log' } });
@@ -50,7 +50,7 @@ describe('main-page task management', () => {
     await screen.findByRole('heading', { name: '本地实验' });
     expect(save).toHaveBeenCalledTimes(1);
     expect(save.mock.calls[0]![0].tasks[0]).toMatchObject({ taskId: 'new-task', label: '本地实验', hostId: 'wsl-ubuntu', algorithm: 'Transformer / 自定义算法', logFormat: 'generic' });
-    expect(screen.getByTitle('算法名称').textContent).toBe('Transformer / 自定义算法');
+    expect(screen.getByTitle('算法 / 模型').textContent).toBe('Transformer / 自定义算法');
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
@@ -60,7 +60,7 @@ describe('main-page task management', () => {
     fireEvent.click(screen.getByRole('menuitem', { name: '编辑任务' }));
     const dialog = screen.getByRole('dialog', { name: '编辑任务' });
     expect((within(dialog).getByLabelText('任务 ID') as HTMLInputElement).disabled).toBe(true);
-    expect((within(dialog).getByRole('textbox', { name: '算法名称（选填）' }) as HTMLInputElement).value).toBe('Flow Matching');
+    expect((within(dialog).getByRole('textbox', { name: '算法 / 模型名称（选填）' }) as HTMLInputElement).value).toBe('Flow Matching');
     expect((within(dialog).getByLabelText('日志识别') as HTMLSelectElement).value).toBe('flow');
     fireEvent.change(within(dialog).getByLabelText('任务名称'), { target: { value: '修改名称' } });
     fireEvent.click(within(dialog).getByRole('button', { name: '保存更改' }));
@@ -90,7 +90,8 @@ describe('main-page task management', () => {
 
   it('keeps form input on a save conflict and permits cancel without saving', async () => {
     const { save } = setup(true);
-    fireEvent.click(await screen.findByRole('button', { name: '添加任务', exact: true }));
+    await waitFor(() => expect(screen.getAllByRole('button', { name: '添加任务', exact: true }).length).toBeGreaterThan(0));
+    fireEvent.click(screen.getAllByRole('button', { name: '添加任务', exact: true })[0]!);
     const dialog = screen.getByRole('dialog', { name: '添加任务' });
     const fill = (name: string, value: string) => fireEvent.change(within(dialog).getByLabelText(name), { target: { value } });
     fill('任务 ID', 'conflict-task'); fill('工作目录', '/data2/cy/xzn/run'); fill('脚本入口', 'train.py'); fill('日志路径', '/data2/cy/xzn/run/train.log');
@@ -108,7 +109,8 @@ describe('main-page task management', () => {
     setup();
     fireEvent.click(await screen.findByRole('button', { name: '系统设置' }));
     const dialog = screen.getByRole('dialog', { name: '系统设置' });
-    expect(within(dialog).getByText('外观')).toBeDefined();
+    expect(within(dialog).getByRole('tab', { name: '外观与语言' })).toBeDefined();
+    fireEvent.click(within(dialog).getByRole('tab', { name: '宿主管理' }));
     expect(within(dialog).getByRole('button', { name: '+ 添加宿主' })).toBeDefined();
     expect(within(dialog).queryByText(/任务配置/)).toBeNull();
     expect(within(dialog).queryByRole('button', { name: /添加任务/ })).toBeNull();

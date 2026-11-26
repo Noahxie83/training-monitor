@@ -10,7 +10,7 @@ import type { Preferences } from '../shared/contracts';
 import { createRegistryStore } from '../registry/config';
 import { openStore } from '../store/client';
 import { createTransport, HostSessionPool } from '../transport/transport';
-import { createGpuWindowManager, createWindow } from './window';
+import { createGpuWindowManager, createWindow, syncWindowTheme } from './window';
 import { registerMonitorIpc } from './ipc';
 import { runStoreCanary } from './runtime-canary';
 import { CHANNELS } from './channels';
@@ -112,9 +112,11 @@ if (gotLock) {
         return;
       }
     }
+    const initialPrefs = await api.getPreferences().catch((): Preferences => ({ theme: 'system' }));
+    syncWindowTheme(initialPrefs.theme);
     const gpuWindows = createGpuWindowManager();
     disposeIpc = registerMonitorIpc(api, { openGpuWindow: (hostId) => gpuWindows.open(hostId) });
-    mainWindow = createWindow();
+    mainWindow = createWindow(initialPrefs.theme);
     mainWindow.on('closed', () => { mainWindow = null; app.quit(); });
   });
 }

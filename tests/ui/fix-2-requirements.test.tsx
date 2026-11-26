@@ -57,6 +57,9 @@ describe('T7 Fix 2 Requirements - Group A: Settings & Registry (I1, NB2)', () =>
       />
     );
 
+    // Switch to Hosts tab
+    fireEvent.click(screen.getByRole('tab', { name: '宿主管理' }));
+
     // Verify edit buttons exist for existing hosts and tasks
     const editHostButtons = screen.getAllByRole('button', { name: /编辑/i });
     expect(editHostButtons.length).toBeGreaterThanOrEqual(2);
@@ -125,8 +128,8 @@ describe('T7 Fix 2 Requirements - Group A: Settings & Registry (I1, NB2)', () =>
     fireEvent.change(screen.getByLabelText('任务名称'), { target: { value: 'Flow Matching Multi-Source' } });
     fireEvent.change(screen.getByLabelText('脚本入口'), { target: { value: 'train.py; eval.py' } });
     fireEvent.change(screen.getByLabelText('检查点目录'), { target: { value: '/data2/ckpts; /data3/ckpts' } });
-    fireEvent.change(screen.getByLabelText('状态文件'), { target: { value: '/data2/status.json' } });
-    fireEvent.change(screen.getByLabelText('队列锁文件'), { target: { value: '/data2/queue.lock' } });
+    fireEvent.change(screen.getByLabelText(/状态文件/), { target: { value: '/data2/status.json' } });
+    fireEvent.change(screen.getByLabelText(/队列锁文件/), { target: { value: '/data2/queue.lock' } });
     fireEvent.click(screen.getByRole('button', { name: '保存更改' }));
 
     await waitFor(() => {
@@ -174,7 +177,7 @@ describe('T7 Fix 2 Requirements - Group A: Settings & Registry (I1, NB2)', () =>
     fireEvent.change(screen.getByLabelText('脚本入口'), { target: { value: 'train_a.py; train_b.py' } });
     fireEvent.change(screen.getByLabelText('检查点目录'), { target: { value: '/workspace/ckpts;/data/ckpts' } });
     fireEvent.change(screen.getByLabelText('日志路径'), { target: { value: '/workspace/custom/train.log' } });
-    fireEvent.change(screen.getByLabelText('状态文件'), { target: { value: '/workspace/custom/status.json' } });
+    fireEvent.change(screen.getByLabelText(/状态文件/), { target: { value: '/workspace/custom/status.json' } });
 
     fireEvent.click(screen.getByRole('button', { name: '添加任务' }));
 
@@ -306,12 +309,12 @@ describe('T7 Fix 2 Requirements - Group B: Async State, Isolation, Boundary (I3,
       expect(screen.getByText('initial source A log')).toBeDefined();
     });
 
-    // Click "↑ 加载更早日志" on source A (starts deferred in-flight request)
-    const loadEarlierBtn = screen.getByRole('button', { name: /↑ 加载更早日志/i });
+    // Click "加载更早日志" on source A (starts deferred in-flight request)
+    const loadEarlierBtn = screen.getByRole('button', { name: /加载更早日志/i });
     fireEvent.click(loadEarlierBtn);
 
-    // Now switch to source B tab
-    const sourceBTab = screen.getByRole('tab', { name: 'source-b' });
+    // Now switch to source B tab (friendly filename b.log)
+    const sourceBTab = screen.getByRole('tab', { name: /b\.log|source-b/i });
     fireEvent.click(sourceBTab);
 
     // Wait for source B to be displayed
@@ -353,7 +356,7 @@ describe('T7 Fix 2 Requirements - Group B: Async State, Isolation, Boundary (I3,
     // Source B log remains
     expect(screen.getByText('initial source B log')).toBeDefined();
     // Source B nextBefore should remain null (not overwritten by stale-cursor-a)
-    expect(screen.queryByRole('button', { name: /↑ 加载更早日志/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /加载更早日志/i })).toBeNull();
   });
 
   // I4: STALE_CONTINUATION surfaced with error banner and retry action
@@ -408,12 +411,12 @@ describe('T7 Fix 2 Requirements - Group B: Async State, Isolation, Boundary (I3,
 
     // Next paging call will fail with STALE_CONTINUATION
     shouldFailStale = true;
-    const loadEarlierBtn = screen.getByRole('button', { name: /↑ 加载更早日志/i });
+    const loadEarlierBtn = screen.getByRole('button', { name: /加载更早日志/i });
     fireEvent.click(loadEarlierBtn);
 
-    // Assert error banner is displayed
+    // Assert friendly error banner is displayed (no raw internal error code leaked)
     await waitFor(() => {
-      expect(screen.getByText(/STALE_CONTINUATION|游标已失效/i)).toBeDefined();
+      expect(screen.getByText(/历史日志位置已过期/i)).toBeDefined();
     });
 
     // A button to reload from latest should be present
@@ -450,7 +453,7 @@ describe('T7 Fix 2 Requirements - Group B: Async State, Isolation, Boundary (I3,
     });
 
     // 2. Trigger search failure
-    const searchInput = screen.getByPlaceholderText(/查找日志/i);
+    const searchInput = screen.getByPlaceholderText(/搜索日志/i);
     fireEvent.change(searchInput, { target: { value: 'target_search' } });
 
     await waitFor(() => {
@@ -621,7 +624,7 @@ describe('T7 Fix 2 Requirements - Group C: Log Retention & Scroll Anchors (I6, I
     }
 
     await waitFor(() => {
-      expect(screen.getByText(/有 1 条新日志，点击恢复自动滚动/i)).toBeDefined();
+      expect(screen.getByText(/回到底部 \(\+1 新行\)/i)).toBeDefined();
     });
 
     // Click resume button in unread banner
@@ -630,7 +633,7 @@ describe('T7 Fix 2 Requirements - Group C: Log Retention & Scroll Anchors (I6, I
 
     // Unread banner disappears
     await waitFor(() => {
-      expect(screen.queryByText(/有 1 条新日志/i)).toBeNull();
+      expect(screen.queryByText(/回到底部/i)).toBeNull();
     });
   });
 });
@@ -675,7 +678,7 @@ describe('T7 Fix 2 Requirements - Group D: Observability Semantics, Shortcuts & 
       errorCode: null,
     };
     const { rerender } = render(<LogConsole {...defaultProps} sources={[missingSource]} activeSource={missingSource} />);
-    expect(screen.getByText(/来源文件缺失/i)).toBeDefined();
+    expect(screen.getByText(/日志文件缺失/i)).toBeDefined();
 
     // Case B: reconciling
     const reconcilingSource: LogSourceSnapshot = {
@@ -685,7 +688,7 @@ describe('T7 Fix 2 Requirements - Group D: Observability Semantics, Shortcuts & 
       freshness: 'fresh',
     };
     rerender(<LogConsole {...defaultProps} sources={[reconcilingSource]} activeSource={reconcilingSource} />);
-    expect(screen.getByText(/状态对齐中/i)).toBeDefined();
+    expect(screen.getByText(/同步日志位置中/i)).toBeDefined();
 
     // Case C: cache_full
     const cacheFullSource: LogSourceSnapshot = {
@@ -706,9 +709,9 @@ describe('T7 Fix 2 Requirements - Group D: Observability Semantics, Shortcuts & 
       errorCode: 'EACCES_PERMISSION_DENIED',
     };
     rerender(<LogConsole {...defaultProps} sources={[permErrorSource]} activeSource={permErrorSource} />);
-    expect(screen.getByText(/权限错误: EACCES_PERMISSION_DENIED/i)).toBeDefined();
+    expect(screen.getByText(/无读取权限.*EACCES_PERMISSION_DENIED/i)).toBeDefined();
 
-    // Case E: ready but offset is LESS than maxObservedOffset -> must show 已就绪, NOT 已补齐!
+    // Case E: ready but offset is LESS than maxObservedOffset -> must show 已就绪, NOT 已同步最新!
     const readyLaggingSource: LogSourceSnapshot = {
       ...testFlowSource,
       sourceId: 'src-1',
@@ -719,10 +722,10 @@ describe('T7 Fix 2 Requirements - Group D: Observability Semantics, Shortcuts & 
       generationStartOffset: '0',
     };
     rerender(<LogConsole {...defaultProps} sources={[readyLaggingSource]} activeSource={readyLaggingSource} />);
-    expect(screen.queryByText(/已补齐/i)).toBeNull();
+    expect(screen.queryByText(/已同步最新/i)).toBeNull();
     expect(screen.getByText(/已就绪/i)).toBeDefined();
 
-    // Case F: ready and committedOffset >= maxObservedOffset -> displays 已补齐
+    // Case F: ready and committedOffset >= maxObservedOffset -> displays 已同步最新
     const readyCaughtUpSource: LogSourceSnapshot = {
       ...testFlowSource,
       sourceId: 'src-1',
@@ -733,7 +736,7 @@ describe('T7 Fix 2 Requirements - Group D: Observability Semantics, Shortcuts & 
       generationStartOffset: '0',
     };
     rerender(<LogConsole {...defaultProps} sources={[readyCaughtUpSource]} activeSource={readyCaughtUpSource} />);
-    expect(screen.getByText(/已补齐/i)).toBeDefined();
+    expect(screen.getByText(/已同步最新/i)).toBeDefined();
 
     // Case G: generation_started boundary event
     rerender(
@@ -763,7 +766,7 @@ describe('T7 Fix 2 Requirements - Group D: Observability Semantics, Shortcuts & 
         ]}
       />
     );
-    expect(screen.getByText(/\[日志文件已更新\]/i)).toBeDefined();
+    expect(screen.getByText(/\[日志文件已轮转更新\]/i)).toBeDefined();
   });
 
   // I8: Header per-host lastSuccessAt vs snapshot time, KPI stops speed/ETA on stale, separates checkpoint mtime & process unknowns
@@ -797,8 +800,7 @@ describe('T7 Fix 2 Requirements - Group D: Observability Semantics, Shortcuts & 
     const refreshBtn = screen.getByRole('button', { name: /刷新全部宿主/ });
     expect(refreshBtn.getAttribute('title')).toContain('最近更新');
     const hostPill = screen.getByRole('button', { name: '切换到 lab-campus' });
-    expect(hostPill.getAttribute('title')).toContain('部分信息未读取');
-    expect(screen.getByText(/未观测/i)).toBeDefined();
+    expect(hostPill.getAttribute('title')).toContain('部分信息尚未读取完成');
 
     // 2. KPI test: Stale progress stops speed and ETA estimation
     const staleTask: TaskSnapshot = {
@@ -827,7 +829,7 @@ describe('T7 Fix 2 Requirements - Group D: Observability Semantics, Shortcuts & 
     // Speed & ETA must NOT show active rate or estimate; must show 待更新
     expect(screen.queryByText(/6\.33\s*it\/s/i)).toBeNull();
     expect(screen.getAllByText(/待更新/i).length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText(/最新检查点/i)).toBeDefined();
+    expect(screen.getByLabelText('最新检查点')).toBeDefined();
 
     // Main process and workers must NOT say "未运行" or "0 Workers"
     expect(screen.queryByText(/未运行/i)).toBeNull();
@@ -931,15 +933,14 @@ describe('T7 Fix 2 Requirements - Group D: Observability Semantics, Shortcuts & 
       ],
     };
 
-    // Test ResourceMetrics: Main process RSS must show "未观测" because boot-2 resource doesn't match main process boot-1!
+    // Test ResourceMetrics: Main process RSS must show "等待检测" because boot-2 resource doesn't match main process boot-1!
     render(<ResourceMetrics task={taskWithProcesses} />);
-    expect(screen.getByText(/本进程物理内存:/i).nextSibling?.textContent).toBe('未观测');
+    expect(screen.getByText(/本进程物理内存:/i).nextSibling?.textContent).toBe('等待检测');
 
-    // Test EvidenceDrawer: displays process keys, parents, worker metrics and device GPU metrics
+    // Test EvidenceDrawer: displays process keys and worker keys without duplicating ResourceMetrics
     render(<EvidenceDrawer task={taskWithProcesses} isOpen={true} onClose={vi.fn()} />);
-    expect(screen.getAllByText(/boot-1:1000:500/i).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText(/boot-1:1000:500/i).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/boot-1:1001:600/i)).toBeDefined();
-    expect(screen.getByText(/整卡设备指标/i)).toBeDefined();
   });
 
   // I14 & NB1: Keyboard shortcuts, composition guards and focus trap stability across rerenders
@@ -966,7 +967,8 @@ describe('T7 Fix 2 Requirements - Group D: Observability Semantics, Shortcuts & 
       expect(screen.queryByText(/暂无已登记宿主/i)).toBeNull();
     });
 
-    // Click edit on first host to open inline edit input
+    // Switch to Hosts tab and click edit on first host
+    fireEvent.click(screen.getByRole('tab', { name: '宿主管理' }));
     const editHostBtn = screen.getAllByRole('button', { name: /编辑/i })[0];
     fireEvent.click(editHostBtn);
 

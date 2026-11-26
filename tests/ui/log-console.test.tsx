@@ -384,7 +384,7 @@ describe('Log Console (Virtualization & Controls)', () => {
 
     // Floating unread banner appears
     await waitFor(() => {
-      expect(screen.getByText(/有 3 条新日志/)).toBeDefined();
+      expect(screen.getByText(/回到底部 \(\+3 新行\)/)).toBeDefined();
     });
 
     // Click resume button in the floating banner
@@ -392,7 +392,7 @@ describe('Log Console (Virtualization & Controls)', () => {
     fireEvent.click(resumeButton);
 
     await waitFor(() => {
-      expect(screen.queryByText(/有 3 条新日志/)).toBeNull();
+      expect(screen.queryByText(/回到底部/)).toBeNull();
     });
   });
 
@@ -405,12 +405,12 @@ describe('Log Console (Virtualization & Controls)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByPlaceholderText(/查找日志 \(Ctrl\+F\)/)).toBeDefined();
+      expect(screen.getByPlaceholderText(/搜索日志 \(Ctrl\+F\)/)).toBeDefined();
     });
 
     expect(screen.getByTitle('搜索已下载的日志')).toBeDefined();
 
-    const searchInput = screen.getByPlaceholderText(/查找日志 \(Ctrl\+F\)/);
+    const searchInput = screen.getByPlaceholderText(/搜索日志 \(Ctrl\+F\)/);
     fireEvent.change(searchInput, { target: { value: 'error' } });
 
     // Switch task

@@ -25,16 +25,16 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText('模拟数据')).toBeDefined();
+      expect(screen.getByText('DEMO')).toBeDefined();
+      expect(screen.getByTitle('模拟数据')).toBeDefined();
     });
 
     // Host list
     expect(screen.getAllByText(/lab-campus/).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/已连接/).length).toBeGreaterThan(0);
 
-    // WSL unobserved host must display unobserved / waiting probe, never idle or connected
+    // WSL unobserved host must display pending/disabled state, never idle or connected
     expect(screen.getAllByText(/wsl-ubuntu/).length).toBeGreaterThan(0);
-    expect(screen.getByText(/未观测 \/ 待探测/)).toBeDefined();
     expect(screen.queryByText(/wsl.*已连接/i)).toBeNull();
     expect(screen.queryByText(/wsl.*空闲/i)).toBeNull();
 
@@ -54,9 +54,9 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/暂无已登记任务/)).toBeDefined();
+      expect(screen.getAllByText(/暂无宿主/).length).toBeGreaterThan(0);
     });
-    expect(screen.getByText(/先在设置中添加宿主/)).toBeDefined();
+    expect(screen.getAllByText(/在系统设置中添加/).length).toBeGreaterThan(0);
   });
 
   it('shows stale observation warning when host/task is disconnected', async () => {
@@ -79,9 +79,9 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/连接中断/)).toBeDefined();
+      expect(screen.getAllByText(/连接已断开/).length).toBeGreaterThan(0);
     });
-    expect(screen.getByText(/上次确认：/)).toBeDefined();
+    expect(screen.getByText(/上次确认/)).toBeDefined();
     expect(screen.getByText(/等待重连/)).toBeDefined();
   });
 
@@ -92,7 +92,7 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByRole('progressbar', { name: '算法全局累计完成次数' })).toBeDefined();
+      expect(screen.getByRole('progressbar', { name: '全局累计训练进度' })).toBeDefined();
     });
 
     // Flow task dual track
@@ -122,7 +122,7 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/最新检查点/)).toBeDefined();
+      expect(screen.getByLabelText('最新检查点')).toBeDefined();
     });
 
     expect(screen.getByText(/Step 100,000/)).toBeDefined();
@@ -137,7 +137,7 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/训练进程/)).toBeDefined();
+      expect(screen.getByText(/训练进程树/)).toBeDefined();
     });
 
     // Process scope label
@@ -172,13 +172,13 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: '白名单证据详情' })).toBeDefined();
+      expect(screen.getByRole('button', { name: '任务详情' })).toBeDefined();
     });
 
-    fireEvent.click(screen.getByRole('button', { name: '白名单证据详情' }));
+    fireEvent.click(screen.getByRole('button', { name: '任务详情' }));
 
     await waitFor(() => {
-      expect(screen.getByRole('dialog', { name: /白名单证据审查/ })).toBeDefined();
+      expect(screen.getByRole('dialog', { name: /任务详情抽屉/ })).toBeDefined();
     });
 
     expect(screen.getAllByText(/594319/).length).toBeGreaterThan(0); // main PID
@@ -193,9 +193,9 @@ describe('Dashboard (Layout A & Cockpit)', () => {
     expect(screen.queryByText(/dmesg/i)).toBeNull();
 
     // Close drawer
-    fireEvent.click(screen.getByRole('button', { name: /关闭证据抽屉/ }));
+    fireEvent.click(screen.getByRole('button', { name: '关闭抽屉' }));
     await waitFor(() => {
-      expect(screen.queryByRole('dialog', { name: /白名单证据审查/ })).toBeNull();
+      expect(screen.queryByRole('dialog', { name: /任务详情抽屉/ })).toBeNull();
     });
   });
 

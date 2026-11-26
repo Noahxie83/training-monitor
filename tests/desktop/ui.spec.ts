@@ -1,7 +1,7 @@
 import { _electron as electron, expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import path from 'node:path';
-import { mkdtemp, rm, copyFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, copyFile } from 'node:fs/promises';
 import { build } from 'esbuild';
 import os from 'node:os';
 
@@ -31,72 +31,62 @@ test('renders Layout A at 1200x800 in dark mode and captures screenshot', async 
   await page.setViewportSize({ width: 1200, height: 800 });
 
   // Select dark mode explicitly for dark theme screenshot
-  await page.getByRole('button', { name: '⚙ 设置 / 登记' }).click();
-  await page.getByLabel(/深色模式 \(dark\)/).click();
+  await page.getByRole('button', { name: '系统设置' }).click();
+  await page.getByRole('radio', { name: '深色' }).click();
   await expect(page.locator('.app-shell')).toHaveAttribute('data-theme', 'dark');
   await page.getByRole('button', { name: '关闭设置' }).click();
 
   // Verify header and demo badge
-  await expect(page.getByText('模拟数据')).toBeVisible();
-  await expect(page.getByText('LOCAL READ ONLY')).toBeVisible();
-
-  // Verify host statuses: unobserved WSL instance in demo
-  await expect(page.getByText('未观测 / 待探测')).toBeVisible();
+  await expect(page.getByText('DEMO', { exact: true })).toBeVisible();
+  await expect(page.getByTitle('模拟数据')).toBeVisible();
 
   // Verify initial task cockpit
   await expect(page.getByRole('heading', { name: 'demo-task' })).toBeVisible();
-  await expect(page.getByText('算法全局累计完成次数:')).toBeVisible();
-  await expect(page.getByText('本段续训实际完成次数:')).toBeVisible();
+  await expect(page.getByText('累计进度')).toBeVisible();
 
-  // Verify DualProgressBar geometry (I17)
+  // Verify progress bar geometry (I17)
   const rails = page.locator('.progress-bar-rail');
   await expect(rails.first()).toBeVisible();
   const railBox = await rails.first().boundingBox();
   expect(railBox).not.toBeNull();
-  expect(railBox!.height).toBeGreaterThanOrEqual(8);
+  expect(railBox!.height).toBeGreaterThanOrEqual(6);
   expect(railBox!.width).toBeGreaterThan(100);
 
   const fillGlobal = page.locator('.progress-fill-global');
-  const fillSession = page.locator('.progress-fill-session');
   await expect(fillGlobal).toBeAttached();
-  await expect(fillSession).toBeAttached();
 
   // Boundary verification for unknown/null fraction: renders 0% and .fill-empty (I6, I15)
   await expect(fillGlobal).toHaveClass(/fill-empty/);
-  await expect(fillSession).toHaveClass(/fill-empty/);
   const globalStyleWidth = await fillGlobal.evaluate((el) => el.style.width);
-  const sessionStyleWidth = await fillSession.evaluate((el) => el.style.width);
   expect(globalStyleWidth).toBe('0%');
-  expect(sessionStyleWidth).toBe('0%');
 
-  // Verify Checkpoint & Resource cards
-  await expect(page.getByText('最新检查点文件')).toBeVisible();
-  await expect(page.getByText(/待探测 \(部分扫描待确认\)|未发现检查点文件/)).toBeVisible();
-  await expect(page.getByText('资源观测分项')).toBeVisible();
+  // Verify Checkpoint & Resource panels
+  await expect(page.getByLabel('最新检查点')).toBeVisible();
+  await expect(page.getByRole('region', { name: '当前任务 GPU' })).toBeVisible();
 
   // Capture 1200x800 dark screenshot
-  const darkScreenshotPath = path.resolve('docs/reviews/screenshots/1200x800-dark.png');
+  const darkScreenshotPath = path.resolve('test-results/ui-1200x800-dark.png');
   await page.screenshot({ path: darkScreenshotPath });
   expect(darkScreenshotPath).toBeTruthy();
 });
 
 test('toggles light mode via settings modal and captures 1200x800 light screenshot', async () => {
   // Open settings
-  await page.getByRole('button', { name: '⚙ 设置 / 登记' }).click();
-  await expect(page.getByRole('heading', { name: '系统偏好与任务登记' })).toBeVisible();
+  await page.getByRole('button', { name: '系统设置' }).click();
+  await expect(page.getByRole('heading', { name: '系统设置' })).toBeVisible();
 
   // Switch to light theme
-  await page.getByLabel(/浅色模式 \(light\)/).click();
+  await page.getByRole('radio', { name: '浅色' }).click();
 
   // Verify app-shell theme data attribute changed
   await expect(page.locator('.app-shell')).toHaveAttribute('data-theme', 'light');
 
   // Close settings
   await page.getByRole('button', { name: '关闭设置' }).click();
-  await expect(page.getByRole('heading', { name: '系统偏好与任务登记' })).not.toBeVisible();
+  await expect(page.getByRole('heading', { name: '系统设置' })).not.toBeVisible();
 
   // Capture 1200x800 light screenshot
-  const lightScreenshotPath = path.resolve('docs/reviews/screenshots/1200x800-light.png');
+  const lightScreenshotPath = path.resolve('test-results/ui-1200x800-light.png');
   await page.screenshot({ path: lightScreenshotPath });
   expect(lightScreenshotPath).toBeTruthy();
 });
@@ -123,18 +113,18 @@ test('adapts to small window 960x650 and captures both theme screenshots', async
   expect(footerBox!.y + footerBox!.height).toBeLessThanOrEqual(650);
 
   // Still in light mode from previous test, capture 960x650 light screenshot
-  const lightSmallPath = path.resolve('docs/reviews/screenshots/960x650-light.png');
+  const lightSmallPath = path.resolve('test-results/ui-960x650-light.png');
   await page.screenshot({ path: lightSmallPath });
   expect(lightSmallPath).toBeTruthy();
 
   // Switch back to dark mode
-  await page.getByRole('button', { name: '⚙ 设置 / 登记' }).click();
-  await page.getByLabel(/深色模式 \(dark\)/).click();
+  await page.getByRole('button', { name: '系统设置' }).click();
+  await page.getByRole('radio', { name: '深色' }).click();
   await expect(page.locator('.app-shell')).toHaveAttribute('data-theme', 'dark');
   await page.getByRole('button', { name: '关闭设置' }).click();
 
   // Capture 960x650 dark screenshot
-  const darkSmallPath = path.resolve('docs/reviews/screenshots/960x650-dark.png');
+  const darkSmallPath = path.resolve('test-results/ui-960x650-dark.png');
   await page.screenshot({ path: darkSmallPath });
   expect(darkSmallPath).toBeTruthy();
 });
@@ -149,13 +139,13 @@ test('verifies keyboard navigation: Ctrl+1, Ctrl+F, Esc and Space isolation', as
 
   // Ctrl+F focuses search input
   await page.keyboard.press('Control+f');
-  const searchInput = page.getByPlaceholder(/查找日志 \(Ctrl\+F\)/);
+  const searchInput = page.getByPlaceholder(/搜索日志 \(Ctrl\+F\)/);
   await expect(searchInput).toBeFocused();
 
   // Space key isolation inside search input (I14): types space, does NOT toggle scroll lock
   await page.keyboard.type('loss eval');
   await expect(searchInput).toHaveValue('loss eval');
-  await expect(page.getByRole('button', { name: '⏸ 锁定自动滚动' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '锁定自动滚动' })).toBeVisible();
 
   // Esc clears search input (I2, I14)
   await page.keyboard.press('Escape');
@@ -166,16 +156,16 @@ test('verifies keyboard navigation: Ctrl+1, Ctrl+F, Esc and Space isolation', as
   await wrapBtn.focus();
   await page.keyboard.press('Space');
   await expect(page.getByRole('button', { name: '不换行' })).toBeVisible();
-  await expect(page.getByRole('button', { name: '⏸ 锁定自动滚动' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '锁定自动滚动' })).toBeVisible();
   // Toggle back
   await page.keyboard.press('Space');
   await expect(page.getByRole('button', { name: '换行' })).toBeVisible();
 
-  // Open evidence drawer, focus trap, and Escape to close (I14)
-  await page.getByRole('button', { name: /证据详情/ }).click();
-  await expect(page.getByRole('heading', { name: '白名单证据审查' })).toBeVisible();
+  // Open details drawer, focus trap, and Escape to close (I14)
+  await page.getByRole('button', { name: '任务详情' }).click();
+  await expect(page.getByRole('heading', { name: '任务技术详情' })).toBeVisible();
   await page.keyboard.press('Escape');
-  await expect(page.getByRole('heading', { name: '白名单证据审查' })).not.toBeVisible();
+  await expect(page.getByRole('heading', { name: '任务技术详情' })).not.toBeVisible();
 });
 
 test('copies registered path with visual feedback in real Electron window', async () => {
@@ -242,13 +232,13 @@ test('verifies virtualized log console, scroll lock and unread banner in real El
     el.scrollTop = 20;
     el.dispatchEvent(new Event('scroll'));
   });
-  await expect(page.getByRole('button', { name: '▶ 恢复自动滚动' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '恢复自动滚动' })).toBeVisible();
 
   // 3. While locked, refresh/redraw arrives; verify real floating unread banner appears (I6, I15)
   await page.getByRole('button', { name: '刷新全部宿主与任务数据 (Ctrl+R)' }).click();
   const banner = page.locator('.log-unread-floating-banner');
   await expect(banner).toBeVisible();
-  await expect(banner).toContainText(/条新日志/);
+  await expect(banner).toContainText(/新行/);
 
   // Assert floating unread banner geometry & positioning (I6, I15):
   // - Real CSS position is 'absolute'
@@ -265,7 +255,7 @@ test('verifies virtualized log console, scroll lock and unread banner in real El
   const resumeInBanner = banner.locator('button');
   await resumeInBanner.click();
   await expect(banner).toBeHidden();
-  await expect(page.getByRole('button', { name: '⏸ 锁定自动滚动' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '锁定自动滚动' })).toBeVisible();
 
   const resumedScroll = await logViewport.evaluate((el) => ({
     scrollTop: el.scrollTop,
@@ -279,7 +269,7 @@ test('verifies virtualized log console, scroll lock and unread banner in real El
     el.scrollTop = 50;
     el.dispatchEvent(new Event('scroll'));
   });
-  await expect(page.getByRole('button', { name: '▶ 恢复自动滚动' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '恢复自动滚动' })).toBeVisible();
 
   await logViewport.evaluate((el) => {
     const textNode = el.querySelector('.log-event-row .log-col-text')?.firstChild;
@@ -295,23 +285,23 @@ test('verifies virtualized log console, scroll lock and unread banner in real El
       document.dispatchEvent(new Event('selectionchange'));
     }
   });
-  await expect(page.getByRole('button', { name: '▶ 恢复自动滚动' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '恢复自动滚动' })).toBeVisible();
 
   await logViewport.evaluate(() => {
     window.getSelection()?.removeAllRanges();
     document.dispatchEvent(new Event('selectionchange'));
   });
-  await expect(page.getByRole('button', { name: '▶ 恢复自动滚动' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '恢复自动滚动' })).toBeVisible();
 
-  await page.getByRole('button', { name: '▶ 恢复自动滚动' }).click();
-  await expect(page.getByRole('button', { name: '⏸ 锁定自动滚动' })).toBeVisible();
+  await page.getByRole('button', { name: '恢复自动滚动' }).click();
+  await expect(page.getByRole('button', { name: '锁定自动滚动' })).toBeVisible();
 
   // 6. Keyboard Space toggling when focused
   await logViewport.focus();
   await page.keyboard.press('Space');
-  await expect(page.getByRole('button', { name: '▶ 恢复自动滚动' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '恢复自动滚动' })).toBeVisible();
   await page.keyboard.press('Space');
-  await expect(page.getByRole('button', { name: '⏸ 锁定自动滚动' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '锁定自动滚动' })).toBeVisible();
 
   // 7. Line wrapping toggle
   const initialWrap = await page.locator('.log-viewport').evaluate((el) => el.classList.contains('wrap-lines') && !el.classList.contains('nowrap-lines'));
@@ -330,7 +320,7 @@ test('verifies virtualized log console, scroll lock and unread banner in real El
 
 test('NB6/I14: production settings and drawer restore opener after Escape and close; inert isolates focus and snapshots retain focus', async()=>{
   for (const kind of ['settings','drawer']) {
-    const opener=kind==='settings'?page.getByRole('button',{name:'⚙ 设置 / 登记'}):page.getByRole('button',{name:/证据详情/});
+    const opener=kind==='settings'?page.getByRole('button',{name:'系统设置'}):page.getByRole('button',{name:'任务详情'});
     const close=kind==='settings'?'关闭设置':'关闭抽屉';
     for (const mode of ['escape','button']) {
       await opener.focus();await opener.click();const dialog=page.getByRole('dialog');await expect(dialog).toBeVisible();
@@ -353,8 +343,10 @@ test.describe('isolated simulated renderer fixture geometry',()=>{
   let fixturePage:Page;
   let fixtureDirectory:string;
   test.beforeAll(async()=>{
-    fixtureDirectory=await mkdtemp(path.resolve('.superpowers/sdd/2026-10-18-training-monitor-implementation/task-7-fix-4-fixture-'));
-    await build({entryPoints:[path.resolve('tests/ui/electron-fixture.tsx')],bundle:true,outfile:path.join(fixtureDirectory,'fixture.js'),platform:'browser',format:'iife',define:{'process.env.NODE_ENV':'"production"'}});
+    const baseDir=path.resolve('.superpowers/sdd/2026-10-18-training-monitor-implementation');
+    await mkdir(baseDir,{recursive:true});
+    fixtureDirectory=await mkdtemp(path.join(baseDir,'task-7-fix-4-fixture-'));
+    await build({entryPoints:[path.resolve('tests/ui/electron-fixture.tsx')],bundle:true,outfile:path.join(fixtureDirectory,'fixture.js'),platform:'browser',format:'iife',loader:{'.woff2':'file'},define:{'process.env.NODE_ENV':'"production"'}});
     await copyFile(path.resolve('tests/ui/electron-fixture.html'),path.join(fixtureDirectory,'index.html'));
   });
   test.beforeEach(async()=>{
@@ -368,7 +360,7 @@ test.describe('isolated simulated renderer fixture geometry',()=>{
     fixturePage=await created;await fixturePage.getByText('SIMULATED fixture log 499 training progress',{exact:true}).waitFor();
   });
   test.afterEach(async()=>{await fixturePage.close();});
-  test.afterAll(async()=>{const root=path.resolve('.superpowers/sdd/2026-10-18-training-monitor-implementation')+path.sep;if(!fixtureDirectory.startsWith(root))throw new Error('Fixture cleanup escaped coordination directory');await rm(fixtureDirectory,{recursive:true,force:true});});
+  test.afterAll(async()=>{if(!fixtureDirectory)return;const root=path.resolve('.superpowers/sdd/2026-10-18-training-monitor-implementation')+path.sep;if(!fixtureDirectory.startsWith(root))throw new Error('Fixture cleanup escaped coordination directory');await rm(fixtureDirectory,{recursive:true,force:true});});
 
   async function command(name:string,...args:unknown[]){await fixturePage.evaluate(({name,args})=>(window as any).simulatedRendererFixture[name](...args),{name,args});}
   async function bottom(){const v=fixturePage.locator('.log-viewport');await expect.poll(()=>v.evaluate(el=>Math.abs(el.scrollHeight-el.clientHeight-el.scrollTop))).toBeLessThan(5);}
@@ -387,7 +379,7 @@ test.describe('isolated simulated renderer fixture geometry',()=>{
       const box=el.getBoundingClientRect();const row=Array.from(el.querySelectorAll('.log-event-row')).find(row=>row.getBoundingClientRect().bottom>box.top+2);const text=row?.querySelector('.log-col-text')?.firstChild;
       if(!text)throw new Error('Expected visible selected production text');const range=document.createRange();range.setStart(text,0);range.setEnd(text,9);const selection=window.getSelection();if(!selection)throw new Error('No selection');selection.removeAllRanges();selection.addRange(range);if(selection.toString().length!==9)throw new Error('Selection failed');document.dispatchEvent(new Event('selectionchange'));
     });
-    await expect(fixturePage.getByRole('button',{name:'▶ 恢复自动滚动',exact:true}).first()).toBeVisible();const selectedAnchor=await anchor();
+    await expect(fixturePage.getByRole('button',{name:'恢复自动滚动',exact:true}).first()).toBeVisible();const selectedAnchor=await anchor();
     console.log('SIMULATED renderer selected anchor:',JSON.stringify(selectedAnchor));const beforeBox=await viewport.boundingBox();await command('push',500,9500);await expect(fixturePage.locator('.log-console-footer')).toContainText('10,000');await assertAnchor(selectedAnchor);
     const afterBox=await viewport.boundingBox();console.log('SIMULATED renderer unread layout:',JSON.stringify({beforeBox,afterBox}));expect(afterBox).toEqual(beforeBox);expect(await fixturePage.evaluate(()=>window.getSelection()?.toString())).toHaveLength(9);
     await fixturePage.evaluate(()=>{window.getSelection()!.removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});await assertAnchor(selectedAnchor);
@@ -399,7 +391,7 @@ test.describe('isolated simulated renderer fixture geometry',()=>{
     await command('push',10000,25);await assertAnchor(readingAnchor);await expect(fixturePage.getByText('当前阅读位置已被缓冲区淘汰')).toBeHidden();
     await command('push',10025,10000);await expect(fixturePage.getByText('当前阅读位置已被缓冲区淘汰')).toBeVisible();
     await fixturePage.getByRole('button',{name:'重新从最新加载',exact:true}).click();await expect(fixturePage.getByText('当前阅读位置已被缓冲区淘汰')).toBeHidden();
-    await fixturePage.getByRole('button',{name:'▶ 恢复自动滚动',exact:true}).first().click();await bottom();
+    await fixturePage.getByRole('button',{name:'恢复自动滚动',exact:true}).first().click();await bottom();
   });
 
   test('I6/I15: full capacity follows append and same-ID growing redraw; long wrap and resize preserve non-overlapping measured rows',async()=>{
@@ -411,7 +403,7 @@ test.describe('isolated simulated renderer fixture geometry',()=>{
     await fixturePage.setViewportSize({width:960,height:650});await bottom();
     const rows=fixturePage.locator('.log-event-row');const boxes=await rows.evaluateAll(rows=>rows.map(r=>{const b=r.getBoundingClientRect();return {y:b.y,bottom:b.bottom};}));expect(boxes.length).toBeGreaterThan(1);for(let i=1;i<boxes.length;i++)expect(boxes[i].y).toBeGreaterThanOrEqual(boxes[i-1].bottom-1);
     await fixturePage.getByTitle('切换日志换行').click();await bottom();expect((await tail.boundingBox())!.height).toBeLessThan(resizedBox!.height);
-    await fixturePage.locator('.log-viewport').focus();const prevented=await viewportSpace229(fixturePage);expect(prevented).toBe(false);await expect(fixturePage.getByRole('button',{name:'⏸ 锁定自动滚动'})).toBeVisible();
+    await fixturePage.locator('.log-viewport').focus();const prevented=await viewportSpace229(fixturePage);expect(prevented).toBe(false);await expect(fixturePage.getByRole('button',{name:'锁定自动滚动'})).toBeVisible();
   });
 
   test('I15: actual fill bounding boxes track unknown, zero, 52.3 percent and 100 percent',async()=>{

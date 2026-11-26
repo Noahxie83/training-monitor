@@ -1,14 +1,16 @@
-import React, { useState, useLayoutEffect, useRef } from "react";
-import { useMonitor } from "./hooks/useMonitor";
-import { Header } from "./components/Header";
-import { TaskFleetTree } from "./components/TaskFleetTree";
-import { TaskCockpit } from "./components/TaskCockpit";
-import { EvidenceDrawer } from "./components/EvidenceDrawer";
-import { SettingsModal } from "./components/SettingsModal";
+import React, { useLayoutEffect, useRef, useState } from 'react';
+import { useMonitor } from './hooks/useMonitor';
+import { I18nProvider, translate } from './i18n';
+import { Header } from './components/Header';
+import { TaskFleetTree } from './components/TaskFleetTree';
+import { TaskCockpit } from './components/TaskCockpit';
+import { EvidenceDrawer } from './components/EvidenceDrawer';
+import { SettingsModal, type SettingsTab } from './components/SettingsModal';
 import { TaskEditor } from './components/TaskEditor';
 import { HostConnectionPanel } from './components/HostConnectionPanel';
 import { HostOverview } from './components/HostOverview';
-import type { TaskSnapshot, TaskRegistration } from "../shared/contracts";
+import { ProcessDiscoveryModal } from './components/ProcessDiscoveryModal';
+import type { DiscoveredProcess, TaskRegistration, TaskSnapshot } from '../shared/contracts';
 import { taskAlgorithmName } from '../shared/task-profile';
 import { newAutoStartArmId } from './components/AutoStartFields';
 
@@ -18,8 +20,14 @@ export function App() {
     activeTask,
     activeTaskId,
     setActiveTaskId,
-    activeHost, activeHostId, selectHost, connectHost, connectingHostIds, hostConnectionErrors,
+    activeHost,
+    activeHostId,
+    selectHost,
+    connectHost,
+    connectingHostIds,
+    hostConnectionErrors,
     preferences,
+    locale,
     resolvedTheme,
     updatePreferences,
     registry,
@@ -39,111 +47,144 @@ export function App() {
     isRefreshing,
     announcement,
     lastSyncTime,
-    error,
+    alerts,
+    unreadAlertCount,
+    markAlertsRead,
+    clearAlerts,
   } = useMonitor();
 
   const [isEvidenceOpen, setIsEvidenceOpen] = useState(false);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [taskEditor, setTaskEditor] = useState<{ task: TaskRegistration | null; hostId?: string; focusAutoStart?: boolean } | null>(null);
+  const [settingsModal, setSettingsModal] = useState<{ open: boolean; tab: SettingsTab }>({
+    open: false,
+    tab: 'appearance',
+  });
+  const [taskEditor, setTaskEditor] = useState<{
+    task: TaskRegistration | null;
+    hostId?: string;
+    focusAutoStart?: boolean;
+    initialProcess?: DiscoveredProcess | null;
+  } | null>(null);
+  const [discoveryHostId, setDiscoveryHostId] = useState<string | null>(null);
   const [removingTask, setRemovingTask] = useState(false);
   const [taskActionError, setTaskActionError] = useState<string | null>(null);
   const [autoStartBusy, setAutoStartBusy] = useState(false);
   const [autoStartError, setAutoStartError] = useState<string | null>(null);
   const [gpuWindowError, setGpuWindowError] = useState<string | null>(null);
+
+  const t = (key: string, params?: Record<string, string | number | null | undefined>) =>
+    translate(locale, key, params);
+
   const openGpu = () => {
     setGpuWindowError(null);
-    void window.desktop?.openGpuWindow(activeHostId ?? undefined).catch(() => setGpuWindowError('打开 GPU 监控窗口失败，请重试。'));
+    void window.desktop
+      ?.openGpuWindow(activeHostId ?? undefined)
+      .catch(() => setGpuWindowError(t('app.openGpuFailed')));
   };
-  const addTask = (hostId?: string) => { setTaskActionError(null); setTaskEditor({ task: null, hostId: hostId ?? activeHostId ?? undefined }); };
+
+  const addTask = (hostId?: string, initialProcess?: DiscoveredProcess | null) => {
+    setTaskActionError(null);
+    setTaskEditor({ task: null, hostId: hostId ?? activeHostId ?? undefined, initialProcess: initialProcess ?? null });
+  };
+
   const configureAutoStart = (taskId: string) => {
-    const task = registry?.tasks.find(item => item.taskId === taskId);
+    const task = registry?.tasks.find((item) => item.taskId === taskId);
     if (!task) return;
-    setTaskActionError(null); setAutoStartError(null);
+    setTaskActionError(null);
+    setAutoStartError(null);
     setTaskEditor({ task, focusAutoStart: true });
   };
-  /** A new arm id restarts the idle countdown without touching the saved configuration. */
+
   const rearmAutoStart = async (taskId: string) => {
     if (!registry || autoStartBusy) return;
-    const task = registry.tasks.find(item => item.taskId === taskId);
+    const task = registry.tasks.find((item) => item.taskId === taskId);
     if (!task?.autoStart) return;
-    setAutoStartBusy(true); setAutoStartError(null);
+    setAutoStartBusy(true);
+    setAutoStartError(null);
     try {
       await updateRegistry({
         ...registry,
-        tasks: registry.tasks.map(item => item.taskId === taskId
-          ? { ...item, autoStart: { ...item.autoStart!, execution: 'server_tmux' as const, armId: newAutoStartArmId() } }
-          : item),
+        tasks: registry.tasks.map((item) =>
+          item.taskId === taskId
+            ? { ...item, autoStart: { ...item.autoStart!, execution: 'server_tmux' as const, armId: newAutoStartArmId() } }
+            : item,
+        ),
       });
     } catch (reason) {
       setAutoStartError(reason instanceof Error ? reason.message : String(reason));
-    } finally { setAutoStartBusy(false); }
+    } finally {
+      setAutoStartBusy(false);
+    }
   };
-  /** Disabling never stops a running training process; it only removes the automatic trigger. */
+
   const disableAutoStart = async (taskId: string) => {
     if (!registry || autoStartBusy) return;
-    const task = registry.tasks.find(item => item.taskId === taskId);
+    const task = registry.tasks.find((item) => item.taskId === taskId);
     if (!task?.autoStart) return;
-    setAutoStartBusy(true); setAutoStartError(null);
+    setAutoStartBusy(true);
+    setAutoStartError(null);
     try {
       await updateRegistry({
         ...registry,
-        tasks: registry.tasks.map(item => item.taskId === taskId
-          ? { ...item, autoStart: { ...item.autoStart!, enabled: false } }
-          : item),
+        tasks: registry.tasks.map((item) =>
+          item.taskId === taskId ? { ...item, autoStart: { ...item.autoStart!, enabled: false } } : item,
+        ),
       });
     } catch (reason) {
       setAutoStartError(reason instanceof Error ? reason.message : String(reason));
-    } finally { setAutoStartBusy(false); }
+    } finally {
+      setAutoStartBusy(false);
+    }
   };
+
   const removeTask = async (taskId: string) => {
     if (!registry || removingTask) return;
-    setRemovingTask(true); setTaskActionError(null);
+    setRemovingTask(true);
+    setTaskActionError(null);
     try {
-      await updateRegistry({ ...registry, tasks: registry.tasks.filter(task => task.taskId !== taskId) });
+      await updateRegistry({ ...registry, tasks: registry.tasks.filter((task) => task.taskId !== taskId) });
       document.querySelector<HTMLButtonElement>('.fleet-header button')?.focus();
-    } catch (reason) { setTaskActionError(reason instanceof Error ? reason.message : String(reason)); }
-    finally { setRemovingTask(false); }
+    } catch (reason) {
+      setTaskActionError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setRemovingTask(false);
+    }
   };
 
   // Flatten tasks in fleet display order for Ctrl+1~9
   const orderedTasks: TaskSnapshot[] = [];
   if (snapshot) {
     const hostMap = new Map<string, TaskSnapshot[]>();
-    for (const h of snapshot.hosts) {
-      hostMap.set(h.hostId, []);
+    for (const h of snapshot.hosts) hostMap.set(h.hostId, []);
+    for (const taskItem of snapshot.tasks) {
+      const list = hostMap.get(taskItem.hostId);
+      if (list) list.push(taskItem);
+      else hostMap.set(taskItem.hostId, [taskItem]);
     }
-    for (const t of snapshot.tasks) {
-      const list = hostMap.get(t.hostId);
-      if (list) list.push(t);
-      else hostMap.set(t.hostId, [t]);
-    }
-    for (const list of hostMap.values()) {
-      orderedTasks.push(...list);
-    }
+    for (const list of hostMap.values()) orderedTasks.push(...list);
   }
 
-  // Keyboard shortcuts: Ctrl+R, Ctrl+1~9, Esc with strict guards (I14)
   const shortcutStateRef = useRef({
     orderedTasks,
     refresh,
     setActiveTaskId,
-    isSettingsOpen,
+    isSettingsOpen: settingsModal.open,
     isEvidenceOpen,
     taskEditor,
+    discoveryHostId,
   });
   shortcutStateRef.current = {
     orderedTasks,
     refresh,
     setActiveTaskId,
-    isSettingsOpen,
+    isSettingsOpen: settingsModal.open,
     isEvidenceOpen,
     taskEditor,
+    discoveryHostId,
   };
 
   useLayoutEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const state = shortcutStateRef.current;
-      // If modal or drawer is open, or during IME, or in text input, do not trigger global navigation shortcuts
       const activeEl = document.activeElement;
       const targetEl = e.target as HTMLElement | null;
       const isInput =
@@ -151,171 +192,324 @@ export function App() {
         activeEl instanceof HTMLTextAreaElement ||
         activeEl instanceof HTMLSelectElement ||
         (activeEl as HTMLElement)?.isContentEditable ||
-        (activeEl as any)?.contentEditable === "true" ||
-        (activeEl as HTMLElement)?.getAttribute?.("contenteditable") === "true" ||
+        (activeEl as any)?.contentEditable === 'true' ||
+        (activeEl as HTMLElement)?.getAttribute?.('contenteditable') === 'true' ||
         targetEl instanceof HTMLInputElement ||
         targetEl instanceof HTMLTextAreaElement ||
         targetEl instanceof HTMLSelectElement ||
         targetEl?.isContentEditable ||
-        (targetEl as any)?.contentEditable === "true" ||
-        targetEl?.getAttribute?.("contenteditable") === "true";
+        (targetEl as any)?.contentEditable === 'true' ||
+        targetEl?.getAttribute?.('contenteditable') === 'true';
       const isComposing = (e as any).isComposing === true || e.keyCode === 229;
 
-      // Esc -> Close overlays
-      if (e.key === "Escape") {
+      if (e.key === 'Escape') {
         if (isComposing) return;
+        if (state.discoveryHostId) {
+          setDiscoveryHostId(null);
+          return;
+        }
         if (state.isEvidenceOpen) {
           setIsEvidenceOpen(false);
           return;
         }
         if (state.isSettingsOpen) {
-          setIsSettingsOpen(false);
+          setSettingsModal((prev) => ({ ...prev, open: false }));
           return;
         }
       }
 
-      if (state.isSettingsOpen || state.isEvidenceOpen || state.taskEditor || isInput || isComposing) {
+      if (
+        state.isSettingsOpen ||
+        state.isEvidenceOpen ||
+        state.taskEditor ||
+        state.discoveryHostId ||
+        isInput ||
+        isComposing
+      ) {
         return;
       }
 
-      // Ctrl+R -> Refresh
-      if ((e.ctrlKey || e.metaKey) && (e.key === "r" || e.key === "R")) {
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R')) {
         e.preventDefault();
-        state.refresh();
+        void state.refresh();
         return;
       }
 
-      // Ctrl+1~9 -> Switch task
       if ((e.ctrlKey || e.metaKey) && /^[1-9]$/.test(e.key)) {
         const index = parseInt(e.key, 10) - 1;
         if (index < state.orderedTasks.length && state.orderedTasks[index]) {
           e.preventDefault();
-          state.setActiveTaskId(state.orderedTasks[index].taskId);
+          state.setActiveTaskId(state.orderedTasks[index]!.taskId);
         }
-        return;
       }
     };
 
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  const activeTaskRegistration =
-    registry?.tasks.find((t) => t.taskId === activeTaskId) ?? null;
+  const activeTaskRegistration = registry?.tasks.find((item) => item.taskId === activeTaskId) ?? null;
+  const activeHostRegistration = registry?.hosts.find((item) => item.hostId === activeHostId) ?? null;
+  const activeHostTasks = snapshot?.tasks.filter((item) => item.hostId === activeHostId) ?? [];
+
+  const handleToggleLocale = () => {
+    const nextLocale = locale === 'zh-CN' ? 'en-US' : 'zh-CN';
+    void updatePreferences({ ...preferences, locale: nextLocale }).catch(() => undefined);
+  };
 
   return (
-    <div className="app-shell" data-theme={resolvedTheme}>
-      <Header
-        theme={resolvedTheme}
-        onToggleTheme={() => { void updatePreferences({ theme: resolvedTheme === 'light' ? 'dark' : 'light' }).catch(() => undefined); }}
-        isSavingTheme={isSavingPreferences}
-        hosts={snapshot?.hosts ?? []}
-        activeHostId={activeHostId}
-        onSelectHost={selectHost}
-        isDemo={Boolean(snapshot?.demo)}
-        lastSyncTime={lastSyncTime}
-        onRefresh={refresh}
-        isRefreshing={isRefreshing}
-        onOpenSettings={() => setIsSettingsOpen(true)}
-        onOpenGpu={window.desktop ? openGpu : undefined}
-        announcement={announcement}
-      />
-
-      {(isLoadingSnapshot || isLoadingPreferences || isSavingPreferences) && (
-        <div role="status">
-          {isLoadingSnapshot && <span>正在读取监控快照…</span>}
-          {isLoadingPreferences && <span>正在读取偏好设置…</span>}
-          {isSavingPreferences && <span>正在保存偏好设置…</span>}
-        </div>
-      )}
-      {[snapshotError, preferencesError, preferencesSaveError, refreshError].filter(Boolean).map((message) => (
-        <div key={message} className="global-error-banner alert alert-danger" role="alert">
-          <span>{message}</span>
-          {message === snapshotError && <button type="button" className="btn btn-secondary btn-sm" onClick={retrySnapshotLoad}>重试</button>}
-          {message === preferencesError && <button type="button" className="btn btn-secondary btn-sm" onClick={retryPreferencesLoad}>重试读取偏好设置</button>}
-          {message === refreshError && <button type="button" className="btn btn-secondary btn-sm" onClick={refresh}>重试刷新</button>}
-        </div>
-      ))}
-      {(taskActionError || (registryError && !isSettingsOpen && !taskEditor)) && <div className="global-error-banner alert alert-danger" role="alert">
-        <span>{taskActionError || registryError}</span>
-        <button className="btn btn-secondary btn-sm" type="button" onClick={() => { void reloadRegistry().then(() => setTaskActionError(null)).catch(() => undefined); }}>重新加载配置</button>
-      </div>}
-      {gpuWindowError && <div className="global-error-banner alert alert-danger" role="alert"><span>{gpuWindowError}</span><button type="button" className="btn btn-secondary btn-sm" onClick={openGpu}>重试打开</button></div>}
-
-      <div className="app-body">
-        <TaskFleetTree
+    <I18nProvider
+      locale={locale}
+      onChangeLocale={(next) => {
+        void updatePreferences({ ...preferences, locale: next }).catch(() => undefined);
+      }}
+    >
+      <div className="app-shell" data-theme={resolvedTheme}>
+        <Header
+          theme={resolvedTheme}
+          onToggleTheme={() => {
+            void updatePreferences({
+              ...preferences,
+              theme: resolvedTheme === 'light' ? 'dark' : 'light',
+            }).catch(() => undefined);
+          }}
+          isSavingTheme={isSavingPreferences}
+          onToggleLocale={handleToggleLocale}
           hosts={snapshot?.hosts ?? []}
-          tasks={snapshot?.tasks ?? []}
-          activeTaskId={activeTaskId}
+          hostRegistrations={registry?.hosts ?? []}
           activeHostId={activeHostId}
+          activeTaskLabel={activeTask ? activeTaskRegistration?.label || activeTask.taskId : null}
           onSelectHost={selectHost}
           onConnectHost={registry ? connectHost : undefined}
           connectingHostIds={connectingHostIds}
-          disabledHostIds={registry?.hosts.filter(host => !host.enabled).map(host => host.hostId)}
-          onSelectTask={setActiveTaskId}
-          registrations={registry?.tasks}
-          onAddTask={registry ? addTask : undefined}
-          onEditTask={taskId => {
-            const task = registry?.tasks.find(item => item.taskId === taskId);
-            if (task) { setTaskActionError(null); setTaskEditor({ task }); }
-          }}
-          onRemoveTask={removeTask}
-          isSaving={removingTask}
+          hostConnectionErrors={hostConnectionErrors}
+          isDemo={Boolean(snapshot?.demo)}
+          lastSyncTime={lastSyncTime}
+          onRefresh={() => void refresh()}
+          isRefreshing={isRefreshing}
+          onOpenSettings={() => setSettingsModal({ open: true, tab: 'appearance' })}
+          onOpenGpu={window.desktop ? openGpu : undefined}
+          onOpenDiscovery={activeHostId && window.monitor?.discoverProcesses ? () => setDiscoveryHostId(activeHostId) : undefined}
+          announcement={announcement}
+          alerts={alerts}
+          unreadAlertCount={unreadAlertCount}
+          onMarkAlertsRead={markAlertsRead}
+          onClearAlerts={clearAlerts}
+          onSelectAlertTask={(taskId, hostId) => setActiveTaskId(taskId, hostId)}
         />
 
-        <div className="host-workspace">
-        {activeHost && <HostConnectionPanel
-          host={activeHost} registration={registry?.hosts.find(host => host.hostId === activeHostId)}
-          connecting={connectingHostIds.includes(activeHost.hostId)} error={hostConnectionErrors[activeHost.hostId]}
-          onConnect={() => { void connectHost(activeHost.hostId); }} onOpenSettings={() => setIsSettingsOpen(true)}
-        />}
-        {activeTask ? <TaskCockpit
-          task={activeTask}
-          host={activeHost}
-          sources={snapshot?.sources ?? []}
-          onOpenEvidence={() => setIsEvidenceOpen(true)}
-          onRefresh={refresh}
-          onOpenSettings={registry ? () => addTask() : undefined}
-          algorithm={activeTaskRegistration?.algorithm}
-          algorithmName={activeTaskRegistration ? taskAlgorithmName(activeTaskRegistration) : undefined}
-          taskLabel={activeTaskRegistration?.label}
-          autoStartConfig={activeTaskRegistration?.autoStart ?? null}
-          hostSnapshots={snapshot?.hosts ?? []}
-          onConfigureAutoStart={activeTaskRegistration ? () => configureAutoStart(activeTaskRegistration.taskId) : undefined}
-          onRearmAutoStart={activeTaskRegistration ? () => { void rearmAutoStart(activeTaskRegistration.taskId); } : undefined}
-          onDisableAutoStart={activeTaskRegistration ? () => { void disableAutoStart(activeTaskRegistration.taskId); } : undefined}
-          autoStartBusy={autoStartBusy}
-          autoStartError={autoStartError}
-        /> : <HostOverview host={activeHost} label={registry?.hosts.find(host => host.hostId === activeHostId)?.label}
-          taskCount={snapshot?.tasks.filter(task => task.hostId === activeHostId).length ?? 0}
-          onAddTask={registry?.hosts.length ? () => addTask() : undefined} />}
+        {(isLoadingSnapshot || isLoadingPreferences || isSavingPreferences) && (
+          <div className="global-status-strip" role="status">
+            {isLoadingSnapshot && <span>{t('app.loadingSnapshot')}</span>}
+            {isLoadingPreferences && <span>{t('app.loadingPreferences')}</span>}
+            {isSavingPreferences && <span>{t('app.savingPreferences')}</span>}
+          </div>
+        )}
+
+        {[snapshotError, preferencesError, preferencesSaveError, refreshError].filter(Boolean).map((message) => (
+          <div key={message} className="global-error-banner alert alert-danger" role="alert">
+            <span>{message}</span>
+            {message === snapshotError && (
+              <button type="button" className="btn btn-secondary btn-xs" onClick={() => void retrySnapshotLoad()}>
+                {t('app.retry')}
+              </button>
+            )}
+            {message === preferencesError && (
+              <button type="button" className="btn btn-secondary btn-xs" onClick={() => void retryPreferencesLoad()}>
+                {t('app.retryPreferences')}
+              </button>
+            )}
+            {message === refreshError && (
+              <button type="button" className="btn btn-secondary btn-xs" onClick={() => void refresh()}>
+                {t('app.retryRefresh')}
+              </button>
+            )}
+          </div>
+        ))}
+
+        {(taskActionError || (registryError && !settingsModal.open && !taskEditor)) && (
+          <div className="global-error-banner alert alert-danger" role="alert">
+            <span>{taskActionError || registryError}</span>
+            <button
+              className="btn btn-secondary btn-xs"
+              type="button"
+              onClick={() => {
+                void reloadRegistry()
+                  .then(() => setTaskActionError(null))
+                  .catch(() => undefined);
+              }}
+            >
+              {t('app.reloadConfig')}
+            </button>
+          </div>
+        )}
+
+        {gpuWindowError && (
+          <div className="global-error-banner alert alert-danger" role="alert">
+            <span>{gpuWindowError}</span>
+            <button type="button" className="btn btn-secondary btn-xs" onClick={openGpu}>
+              {t('app.retryOpenGpu')}
+            </button>
+          </div>
+        )}
+
+        <div className="app-body">
+          <TaskFleetTree
+            hosts={snapshot?.hosts ?? []}
+            hostRegistrations={registry?.hosts ?? []}
+            tasks={snapshot?.tasks ?? []}
+            activeTaskId={activeTaskId}
+            activeHostId={activeHostId}
+            onSelectHost={selectHost}
+            onConnectHost={registry ? connectHost : undefined}
+            connectingHostIds={connectingHostIds}
+            disabledHostIds={registry?.hosts.filter((host) => !host.enabled).map((host) => host.hostId)}
+            onSelectTask={setActiveTaskId}
+            registrations={registry?.tasks}
+            onAddTask={registry ? addTask : undefined}
+            onEditTask={(taskId) => {
+              const found = registry?.tasks.find((item) => item.taskId === taskId);
+              if (found) {
+                setTaskActionError(null);
+                setTaskEditor({ task: found });
+              }
+            }}
+            onRemoveTask={(taskId) => void removeTask(taskId)}
+            onOpenHostSettings={() => setSettingsModal({ open: true, tab: 'hosts' })}
+            isSaving={removingTask}
+          />
+
+          <div className="host-workspace">
+            {activeHost && (
+              <HostConnectionPanel
+                host={activeHost}
+                registration={activeHostRegistration ?? undefined}
+                connecting={connectingHostIds.includes(activeHost.hostId)}
+                error={hostConnectionErrors[activeHost.hostId]}
+                onConnect={() => {
+                  void connectHost(activeHost.hostId);
+                }}
+                onOpenSettings={() => setSettingsModal({ open: true, tab: 'hosts' })}
+              />
+            )}
+
+            {activeTask ? (
+              <TaskCockpit
+                task={activeTask}
+                host={activeHost}
+                hostRegistration={activeHostRegistration}
+                taskRegistration={activeTaskRegistration}
+                sources={snapshot?.sources ?? []}
+                onOpenEvidence={() => setIsEvidenceOpen(true)}
+                onRefresh={() => void refresh()}
+                onOpenSettings={registry ? () => addTask() : undefined}
+                algorithm={activeTaskRegistration?.algorithm}
+                algorithmName={activeTaskRegistration ? taskAlgorithmName(activeTaskRegistration) : undefined}
+                taskLabel={activeTaskRegistration?.label}
+                autoStartConfig={activeTaskRegistration?.autoStart ?? null}
+                hostSnapshots={snapshot?.hosts ?? []}
+                onConfigureAutoStart={
+                  activeTaskRegistration ? () => configureAutoStart(activeTaskRegistration.taskId) : undefined
+                }
+                onRearmAutoStart={
+                  activeTaskRegistration
+                    ? () => {
+                        void rearmAutoStart(activeTaskRegistration.taskId);
+                      }
+                    : undefined
+                }
+                onDisableAutoStart={
+                  activeTaskRegistration
+                    ? () => {
+                        void disableAutoStart(activeTaskRegistration.taskId);
+                      }
+                    : undefined
+                }
+                autoStartBusy={autoStartBusy}
+                autoStartError={autoStartError}
+              />
+            ) : (
+              <HostOverview
+                host={activeHost}
+                label={activeHostRegistration?.label}
+                taskCount={activeHostTasks.length}
+                hostTasks={activeHostTasks}
+                taskRegistrations={registry?.tasks ?? []}
+                onSelectTask={(taskId) => setActiveTaskId(taskId, activeHostId ?? undefined)}
+                onAddTask={registry?.hosts.length ? () => addTask() : undefined}
+                onDiscoverProcesses={
+                  activeHostId && window.monitor?.discoverProcesses
+                    ? () => setDiscoveryHostId(activeHostId)
+                    : undefined
+                }
+                onOpenSettings={() => setSettingsModal({ open: true, tab: 'hosts' })}
+              />
+            )}
+          </div>
         </div>
+
+        <EvidenceDrawer
+          task={activeTask}
+          sources={snapshot?.sources ?? []}
+          isOpen={isEvidenceOpen}
+          onClose={() => setIsEvidenceOpen(false)}
+        />
+
+        <SettingsModal
+          isOpen={settingsModal.open}
+          initialTab={settingsModal.tab}
+          onClose={() => setSettingsModal((prev) => ({ ...prev, open: false }))}
+          preferences={preferences}
+          onUpdatePreferences={updatePreferences}
+          registry={registry}
+          onUpdateRegistry={updateRegistry}
+          onReloadRegistry={reloadRegistry}
+          registryError={registryError}
+        />
+
+        {taskEditor && registry && (
+          <TaskEditor
+            registry={registry}
+            task={taskEditor.task}
+            hostId={taskEditor.hostId}
+            initialProcess={taskEditor.initialProcess}
+            hostSnapshots={snapshot?.hosts ?? []}
+            focusAutoStart={taskEditor.focusAutoStart}
+            onClose={() => setTaskEditor(null)}
+            onSave={updateRegistry}
+            onReload={reloadRegistry}
+            onSaved={(taskId, savedHostId) => {
+              setActiveTaskId(taskId, savedHostId);
+              setTaskEditor(null);
+            }}
+            onOpenSettings={() => {
+              setTaskEditor(null);
+              setSettingsModal({ open: true, tab: 'hosts' });
+            }}
+            onRequestDiscoverProcesses={
+              window.monitor?.discoverProcesses
+                ? (targetHostId) => {
+                    setTaskEditor(null);
+                    setDiscoveryHostId(targetHostId);
+                  }
+                : undefined
+            }
+          />
+        )}
+
+        {discoveryHostId && (
+          <ProcessDiscoveryModal
+            hostId={discoveryHostId}
+            hostLabel={registry?.hosts.find((h) => h.hostId === discoveryHostId)?.label}
+            onClose={() => setDiscoveryHostId(null)}
+            onImport={(proc) => {
+              const targetHostId = discoveryHostId;
+              setDiscoveryHostId(null);
+              addTask(targetHostId, proc);
+            }}
+          />
+        )}
       </div>
-
-      <EvidenceDrawer
-        task={activeTask}
-        isOpen={isEvidenceOpen}
-        onClose={() => setIsEvidenceOpen(false)}
-      />
-
-      <SettingsModal
-        isOpen={isSettingsOpen}
-        onClose={() => setIsSettingsOpen(false)}
-        preferences={preferences}
-        onUpdatePreferences={updatePreferences}
-        registry={registry}
-        onUpdateRegistry={updateRegistry}
-        onReloadRegistry={reloadRegistry}
-        registryError={registryError}
-      />
-      {taskEditor && registry && <TaskEditor
-        registry={registry} task={taskEditor.task} hostId={taskEditor.hostId}
-        hostSnapshots={snapshot?.hosts ?? []}
-        focusAutoStart={taskEditor.focusAutoStart}
-        onClose={() => setTaskEditor(null)} onSave={updateRegistry} onReload={reloadRegistry}
-        onSaved={(taskId, hostId) => { setActiveTaskId(taskId, hostId); setTaskEditor(null); }}
-        onOpenSettings={() => { setTaskEditor(null); setIsSettingsOpen(true); }}
-      />}
-    </div>
+    </I18nProvider>
   );
 }

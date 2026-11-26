@@ -29,9 +29,15 @@ test('uses native viewport sizes through maximize, restore and narrow window res
         gridWidth: list.getBoundingClientRect().width };
     });
     const resize = async (width: number, height: number) => {
+      await app.evaluate(({ BrowserWindow }) => {
+        const window = BrowserWindow.getAllWindows().find(window => window.webContents.getURL().includes('view=gpu'))!;
+        if (window.isMaximized()) window.unmaximize();
+      });
+      await expect.poll(() => app.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows().find(window => window.webContents.getURL().includes('view=gpu'))!.isMaximized(),
+      )).toBe(false);
       await app.evaluate(({ BrowserWindow }, size) => {
         const window = BrowserWindow.getAllWindows().find(window => window.webContents.getURL().includes('view=gpu'))!;
-        window.unmaximize();
         window.setContentSize(size.width, size.height);
       }, { width, height });
       await expect.poll(() => page.evaluate(() => innerWidth)).toBe(width);

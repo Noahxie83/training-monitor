@@ -27,7 +27,8 @@ test.afterAll(async () => {
 });
 
 test('opens a local demo window with only the frozen preload API', async () => {
-  await expect(page.getByText('模拟数据')).toBeVisible();
+  await expect(page.getByText('DEMO', { exact: true })).toBeVisible();
+  await expect(page.getByTitle('模拟数据')).toBeVisible();
   expect(await page.evaluate(() => typeof window.require)).toBe('undefined');
   expect(await page.evaluate(() => 'ipcRenderer' in window)).toBe(false);
   expect(await page.evaluate(() => Object.keys(window.monitor).sort())).toEqual([

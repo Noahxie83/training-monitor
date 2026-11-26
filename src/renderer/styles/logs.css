@@ -1,0 +1,474 @@
+/* Terminal-grade Recessed Log Console */
+.log-console-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--card-shadow);
+  overflow: hidden;
+}
+
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  background-color: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.log-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.log-toolbar-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--text-meta);
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+/* Source tabs with guaranteed AAA contrast (--accent-ink on --accent-primary) */
+.log-source-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.source-tab-btn {
+  height: 24px;
+  padding: 0 8px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-subtle);
+  background-color: var(--bg-inset);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background-color var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.source-tab-btn:hover {
+  background-color: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+.source-tab-btn.is-active {
+  background-color: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+/* Level filter capsules */
+.log-level-filters {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--radius-xs);
+  background-color: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+}
+
+.log-level-btn {
+  height: 20px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.log-level-btn:hover {
+  color: var(--text-primary);
+}
+
+.log-level-btn.is-active {
+  background-color: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--card-shadow);
+}
+
+.log-level-btn.level-error.is-active {
+  color: var(--status-danger);
+}
+
+.log-level-btn.level-warn.is-active {
+  color: var(--status-warning);
+}
+
+/* Search group with clear border, regex/case toggles, match counter & SVG nav */
+.log-search-group {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 26px;
+  padding: 0 4px 0 8px;
+  min-width: 170px;
+  flex: 1;
+  max-width: 340px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-inset);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.log-search-group:focus-within {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 2px var(--accent-subtle);
+}
+
+.log-search-group.is-invalid {
+  border-color: var(--status-danger);
+}
+
+.log-search-group > .ui-icon {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.log-search-input {
+  flex: 1;
+  min-width: 60px;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  outline: none;
+}
+
+.log-search-input::placeholder {
+  font-family: var(--font-sans);
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+.log-search-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 4px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.log-search-toggle:hover {
+  background-color: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+.log-search-toggle.is-active {
+  background-color: var(--accent-subtle);
+  border-color: var(--accent-border);
+  color: var(--accent-primary);
+}
+
+.log-match-counter {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  padding: 0 3px;
+}
+
+.log-search-nav-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.log-search-nav-btn:hover:not(:disabled) {
+  background-color: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+.log-pagination-actions,
+.log-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.log-earlier-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Status & Error banners inside LogConsole (zero inline styles, zero undefined CSS vars) */
+.log-alert-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--text-meta);
+  flex-shrink: 0;
+}
+
+.log-alert-banner.alert-warning {
+  background-color: var(--status-warning-bg);
+  border-bottom-color: var(--status-warning-border);
+  color: var(--status-warning);
+}
+
+.log-alert-banner.alert-danger {
+  background-color: var(--status-danger-bg);
+  border-bottom-color: var(--status-danger-border);
+  color: var(--status-danger);
+}
+
+.log-alert-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.log-status-notice {
+  padding: 4px 12px;
+  background-color: var(--bg-surface-hover);
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+
+/* Recessed terminal viewport */
+.log-viewport-wrapper {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--log-bg);
+}
+
+.log-viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: 22px;
+  background-color: var(--log-bg);
+  color: var(--log-fg);
+  padding: 0;
+  outline: none;
+}
+
+.log-viewport:focus-visible {
+  box-shadow: inset 0 0 0 1.5px var(--accent-primary);
+  outline: none;
+}
+
+.log-event-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 1px 14px;
+  border-left: 2px solid transparent;
+}
+
+.log-event-row:hover {
+  background-color: var(--log-row-hover);
+}
+
+.log-event-row.log-level-error {
+  background-color: var(--log-error-bg);
+  border-left-color: var(--status-danger);
+}
+
+.log-event-row.log-level-warn {
+  background-color: var(--log-warn-bg);
+  border-left-color: var(--status-warning);
+}
+
+.log-event-row.log-row-redraw {
+  border-left-color: var(--accent-primary);
+}
+
+.log-col-time {
+  width: 64px;
+  flex-shrink: 0;
+  color: var(--log-time-fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-log-meta);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+.log-col-text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.nowrap-lines .log-col-text {
+  white-space: pre;
+  word-break: normal;
+}
+
+.log-mark {
+  background-color: var(--log-mark-bg);
+  color: var(--log-mark-fg);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.log-mark.log-mark-active {
+  background-color: var(--log-mark-active-bg);
+  color: var(--log-mark-active-fg);
+  font-weight: 600;
+}
+
+.log-truncated-tag {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background-color: var(--status-warning-bg);
+  border: 1px solid var(--status-warning-border);
+  color: var(--status-warning);
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+/* System log stream banners (zero !important) */
+.log-event-row.banner-gap-confirmed,
+.log-event-row.banner-gap-unknown {
+  background-color: var(--status-danger-bg);
+  color: var(--status-danger);
+  border-left-color: var(--status-danger);
+  font-weight: 500;
+}
+
+.log-event-row.banner-cache-evicted {
+  background-color: var(--status-warning-bg);
+  color: var(--status-warning);
+  border-left-color: var(--status-warning);
+  font-weight: 500;
+}
+
+.log-event-row.banner-import-boundary,
+.log-event-row.banner-generation-started {
+  background-color: var(--status-info-bg);
+  color: var(--status-info);
+  border-left-color: var(--status-info);
+  font-weight: 500;
+}
+
+/* Centered viewport empty state */
+.log-viewport-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 20px;
+  text-align: center;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: var(--text-meta);
+  pointer-events: auto;
+}
+
+/* Floating bottom-right jump-to-bottom capsule */
+.log-unread-floating-banner {
+  position: absolute;
+  bottom: 12px;
+  right: 16px;
+  z-index: 12;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px 5px 12px;
+  border-radius: var(--radius-pill);
+  background-color: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--accent-border);
+  box-shadow: var(--shadow-popover);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+/* Log console footer */
+.log-console-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 12px;
+  background-color: var(--bg-surface);
+  border-top: 1px solid var(--border-subtle);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.footer-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.footer-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+@media (max-width: 1100px) {
+  .log-toolbar-title {
+    display: none;
+  }
+  .log-toolbar-actions .btn-label {
+    display: none;
+  }
+}

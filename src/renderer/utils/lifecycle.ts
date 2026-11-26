@@ -1,28 +1,29 @@
 import type { Lifecycle } from '../../shared/contracts';
+import { translate, type Locale } from '../i18n';
 
-export function getLifecycleBadge(lifecycle: Lifecycle): {
+export function getLifecycleBadge(lifecycle: Lifecycle, locale: Locale = 'zh-CN'): {
   text: string;
-  symbol: string;
   className: string;
+  pulse: boolean;
 } {
   switch (lifecycle) {
     case 'running':
-      return { text: '运行中', symbol: '●', className: 'lifecycle-running' };
+      return { text: translate(locale, 'lifecycle.running'), className: 'lifecycle-running', pulse: true };
     case 'queued':
-      return { text: '排队中', symbol: '⏳', className: 'lifecycle-queued' };
+      return { text: translate(locale, 'lifecycle.queued'), className: 'lifecycle-queued', pulse: false };
     case 'ready_not_training':
-      return { text: '就绪未启动', symbol: '○', className: 'lifecycle-ready' };
+      return { text: translate(locale, 'lifecycle.ready_not_training'), className: 'lifecycle-ready', pulse: false };
     case 'completed':
-      return { text: '已完成', symbol: '✓', className: 'lifecycle-completed' };
+      return { text: translate(locale, 'lifecycle.completed'), className: 'lifecycle-completed', pulse: false };
     case 'failed':
-      return { text: '失败', symbol: '✕', className: 'lifecycle-failed' };
+      return { text: translate(locale, 'lifecycle.failed'), className: 'lifecycle-failed', pulse: false };
     case 'stopped_unconfirmed':
-      return { text: '已停止', symbol: '■', className: 'lifecycle-stopped' };
+      return { text: translate(locale, 'lifecycle.stopped_unconfirmed'), className: 'lifecycle-stopped', pulse: false };
     case 'unconfirmed':
-      return { text: '待确认', symbol: '?', className: 'lifecycle-unconfirmed' };
+      return { text: translate(locale, 'lifecycle.unconfirmed'), className: 'lifecycle-unconfirmed', pulse: false };
     case 'not_observed':
-      return { text: '未观测', symbol: '○', className: 'lifecycle-not-observed' };
+      return { text: translate(locale, 'lifecycle.not_observed'), className: 'lifecycle-not-observed', pulse: false };
     default:
-      return { text: '未知', symbol: '—', className: 'lifecycle-unknown' };
+      return { text: translate(locale, 'lifecycle.unknown'), className: 'lifecycle-unknown', pulse: false };
   }
 }

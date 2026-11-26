@@ -21,10 +21,10 @@ describe('Keyboard Shortcuts & Isolation', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByPlaceholderText(/查找日志 \(Ctrl\+F\)/)).toBeDefined();
+      expect(screen.getByPlaceholderText(/搜索日志 \(Ctrl\+F\)/)).toBeDefined();
     });
 
-    const searchInput = screen.getByPlaceholderText(/查找日志 \(Ctrl\+F\)/);
+    const searchInput = screen.getByPlaceholderText(/搜索日志 \(Ctrl\+F\)/);
     expect(document.activeElement).not.toBe(searchInput);
 
     fireEvent.keyDown(window, { key: 'f', ctrlKey: true });
@@ -93,7 +93,7 @@ describe('Keyboard Shortcuts & Isolation', () => {
     const logContainer = screen.getByRole('region', { name: /日志流视窗/ });
 
     // Case 1: Active element is an input -> space should NOT toggle lock
-    const searchInput = screen.getByPlaceholderText(/查找日志 \(Ctrl\+F\)/);
+    const searchInput = screen.getByPlaceholderText(/搜索日志 \(Ctrl\+F\)/);
     searchInput.focus();
 
     const inputSpaceEvent = new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true });
@@ -139,19 +139,19 @@ describe('Keyboard Shortcuts & Isolation', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: '白名单证据详情' })).toBeDefined();
+      expect(screen.getByRole('button', { name: '任务详情' })).toBeDefined();
     });
 
     // Open drawer
-    fireEvent.click(screen.getByRole('button', { name: '白名单证据详情' }));
+    fireEvent.click(screen.getByRole('button', { name: '任务详情' }));
     await waitFor(() => {
-      expect(screen.getByRole('dialog', { name: '白名单证据审查抽屉' })).toBeDefined();
+      expect(screen.getByRole('dialog', { name: '任务详情抽屉' })).toBeDefined();
     });
 
     // Press Esc
     fireEvent.keyDown(window, { key: 'Escape' });
     await waitFor(() => {
-      expect(screen.queryByRole('dialog', { name: '白名单证据审查抽屉' })).toBeNull();
+      expect(screen.queryByRole('dialog', { name: '任务详情抽屉' })).toBeNull();
     });
     fireEvent.click(screen.getByRole('button', { name: '系统设置' }));
     expect(screen.getByRole('dialog', { name: '系统设置' })).toBeDefined();

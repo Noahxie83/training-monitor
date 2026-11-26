@@ -1,49 +1,109 @@
-# 训练监控器设计约定
+# Training Monitor — Design System & UI Specification (Phase 3)
 
-用户于 2026-11-05 选定：浅色使用方案①（Codex 式浅色），深色使用方案②（石墨灰工作台），通过同一套界面切换。原型位于本次聊天的 `ui-options/codex.png` 和 `ui-options/graphite.png`；正式组件效果以 `test-results/theme-light-1280.png`、`theme-dark-1280.png` 为准。
+Training Monitor adopts a unified, bilingual (**zh-CN / en-US**) telemetry workstation design system built around two cohesive palettes — **Atelier Precision Light** and **Obsidian Telemetry Studio** — sharing one single structural layout across light and dark themes.
 
-## 字体与交互
+---
 
-全局微软雅黑，数字使用 tabular-nums。正文 13px，标签和辅助信息 12px，页面任务标题 24px（小窗口 21px），执行数值 20px（小窗口 18px）。不要用等宽字体装饰技术界面。图标使用 `Icon.tsx` 中统一的 24×24 SVG、1.65px 描边；避免用 emoji 或 Unicode 替代图标。
+## 1. Typography & Local Offline Fonts
 
-保留固定展开侧栏、侧栏与宿主旁的添加入口、任务菜单。任务菜单通过 portal 脱离滚动容器，键盘可达且有明确焦点。空态直接引导添加任务。主题切换不改变当前任务或监控数据。
+- **UI Sans**: `Inter` (`400 / 500 / 600 / 700`), locally bundled WOFF2 in `src/renderer/assets/fonts/` (`@font-face` in `src/renderer/styles/tokens.css`), falling back cleanly to `'PingFang SC'`, `'Microsoft YaHei UI'`, `'Noto Sans CJK SC'`, system sans.
+- **Technical Monospace**: `JetBrains Mono` (`400 / 500 / 600`), locally bundled WOFF2 in `src/renderer/assets/fonts/`, applied strictly to logs, numeric readouts, PIDs, step counters, file paths, regex inputs, and tmux commands.
+- **100% Offline CSP Compliance**: Zero external Google Fonts or CDN links; `index.html` enforces `default-src 'self'; font-src 'self'`.
+- **Tabular Numerals**: All dynamic numeric KPIs, percentages, clocks, VRAM counters, and log timestamps use `font-variant-numeric: tabular-nums` to prevent horizontal jitter during live updates.
 
-宿主本身可独立选中，侧栏标题、宿主 ID 与顶部宿主按钮进入宿主首页，显示全部 GPU 概览；点击具体任务进入进程与日志视图。没有任务时仍保留宿主 GPU 与添加任务入口。内容区顶部提供连接结果和主动连接/重试操作，等待时防止重复提交。添加任务默认采用当前宿主。
+### Type Scale (5 Levels)
 
-任务登记中的算法名称为选填自由文本，可填写任何算法或模型名称，不限定用户过去使用过的三种模型。日志识别独立放在高级选项，新增任务默认通用模式；算法名称不选择解析器。旧配置继续使用原来的解析格式，旧枚举在编辑器中显示为可读名称。主页面在任务信息中显示填写的算法名称。
+| Role | Size | Weight | Font |
+| :--- | :---: | :---: | :--- |
+| Page / Task Title | `18px` (`16px` ≤ 1024px) | `600` | Inter |
+| KPI Hero Figure | `20px` (`18px` ≤ 1024px) | `600` | JetBrains Mono (`tabular-nums`) |
+| Section Heading | `12px` | `600` | Inter (`letter-spacing: 0.02em`) |
+| Body / Controls | `13px` | `400 / 500` | Inter |
+| Technical / Log Stream | `12px` (`1.6` line-height) | `400` | JetBrains Mono |
 
-## 浅色
+---
 
-白色内容面、浅灰侧栏与选中状态，尽量用留白和对齐分组，减少嵌套卡片。核心颜色：画布 `#ffffff`，侧栏 `#f5f5f5`，主文字 `#27292e`，辅助文字 `#626974`，蓝色强调 `#416dc6`，运行状态 `#2b6e52`。
+## 2. Color Palette & Three-Layer Surface Depth
 
-训练进度与 GPU 概览并排，日志横跨内容区。八卡在宽窗口下为两列；小窗口改为单列并内部滚动。
+Light and Dark themes use strictly matching 3-layer elevation tokens (`--bg-canvas` / `--bg-surface` / `--bg-elevated`), recessed `--bg-inset` log wells, and high-contrast `--accent-ink` on primary fills (WCAG AAA ≥ 7:1).
 
-## 深色
+| Token | Atelier Light (`data-theme="light"`) | Obsidian Dark (`data-theme="dark"`) | Usage |
+| :--- | :--- | :--- | :--- |
+| `--bg-canvas` | `#F4F5F7` | `#0E1014` | App shell background & main canvas |
+| `--bg-sidebar` | `#ECEEF2` | `#12151B` | Left fleet tree sidebar |
+| `--bg-surface` | `#FFFFFF` | `#161A22` | Telemetry cards, GPU cards, modals |
+| `--bg-elevated` | `#FFFFFF` | `#1E232E` | Popovers, menus, floating jump pill |
+| `--bg-inset` | `#F8FAFC` | `#0A0C10` | Recessed terminal log stream well & chart plot |
+| `--bg-hover` | `#F1F3F6` | `#1F2430` | Interactive hover backgrounds |
+| `--border-subtle` | `#E4E7EC` | `#232836` | Card hairlines and panel dividers |
+| `--border-strong` | `#CBD2DC` | `#333B4D` | Inputs, buttons, active outlines |
+| `--text-primary` | `#0F172A` | `#F1F5F9` | Primary headings & values |
+| `--text-secondary` | `#475569` | `#94A3B8` | Labels, metadata, secondary copy |
+| `--text-muted` | `#64748B` | `#64748B` | Timestamps, placeholders, captions |
+| `--accent` | `#2563EB` | `#60A5FA` | Primary actions, active selections, focus rings |
+| `--accent-ink` | `#FFFFFF` | `#0B1120` | Foreground text on `--accent` backgrounds |
+| `--status-running` | `#059669` | `#34D399` | Active training, connected host |
+| `--status-warning` | `#D97706` | `#FBBF24` | Queued, stale, countdown, high load |
+| `--status-danger` | `#DC2626` | `#F87171` | Disconnected, OOM/crash, error logs |
 
-中性的石墨灰，避免原来的高饱和藏蓝。核心颜色：画布 `#1c1d20`，侧栏 `#17181b`，面板 `#202125`，主文字 `#e6e7e9`，辅助文字 `#a0a5ae`，强调 `#9ab7fa`，运行状态 `#8dc6a5`。
+### 4-Tier GPU Load Color Scale
 
-GPU 位于独立右栏，跨越进度和日志区域高度。训练进度与日志位于左侧，窄窗口右栏适度收窄并允许内部滚动。
+- **Idle (`0–10%`)**: `--load-idle` (`#10B981` light / `#34D399` dark)
+- **Active (`11–70%`)**: `--load-active` (`#3B82F6` light / `#60A5FA` dark)
+- **High (`71–90%`)**: `--load-high` (`#F59E0B` light / `#FBBF24` dark)
+- **Critical (`91–100%`)**: `--load-critical` (`#EF4444` light / `#F87171` dark)
 
-## 状态与设置
+---
 
-颜色只表达操作、选择及运行状态。GPU 整卡与训练进程分区，后者可展开；未知与过期数据保留语义，不以 0 替代未知。时间按本机时区显示；日志显示时分秒、悬停提供完整本地日期时间。
+## 3. Optical Iconography & Chrome Integration
 
-任务页的 GPU 区域只显示该任务已确认进程实际关联的卡、PID、进程利用率及进程显存；全部卡的整卡利用率放在宿主首页和独立 GPU 窗口。进程利用率未提供时明确显示未知，不用整卡利用率替代。旧归属标上次使用与待更新；新 PID 实例不继承旧实例的卡。宿主首页使用两列 GPU 列表。
+- **Icons**: All UI icons are rendered via `lucide-react` inside `src/renderer/components/Icon.tsx` (`strokeWidth={1.75}`, crisp `12–16px` sizing). Zero bare Unicode symbols (`↑`, `↓`, `⏳`, `✓`, `✕`, `●`, `⚙`, `▶`, `⏸`) appear in controls.
+- **Electron Integrated Titlebar & Theme Sync**:
+  - `src/desktop/window.ts` enables frameless integrated chrome (`titleBarStyle: 'hidden'` + `titleBarOverlay` on Windows; `titleBarStyle: 'hiddenInset'` on macOS) with `-webkit-app-region: drag` on `.app-header` and `no-drag` on interactive controls.
+  - Window background color, `nativeTheme.themeSource`, and Windows `titleBarOverlay` colors synchronize automatically on startup and whenever preferences change (`syncWindowTheme`).
+- **Anti-Flash Theme Switching**: Switching themes adds `.theme-switching` to `document.documentElement` for a single animation frame (`* { transition: none }`), completely eliminating white-flash transitions on dark buttons.
+- **Custom Scrollbars**: Thin `6px` theme-adaptive custom scrollbars across sidebar, main scroll areas, log viewport, and modals.
+- **Modular CSS Architecture**: `src/renderer/style.css` imports 9 focused modules under `src/renderer/styles/` (`tokens.css`, `base.css`, `primitives.css`, `layout.css`, `sidebar.css`, `cockpit.css`, `gpu.css`, `logs.css`, `overlays.css`) with **zero `!important` overrides** and zero missing class definitions.
 
-顶部日/月按钮直接切换并保存浅深偏好。设置保留浅色、深色、跟随系统三项。跟随系统响应 OS 变化，明确选择浅/深后固定使用所选主题。
+---
 
-细节、表单、设置和错误态使用相同语义变量。默认最小检查视口为 960×650。支持 reduced-motion；动效仅限短暂的控件颜色和指标宽度反馈。
+## 4. Unified Layout & Core Views
 
-## GPU 独立窗口
+### Unified Structural Geometry (No Light/Dark Layout Mutation)
 
-主页面顶部的 GPU 实时监控打开可独立移动和缩放的原生窗口；再次点击复用已有窗口并切到指定宿主。窗口共享采集器的约 5 秒采样，不因多开视图增加后台轮询。宿主整卡数据不依赖训练任务登记，GPU 采样失败保留原采样时间并标待更新。
+Both Light and Dark themes share the exact same layout hierarchy:
+1. **44px Deduplicated Top Header (`Header.tsx`)**: Brand + subtle `DEMO` badge (demo mode only), active host breadcrumb (`PLATFORM` badge + display name + optional task name) + inline status pill opening a diagnostic popover, and right-aligned action cluster (Process Discovery, Standalone GPU Window, Refresh with spin feedback, Alert Bell + unread badge + popover, `EN/中` Language Toggle, Theme Toggle, Settings).
+2. **Collapsible Inline Host Alert Strip (`HostConnectionPanel.tsx`)**: `0px` height when the selected host is healthy and connected; automatically appears only for disconnects, disabled hosts, pending connections, or probe errors.
+3. **248px Left Fleet Sidebar (`TaskFleetTree.tsx`)**: Host groups with platform badge + display name, non-overlapping action buttons vs right summary badges, task list with pulsing running dot + algorithm subtitle + accessible portal menu, and a bottom fleet online/running status footer with quick `+ Add Host`.
 
-窗口为 Operate 模式。沿用主题、微软雅黑和统一图标；主窗口与独立窗口同步主题及登记变更。设备标签保持在顶部，GPU 列表使用完整可用宽度：宽度不超过 700px 为单列，701～1499px 为两列，1500px 起为四列。宽屏适度增大字号及间距，不强制拉伸内容填满高度；单卡列表最大宽度为 760px。窄窗使用内容区纵向滚动，顶部操作保持可见。
+### Task Cockpit (`TaskCockpit.tsx`)
 
-独立窗口的 GPU 区块明确使用 order:0，避免继承主面板资源区的排序。窗口缩放验收使用 Electron 原生 maximize、unmaximize、setContentSize；不用固定浏览器视口模拟原生窗口的还原行为。
+- **Header**: Task name, lifecycle badge, attribution confidence pill (`已确认进程` / `进程树推断` / `仅日志追踪`), algorithm badge, working directory, and action cluster (Open Terminal / SSH / tmux, Auto-Start, optional Job Control when `host.allowJobControl === true`, Copy Path, Task Details).
+- **Compact Auto-Start Strip (`AutoStartPanel.tsx`)**: 2-row high-density banner with condition chips, `Continues offline` server-tmux indicator, live linear countdown bar, and collapsible copyable `tmux attach` command.
+- **Unified 2-Column Telemetry Row**:
+  - **Left Card**: Adaptive `DualProgressBar` (renders a single progress track unless resumed-session evidence exists) + 4-cell tabular monospace `KpiMetricsGrid` (Step, Loss / LR, 2-decimal throughput, humanized ETA) + compact Checkpoint row.
+  - **Right Card**: Interactive SVG `TrainingChart` (`Loss` / `Eval Loss` / `LR` / `Throughput` with EMA smoothing & crosshair hover tooltip) and `ResourceMetrics` (process-attributed GPU cards + collapsible process tree). Displayed as segmented tabs on `< 1440px` and side-by-side split on `>= 1440px` when curve data is present.
+- **Terminal-Grade Log Console (`LogConsole.tsx`)**: Always visible above the fold (`>= 180px` even at `960×650`). Recessed `--bg-inset` surface, `JetBrains Mono`, virtualized dynamic rows (`@tanstack/react-virtual`), safe ANSI 16/256/TrueColor rendering (`src/renderer/utils/ansi.ts`, zero `dangerouslySetInnerHTML`), level filter capsules (`ALL` / `ERR` / `WARN` / `INFO`), bordered search with `Aa` case & `.*` regex toggles, `<mark>` highlighting, match counter + prev/next navigation, readable filename source tabs, `\r` in-place redraw, wrap/lock/export/clear/refresh controls, centered empty states, and bottom-right floating jump-to-bottom capsule.
 
-## GPU 空闲自动启动
+### Host Overview & Standalone GPU Monitor (`HostOverview.tsx`, `GpuMonitor.tsx`)
 
-仅 SSH 服务器提供 tmux 托管；界面明确确认提交后可关闭本机，WSL 不提供该选项。监控全部 GPU，任意一张卡独立连续空闲达标即可使用一张卡启动，不提供多选和全卡同时空闲条件。任务页显示候选卡与连续时间、启动后使用的卡和 PID，不显示全部整卡资源图。网络断开显示状态待确认，并说明服务器可能仍在等待，不把本机断线显示为已取消。
+- **Fleet Summary Strip (`FleetSummaryStrip.tsx`)**: 4 KPI tiles (Idle GPUs, Total VRAM Used/Total, Average Utilization, Peak Temperature), Host CPU / RAM / Disk micro-bars, and `All / Idle Only` filter toggle.
+- **Natural-Height GPU Cards (`ResourceMetrics.tsx`)**: Eliminates artificial `min-height` whitespace; displays card ID + short model name, 4-tier load badge, temperature & power draw/limit, utilization meter + restored visible VRAM meter (`.gpu-memory-meter`), 15-minute dual-line SVG `Sparkline`, and active GPU process tags with click-to-jump to monitored tasks.
+- **Responsive Breakpoints**: Standalone GPU window adapts cleanly across native `maximize`, `unmaximize`, and `setContentSize` (`<= 700px`: 1 col, `701–1499px`: 2 cols, `>= 1500px`: 4 cols).
 
-任务标题提供配置入口，编辑器设置连续空闲秒数、利用率和显存阈值及 Python 启动参数。旧规则默认不转换为远程托管，保存明确启用时生成新 arm。提供编辑、重新等待和停用；停用与修改先获得服务器取消确认，再更新本地配置，不终止训练进程。等待会话可展开查看 tmux attach 命令，代码换行避免小窗口横向溢出。沿用两套主题、表单控件和窄窗纵向滚动。
+### Settings, Forms & Technical Details
+
+- **Tabbed Settings (`SettingsModal.tsx`)**: 3 tabs — **Appearance & Language** (theme cards with palette swatches, `zh-CN / en-US` toggle, tray/autostart behavior), **Hosts** (card-based host management with SSH/WSL discovery, `pollIntervalMs`, opt-in `allowJobControl`, and mandatory secondary confirmation dialog when deleting hosts with tasks), and **Alerts & Webhooks** (desktop notifications, rule toggles, thresholds, webhook editor + live test send).
+- **Progressive Task Editor (`TaskEditor.tsx` & `AutoStartFields.tsx`)**: Quick-import banner from running GPU processes (`ProcessDiscoveryModal`), auto-slug `taskId`, full-width monospace path inputs with inline validation, collapsible Advanced options (`<optgroup>` legacy formats, path mode, custom regexes), and 3-section Auto-Start configuration (`Trigger Conditions`, `Launch Command & Environment` with script/module/command switch & KV env editor, and `Collapsible Advanced`).
+- **Streamlined Technical Details Drawer (`EvidenceDrawer.tsx`)**: Clean KV tables with one-click copy chips for attribution, process tree, log cursors, checkpoint metadata, queue lock, and evidence chain (no duplicated `<ResourceMetrics />`).
+
+---
+
+## 5. Verification Matrix
+
+All UI changes are verified via automated unit tests (`vitest`) and real Electron Playwright visual audits across **`1440×900`**, **`1280×800`**, and **`960×650`** in both **Light** and **Dark** themes covering:
+1. Host Overview (8 GPUs + Fleet Summary Strip + Sparklines + Empty-task onboarding)
+2. Task Cockpit (Progress + Training Chart + Process GPU + ANSI Log Console + Auto-Start Countdown)
+3. Task Editor & Auto-Start Modal
+4. Settings Modal (all 3 tabs) & Process Discovery Modal
+5. Standalone GPU Window (normal + native maximized)
