@@ -1,7 +1,8 @@
 import { _electron as electron, expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, copyFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
+import { mkdtemp, rm, copyFile } from 'node:fs/promises';
 import { build } from 'esbuild';
 import os from 'node:os';
 
@@ -12,8 +13,7 @@ let testData: string;
 test.beforeAll(async () => {
   testData = await mkdtemp(path.join(os.tmpdir(), 'TrainingMonitor-ui-desktop-'));
   app = await electron.launch({
-    args: [path.resolve('dist/main.cjs'), '--demo'],
-    env: { ...process.env, APPDATA: path.join(testData, 'appdata') },
+    args: [path.resolve('dist/main.cjs'), '--demo', `--user-data-dir=${path.join(testData, 'profile')}`],
   });
   page = await app.firstWindow();
 });
@@ -343,24 +343,24 @@ test.describe('isolated simulated renderer fixture geometry',()=>{
   let fixturePage:Page;
   let fixtureDirectory:string;
   test.beforeAll(async()=>{
-    const baseDir=path.resolve('.superpowers/sdd/2026-10-18-training-monitor-implementation');
-    await mkdir(baseDir,{recursive:true});
-    fixtureDirectory=await mkdtemp(path.join(baseDir,'task-7-fix-4-fixture-'));
+    fixtureDirectory=await mkdtemp(path.join(testData,'renderer-fixture-'));
     await build({entryPoints:[path.resolve('tests/ui/electron-fixture.tsx')],bundle:true,outfile:path.join(fixtureDirectory,'fixture.js'),platform:'browser',format:'iife',loader:{'.woff2':'file'},define:{'process.env.NODE_ENV':'"production"'}});
     await copyFile(path.resolve('tests/ui/electron-fixture.html'),path.join(fixtureDirectory,'index.html'));
   });
   test.beforeEach(async()=>{
-    const created=app.waitForEvent('window');
+    const fixturePath = path.join(fixtureDirectory, 'index.html');
+    const fixtureUrl = pathToFileURL(fixturePath).href;
     await app.evaluate(async({BrowserWindow,session},file)=>{
       const isolated=session.fromPartition('fix4-renderer-fixture');isolated.webRequest.onBeforeRequest((details,callback)=>callback({cancel:!details.url.startsWith('file:')}));isolated.setPermissionCheckHandler(()=>false);isolated.setPermissionRequestHandler((_w,_p,callback)=>callback(false));
       const window=new BrowserWindow({width:1200,height:800,webPreferences:{contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true,session:isolated}});
       window.webContents.setWindowOpenHandler(()=>({action:'deny'}));window.webContents.on('will-navigate',event=>event.preventDefault());
       await window.loadFile(file);
-    },path.join(fixtureDirectory,'index.html'));
-    fixturePage=await created;await fixturePage.getByText('SIMULATED fixture log 499 training progress',{exact:true}).waitFor();
+    }, fixturePath);
+    await expect.poll(() => app.windows().map(window => window.url())).toContain(fixtureUrl);
+    fixturePage = app.windows().find(window => window.url() === fixtureUrl)!;
+    await expect(fixturePage.locator('.log-console-footer')).toContainText('500');
   });
   test.afterEach(async()=>{await fixturePage.close();});
-  test.afterAll(async()=>{if(!fixtureDirectory)return;const root=path.resolve('.superpowers/sdd/2026-10-18-training-monitor-implementation')+path.sep;if(!fixtureDirectory.startsWith(root))throw new Error('Fixture cleanup escaped coordination directory');await rm(fixtureDirectory,{recursive:true,force:true});});
 
   async function command(name:string,...args:unknown[]){await fixturePage.evaluate(({name,args})=>(window as any).simulatedRendererFixture[name](...args),{name,args});}
   async function bottom(){const v=fixturePage.locator('.log-viewport');await expect.poll(()=>v.evaluate(el=>Math.abs(el.scrollHeight-el.clientHeight-el.scrollTop))).toBeLessThan(5);}

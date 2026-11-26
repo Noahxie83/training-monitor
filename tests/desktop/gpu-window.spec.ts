@@ -1,15 +1,13 @@
 import { _electron as electron, expect, test } from '@playwright/test';
 import path from 'node:path';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 
 test('opens, reuses, updates and closes a GPU companion without affecting the main window', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'TrainingMonitor-gpu-window-'));
-  const appData = path.join(directory, 'appdata');
-  await mkdir(appData);
-  const bootstrap = path.join(directory, 'bootstrap.cjs');
-  await writeFile(bootstrap, `const {app}=require('electron');app.setPath('appData',${JSON.stringify(appData)});require(${JSON.stringify(path.resolve('dist/main.cjs'))});`);
-  const app = await electron.launch({ args: [bootstrap, '--demo', `--user-data-dir=${path.join(directory, 'lock')}`] });
+  const app = await electron.launch({
+    args: [path.resolve('dist/main.cjs'), '--demo', `--user-data-dir=${directory}`],
+  });
   try {
     const main = await app.firstWindow();
     await main.getByRole('button', { name: '打开 GPU 实时监控窗口' }).waitFor();

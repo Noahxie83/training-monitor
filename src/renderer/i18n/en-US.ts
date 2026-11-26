@@ -28,6 +28,16 @@ export const enUS = {
     unobserved: 'Pending',
     none: '—',
   },
+  recovery: {
+    title: 'This window encountered an error',
+    description: 'Reload this window to try again or copy the diagnostic information to report the problem.',
+    unknownError: 'An unexpected rendering error occurred.',
+    reload: 'Reload window',
+    copy: 'Copy diagnostic information',
+    copied: 'Diagnostic information copied.',
+    copyFailed: 'Select the diagnostic text below to copy it manually.',
+    diagnostic: 'Diagnostic information',
+  },
   header: {
     hostStatusAria: 'Host connection status',
     switchHostAria: 'Switch to {hostId}',

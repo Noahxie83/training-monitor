@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { AutoStartStatus, HostRegistration, Registry, TaskRegistration } from '../shared/contracts';
 import type { HostObservation, ServerWaitResult, Transport } from '../transport/types';
-import type { LaunchLedger } from './ledger';
 
 export function launchConfigHash(host: HostRegistration, task: TaskRegistration): string {
   return createHash('sha256').update(JSON.stringify({
@@ -19,7 +18,6 @@ export function launchConfigHash(host: HostRegistration, task: TaskRegistration)
 
 type State = { hash: string; status: AutoStartStatus };
 interface Options {
-  ledger?: LaunchLedger;
   clock: () => number;
   monotonicClock?: () => number;
   registryProvider: () => Promise<Registry>;

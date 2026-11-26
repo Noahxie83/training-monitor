@@ -200,6 +200,7 @@ export function LogConsole({
   const [isAnchorEvictedState, setIsAnchorEvictedState] = useState<boolean>(false);
   const effectiveAnchorEvicted = isAnchorEvicted ?? isAnchorEvictedState;
   const anchorRef = useRef<{ eventId: string; offsetInRow: number } | null>(null);
+  const previousScroll = useRef({ top: 0, maximum: 0 });
   const hasSelectionRef = useRef<boolean>(false);
   const isScrollLockedRef = useRef<boolean>(isScrollLocked);
   isScrollLockedRef.current = isScrollLocked;
@@ -284,6 +285,7 @@ export function LogConsole({
     count: visibleEvents.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => 24,
+    anchorTo: isScrollLocked ? 'start' : 'end',
     overscan: 25,
     getItemKey: (index) => visibleEvents[index]?.eventId ?? index,
     measureElement: (element, entry, instance) => {
@@ -362,20 +364,28 @@ export function LogConsole({
 
   const currentTailId = visibleEvents[visibleEvents.length - 1]?.eventId ?? null;
   const currentTailText = visibleEvents[visibleEvents.length - 1]?.text ?? null;
-  useEffect(() => {
+  const totalRowHeight = rowVirtualizer.getTotalSize();
+  const viewportHeight = rowVirtualizer.scrollRect?.height;
+  useLayoutEffect(() => {
     if (!isScrollLocked && !hasSelectionRef.current && visibleEvents.length > 0) {
-      rowVirtualizerRef.current.scrollToIndex(visibleEvents.length - 1, { align: 'end' });
+      rowVirtualizerRef.current.scrollToEnd();
     }
-  }, [currentTailId, currentTailText, isScrollLocked, visibleEvents.length]);
+  }, [currentTailId, currentTailText, isScrollLocked, totalRowHeight, viewportHeight, visibleEvents.length]);
 
   const handleScroll = () => {
     const el = parentRef.current;
     if (!el) return;
-    const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
-    if (!isAtBottom) {
-      if (!isScrollLocked) setIsScrollLocked(true);
-      captureAnchor();
+    const { scrollTop: top, scrollHeight, clientHeight } = el;
+    const maximum = scrollHeight - clientHeight;
+    const previous = previousScroll.current;
+    previousScroll.current = { top, maximum };
+    if (maximum - top < 30) return;
+    if (!isScrollLocked) {
+      // Filtering and remeasurement may dispatch scroll while the layout changes.
+      if (maximum !== previous.maximum || top >= previous.top) return;
+      setIsScrollLocked(true);
     }
+    captureAnchor();
   };
 
   useEffect(() => {
@@ -1011,7 +1021,7 @@ export function LogConsole({
             <div
               className="log-virtual-inner"
               style={{
-                height: `${rowVirtualizer.getTotalSize()}px`,
+                height: `${totalRowHeight}px`,
                 width: '100%',
                 position: 'relative',
               }}

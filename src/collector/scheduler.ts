@@ -61,14 +61,17 @@ export class CollectorScheduler {
     }
   }
 
-  stop(): void {
-    this.stopped = true;
-    for (const task of this.tasks) {
-      task.cancelled = true;
-      task.timer = null;
-    }
+  pause(): void {
+    this.started = false;
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
+    for (const task of this.tasks) task.timer = null;
+  }
+
+  stop(): void {
+    this.stopped = true;
+    this.pause();
+    for (const task of this.tasks) task.cancelled = true;
     this.tasks.length = 0;
   }
 
@@ -81,7 +84,7 @@ export class CollectorScheduler {
     const timer = setTimeout(() => {
       this.timers.delete(timer);
       if (task.timer === timer) task.timer = null;
-      if (this.stopped || task.cancelled) return;
+      if (!this.started || this.stopped || task.cancelled) return;
       // Keep one periodic timer armed for every task. A slow operation only
       // suppresses overlap; it must not leave that task unscheduled.
       this.arm(task);

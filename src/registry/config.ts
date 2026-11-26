@@ -1,9 +1,10 @@
-import { copyFile, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { ConfigRecoveryNotice, HostRegistration, HostTarget, Registry } from '../shared/contracts';
 import { validateRegistry } from '../shared/validate';
 import { createDefaultRegistry } from './presets';
+import { backUpCorruptConfig, ConfigRecoveryDeclined, type ConfigRecoveryOptions } from './recovery';
 
 const queues = new Map<string, Promise<unknown>>();
 
@@ -130,10 +131,8 @@ function validateSavedRegistry(value: unknown): Registry {
   catch { throw new Error('REGISTRY_INVALID'); }
 }
 
-export interface RegistryStoreOptions {
+export interface RegistryStoreOptions extends ConfigRecoveryOptions {
   defaults?: () => Registry;
-  onRecovery?: (notice: ConfigRecoveryNotice) => void;
-  clock?: () => number;
 }
 
 export interface RegistryStore {
@@ -156,26 +155,15 @@ export function createRegistryStore(
   const v1BackupFilename = path.join(dir, 'registry.v1.bak.json');
   let lastRecoveryNotice: ConfigRecoveryNotice | null = null;
 
-  async function quarantineCorrupt(raw: string, errorCode: string): Promise<Registry> {
-    const timestamp = new Date(clock()).toISOString().replace(/[:.]/g, '-');
-    const backupPath = `${filename}.corrupt-${timestamp}.bak`;
-    try {
-      await atomicWriteFile(backupPath, raw);
-      await rm(filename, { force: true }).catch(() => undefined);
-    } catch {
-      try { await copyFile(filename, backupPath); } catch { /* Best-effort quarantine. */ }
-    }
-    const notice: ConfigRecoveryNotice = {
-      file: 'registry',
-      backupPath,
-      errorCode,
-      recoveredAt: new Date(clock()).toISOString(),
-      message: `registry.json 损坏或格式无效 (${errorCode})，已自动隔离备份至 ${path.basename(backupPath)} 并恢复默认配置。`,
-    };
+  async function quarantineCorrupt(errorCode: string): Promise<Registry> {
+    const notice = await backUpCorruptConfig(filename, 'registry', errorCode, clock);
     lastRecoveryNotice = notice;
     console.error(`[registry] ${notice.message}`);
+    if (opts.confirmRecovery && !await opts.confirmRecovery(notice)) throw new ConfigRecoveryDeclined(notice.message);
+    const registry = validateSavedRegistry(defaults());
+    await atomicWriteFile(filename, `${JSON.stringify(registry, null, 2)}\n`);
     opts.onRecovery?.(notice);
-    return validateSavedRegistry(defaults());
+    return registry;
   }
 
   async function readCurrent(): Promise<Registry> {
@@ -188,13 +176,13 @@ export function createRegistryStore(
     let parsed: unknown;
     try { parsed = JSON.parse(raw); }
     catch {
-      return quarantineCorrupt(raw, 'REGISTRY_CORRUPT');
+      return quarantineCorrupt('REGISTRY_CORRUPT');
     }
     let result: RegistryMigrationResult;
     try {
       result = migrateRegistry(parsed);
     } catch {
-      return quarantineCorrupt(raw, 'REGISTRY_INVALID');
+      return quarantineCorrupt('REGISTRY_INVALID');
     }
     if (result.migrated) {
       // Atomic v1 backup prior to writing v2 registry.

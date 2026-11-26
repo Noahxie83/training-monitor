@@ -804,8 +804,8 @@ function validateWindowBounds(value: unknown): WindowBounds {
   if (
     typeof b.x !== 'number' || !Number.isFinite(b.x) ||
     typeof b.y !== 'number' || !Number.isFinite(b.y) ||
-    typeof b.width !== 'number' || !Number.isFinite(b.width) || b.width <= 0 ||
-    typeof b.height !== 'number' || !Number.isFinite(b.height) || b.height <= 0 ||
+    typeof b.width !== 'number' || !Number.isFinite(b.width) || b.width < 1 ||
+    typeof b.height !== 'number' || !Number.isFinite(b.height) || b.height < 1 ||
     (b.isMaximized !== undefined && typeof b.isMaximized !== 'boolean')
   ) {
     throw new TypeError('INVALID_PREFERENCES');
@@ -830,7 +830,14 @@ export function validatePreferences(value: unknown): Preferences {
   if (p.locale !== undefined) result.locale = p.locale as Preferences['locale'];
   if (p.minimizeToTrayOnClose !== undefined) result.minimizeToTrayOnClose = p.minimizeToTrayOnClose;
   if (p.launchAtLogin !== undefined) result.launchAtLogin = p.launchAtLogin;
-  if (p.windowBounds !== undefined) result.windowBounds = validateWindowBounds(p.windowBounds);
+  if (p.windowBounds !== undefined) {
+    const bounds = object(p.windowBounds, 'INVALID_PREFERENCES');
+    exact(bounds, ['main', 'gpu'], 'INVALID_PREFERENCES');
+    result.windowBounds = {
+      ...(bounds.main === undefined ? {} : { main: validateWindowBounds(bounds.main) }),
+      ...(bounds.gpu === undefined ? {} : { gpu: validateWindowBounds(bounds.gpu) }),
+    };
+  }
   if (p.alerts !== undefined) result.alerts = validateAlertPreferences(p.alerts);
   return result;
 }

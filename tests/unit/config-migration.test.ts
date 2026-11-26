@@ -152,7 +152,7 @@ describe('v1 -> v2 registry migration and config recovery', () => {
       locale: 'en-US',
       minimizeToTrayOnClose: true,
       launchAtLogin: false,
-      windowBounds: { x: 10, y: 20, width: 1200, height: 800, isMaximized: false },
+      windowBounds: { main: { x: 10, y: 20, width: 1200, height: 800, isMaximized: false } },
     });
 
     const dir = await makeTempDir('monitor-prefs-corrupt-');
@@ -165,5 +165,44 @@ describe('v1 -> v2 registry migration and config recovery', () => {
     expect(notices[0]?.file).toBe('preferences');
     const files = await readdir(dir);
     expect(files.some((f) => f.startsWith('preferences.json.corrupt-') && f.endsWith('.bak'))).toBe(true);
+  });
+
+  it('preserves the corrupt original while opening the configuration folder and resets only on confirmation', async () => {
+    const directory = await makeTempDir('monitor-config-recovery-');
+    const registryPath = path.join(directory, 'registry.json');
+    const original = Buffer.from([0x7b, 0xff, 0x7d]);
+    await writeFile(registryPath, original);
+
+    const declined = createRegistryStore(directory, {
+      confirmRecovery: async (notice) => {
+        expect(await readFile(notice.backupPath)).toEqual(original);
+        return false;
+      },
+    });
+    await expect(declined.loadRegistry()).rejects.toThrow('REGISTRY_CORRUPT');
+    expect(await readFile(registryPath)).toEqual(original);
+
+    const confirmed = createRegistryStore(directory, { confirmRecovery: () => true });
+    expect(await confirmed.loadRegistry()).toEqual(createDefaultRegistry());
+    expect(JSON.parse(await readFile(registryPath, 'utf8'))).toEqual(createDefaultRegistry());
+    expect(await readFile(confirmed.getRecoveryNotice()!.backupPath)).toEqual(original);
+  });
+
+  it('merges concurrent window geometry and settings writes and preserves old main bounds', async () => {
+    const directory = await makeTempDir('monitor-preferences-geometry-');
+    const main = { x: -400, y: 20, width: 1200, height: 800, isMaximized: true };
+    const gpu = { x: 100, y: 40, width: 700, height: 500, isMaximized: false };
+    await writeFile(path.join(directory, 'preferences.json'), JSON.stringify({ version: 1, theme: 'dark', windowBounds: main }));
+    const store = createPreferencesStore(directory);
+    await Promise.all([
+      store.saveWindowBounds('gpu', gpu),
+      store.save({ theme: 'light', minimizeToTrayOnClose: false, launchAtLogin: true }),
+    ]);
+    expect(await store.load()).toEqual({
+      theme: 'light',
+      minimizeToTrayOnClose: false,
+      launchAtLogin: true,
+      windowBounds: { main, gpu },
+    });
   });
 });

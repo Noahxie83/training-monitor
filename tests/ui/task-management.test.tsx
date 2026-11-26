@@ -27,7 +27,7 @@ async function openMenu(label: string) {
 describe('main-page task management', () => {
   it('hides deleted cached tasks, remains empty after a late snapshot, and keeps the add entry on the main page', async () => {
     const { api, staleSnapshot } = setup(true);
-    await waitFor(() => expect(screen.getAllByRole('button', { name: '添加任务', exact: true }).length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByRole('button', { name: '添加任务' }).length).toBeGreaterThan(0));
     expect(screen.getByRole('heading', { name: '暂无已登记任务' })).toBeDefined();
     expect(screen.queryByText('Flow Matching')).toBeNull();
     act(() => api.emitUpdate({ kind: 'snapshot', snapshot: staleSnapshot }));
@@ -90,8 +90,8 @@ describe('main-page task management', () => {
 
   it('keeps form input on a save conflict and permits cancel without saving', async () => {
     const { save } = setup(true);
-    await waitFor(() => expect(screen.getAllByRole('button', { name: '添加任务', exact: true }).length).toBeGreaterThan(0));
-    fireEvent.click(screen.getAllByRole('button', { name: '添加任务', exact: true })[0]!);
+    await waitFor(() => expect(screen.getAllByRole('button', { name: '添加任务' }).length).toBeGreaterThan(0));
+    fireEvent.click(screen.getAllByRole('button', { name: '添加任务' })[0]!);
     const dialog = screen.getByRole('dialog', { name: '添加任务' });
     const fill = (name: string, value: string) => fireEvent.change(within(dialog).getByLabelText(name), { target: { value } });
     fill('任务 ID', 'conflict-task'); fill('工作目录', '/data2/cy/xzn/run'); fill('脚本入口', 'train.py'); fill('日志路径', '/data2/cy/xzn/run/train.log');

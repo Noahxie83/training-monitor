@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { DesktopApi, MonitorApi } from '../shared/api';
+import type { DesktopApi, MonitorApi, MonitorUpdate } from '../shared/api';
 import type { Preferences, Registry } from '../shared/contracts';
 import { CHANNELS as c } from './channels';
 import {
@@ -24,16 +24,42 @@ import {
 
 const sessionId = crypto.randomUUID();
 let sequence = 0;
+const updateListeners = new Map<string, (update: MonitorUpdate) => void>();
+ipcRenderer.on(c.update, (_event, payload: unknown) => {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+      Object.keys(payload).some((key) => !['sessionId', 'subscriptionId', 'update'].includes(key))) return;
+  const item = payload as { sessionId?: unknown; subscriptionId?: unknown; update?: unknown };
+  if (item.sessionId !== sessionId || typeof item.subscriptionId !== 'string') return;
+  const listener = updateListeners.get(item.subscriptionId);
+  if (!listener) return;
+  let update: MonitorUpdate;
+  try {
+    update = validateMonitorUpdate(item.update);
+  } catch (error) {
+    console.warn('MONITOR_INVALID_UPDATE', error);
+    return;
+  }
+  listener(update);
+});
+
 const api: MonitorApi = {
   async getSnapshot() { return validateMonitorSnapshot(await ipcRenderer.invoke(c.snapshot)); },
   subscribe(listener) {
     const subscriptionId = `sub-${++sequence}`;
-    let active = true; let registered = false;
+    let registered = false;
     const reportFailure = () => window.dispatchEvent(new CustomEvent('monitor-subscription-error', { detail: { code: 'SUBSCRIPTION_FAILED' } }));
-    const handler = (_event: Electron.IpcRendererEvent, payload: unknown) => { if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).some((k) => !['sessionId', 'subscriptionId', 'update'].includes(k))) return; const item = payload as { sessionId?: unknown; subscriptionId?: unknown; update?: unknown }; if (item.sessionId === sessionId && item.subscriptionId === subscriptionId && active) listener(validateMonitorUpdate(item.update)); };
-    ipcRenderer.on('monitor:update', handler);
-    void ipcRenderer.invoke(c.subscribe, { sessionId, subscriptionId }).then(() => { registered = true; if (!active) void ipcRenderer.invoke(c.unsubscribe, { sessionId, subscriptionId }).catch(reportFailure); }).catch(() => { ipcRenderer.removeListener('monitor:update', handler); reportFailure(); });
-    return () => { active = false; ipcRenderer.removeListener('monitor:update', handler); if (registered) void ipcRenderer.invoke(c.unsubscribe, { sessionId, subscriptionId }).catch(reportFailure); };
+    const request = { sessionId, subscriptionId };
+    const unsubscribe = () => { void ipcRenderer.invoke(c.unsubscribe, request).catch(reportFailure); };
+    updateListeners.set(subscriptionId, listener);
+    void ipcRenderer.invoke(c.subscribe, request).then(() => {
+      registered = true;
+      if (!updateListeners.has(subscriptionId)) unsubscribe();
+    }).catch(() => {
+      if (updateListeners.delete(subscriptionId)) reportFailure();
+    });
+    return () => {
+      if (updateListeners.delete(subscriptionId) && registered) unsubscribe();
+    };
   },
   async requestRefresh(scope) { await ipcRenderer.invoke(c.refresh, validateRefreshScope(scope)); },
   async getLogs(query) { return validateLogPage(await ipcRenderer.invoke(c.logs, validateLogQuery(query))); },
@@ -67,11 +93,20 @@ ipcRenderer.on(c.gpuHost, (_event, hostId: unknown) => {
   if (!hostListeners.size) pendingHostId = hostId;
   else for (const listener of hostListeners) listener(hostId);
 });
+const focusTaskListeners = new Set<(taskId: string) => void>();
+let pendingTaskId: string | undefined;
+ipcRenderer.on(c.focusTask, (_event, taskId: unknown) => {
+  if (typeof taskId !== 'string' || !taskId) return;
+  if (!focusTaskListeners.size) pendingTaskId = taskId;
+  else for (const listener of focusTaskListeners) listener(taskId);
+});
 const desktop: DesktopApi = {
   async openGpuWindow(hostId) {
     if (hostId !== undefined && (typeof hostId !== 'string' || !hostId || hostId.length > 256)) throw new TypeError('INVALID_HOST_ID');
     await ipcRenderer.invoke(c.openGpu, hostId);
   },
+  async setActiveTask(taskId) { await ipcRenderer.invoke(c.activeTask, taskId); },
+  async copyDiagnosticText(text) { await ipcRenderer.invoke(c.copyDiagnostic, text); },
   onGpuHostSelected(listener) {
     hostListeners.add(listener);
     if (pendingHostId) {
@@ -100,11 +135,17 @@ const desktop: DesktopApi = {
   async openSshTerminal(request) { return ipcRenderer.invoke(c.openSshTerminal, request); },
   async copyCommand(request) { return ipcRenderer.invoke(c.copyCommand, request); },
   onFocusTask(listener) {
-    const handler = (_event: Electron.IpcRendererEvent, taskId: unknown) => {
-      if (typeof taskId === 'string' && taskId) listener(taskId);
-    };
-    ipcRenderer.on(c.focusTask, handler);
-    return () => { ipcRenderer.removeListener(c.focusTask, handler); };
+    focusTaskListeners.add(listener);
+    const taskId = pendingTaskId;
+    if (taskId) {
+      queueMicrotask(() => {
+        if (focusTaskListeners.has(listener) && pendingTaskId === taskId) {
+          pendingTaskId = undefined;
+          listener(taskId);
+        }
+      });
+    }
+    return () => { focusTaskListeners.delete(listener); };
   },
 };
 contextBridge.exposeInMainWorld('desktop', Object.freeze(desktop));

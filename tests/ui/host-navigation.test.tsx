@@ -81,7 +81,7 @@ describe('host navigation and explicit connection', () => {
     refresh.mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
     fireEvent.click(await screen.findByRole('button', { name: '选择宿主 wsl-ubuntu' }));
     const panel = screen.getByRole('region', { name: 'wsl-ubuntu连接状态' });
-    fireEvent.click(within(panel).getByRole('button', { name: '连接', exact: true }));
+    fireEvent.click(within(panel).getByRole('button', { name: '连接' }));
     expect(refresh).toHaveBeenCalledExactlyOnceWith({ hostId: 'wsl-ubuntu' });
     expect((within(panel).getByRole('button', { name: '连接中…' }) as HTMLButtonElement).disabled).toBe(true);
     await act(async () => {
@@ -105,7 +105,7 @@ describe('host navigation and explicit connection', () => {
     } }));
     fireEvent.click(await screen.findByRole('button', { name: '选择宿主 wsl-ubuntu' }));
     const panel = screen.getByRole('region', { name: 'wsl-ubuntu连接状态' });
-    fireEvent.click(within(panel).getByRole('button', { name: '连接', exact: true }));
+    fireEvent.click(within(panel).getByRole('button', { name: '连接' }));
     await screen.findByText(/WSL 尚未运行，请先启动/);
     expect(within(panel).getByRole('button', { name: '重新连接' })).toBeDefined();
   });

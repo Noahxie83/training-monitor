@@ -34,7 +34,13 @@ describe('mock monitor API', () => {
     registry.hosts.push({ hostId: 'h1', label: 'Host', enabled: true, allowedRoots: ['/allowed'], target: { kind: 'wsl', distribution: 'Ubuntu-26.04' } });
     registry.tasks.push({ taskId: 't1', hostId: 'h1', label: 'Task', enabled: true, algorithm: 'flow', allowedDirectories: ['/allowed/task'], entryPaths: [], sources: [{ sourceId: 's1', path: '/allowed/task/train.log', kind: 'log' }], checkpointDirectories: [] });
     await api.saveRegistry(registry);
-    expect(await api.getSnapshot()).toMatchObject({ demo: false, hosts: [{ hostId: 'h1', freshness: 'unobserved' }], tasks: [{ taskId: 't1', lifecycle: 'unknown', freshness: 'unobserved', currentRun: null, resources: [] }], sources: [{ sourceId: 's1', taskId: 't1', state: 'unobserved' }] });
+    expect(await api.getSnapshot()).toMatchObject({
+      demo: false,
+      hosts: [{ hostId: 'h1', freshness: 'unobserved' }],
+      tasks: [{ taskId: 't1', lifecycle: 'unknown', freshness: 'unobserved', currentRun: null, resources: [], evidence: [],
+        statusObservedAt: null, progress: { runId: null, global: { fraction: null } }, checkpoint: { path: null } }],
+      sources: [{ sourceId: 's1', taskId: 't1', state: 'unobserved', observedAt: null, generation: null, committedOffset: null }],
+    });
     expect(await api.getLogs({ requestId: 'normal-source', sourceId: 's1', before: null, limit: 100 })).toMatchObject({ events: [], nextBefore: null });
     const updates: unknown[] = [];
     const unsubscribe = api.subscribe((update) => updates.push(update));

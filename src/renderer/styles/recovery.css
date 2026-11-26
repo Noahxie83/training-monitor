@@ -1,0 +1,59 @@
+.recovery-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: auto;
+  padding: 24px;
+}
+
+.recovery-card {
+  width: min(100%, 560px);
+  margin: auto;
+  padding: clamp(16px, 4vw, 32px);
+  display: grid;
+  gap: 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--card-shadow);
+}
+
+.recovery-icon {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  color: var(--status-danger);
+  background: var(--status-danger-bg);
+  border-radius: var(--radius-md);
+}
+
+.recovery-card h1 {
+  font-size: 1.5rem;
+  line-height: 1.25;
+}
+
+.recovery-description {
+  margin-top: 8px;
+  color: var(--text-secondary);
+}
+
+.recovery-message {
+  display: block;
+  max-height: 9rem;
+  width: 100%;
+  margin-top: 12px;
+  padding: 10px 12px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  background: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+}
+
+.recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

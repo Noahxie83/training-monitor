@@ -1,0 +1,126 @@
+import { _electron as electron, expect, test } from '@playwright/test';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
+
+test('hides the main window on close and keeps the GPU monitor live', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'TrainingMonitor-tray-'));
+  const app = await electron.launch({ chromiumSandbox: true, args: [path.resolve('dist/main.cjs'), '--demo', `--user-data-dir=${directory}`] });
+  try {
+    const main = await app.firstWindow();
+    const gpuOpened = app.waitForEvent('window');
+    await main.getByRole('button', { name: '打开 GPU 实时监控窗口' }).click();
+    const gpu = await gpuOpened;
+    const mainWindow = await app.browserWindow(main);
+    const gpuWindow = await app.browserWindow(gpu);
+    await expect.poll(() => gpuWindow.evaluate((window) => window.isVisible())).toBe(true);
+
+    await mainWindow.evaluate((window) => window.close());
+    await expect.poll(() => mainWindow.evaluate((window) => window.isVisible())).toBe(false);
+    expect(await gpuWindow.evaluate((window) => window.isVisible())).toBe(true);
+    await expect(gpu.getByRole('heading', { name: 'GPU 实时监控', exact: true })).toBeVisible();
+    await gpu.evaluate(() => window.monitor.requestRefresh({}));
+
+    await gpuWindow.evaluate((window) => window.close());
+    await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length)).toBe(1);
+    expect(await mainWindow.evaluate((window) => window.isVisible())).toBe(false);
+    await app.evaluate(({ app }) => app.emit('activate'));
+    await expect.poll(() => mainWindow.evaluate((window) => window.isVisible())).toBe(true);
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('backs up a damaged configuration and continues when the user chooses reset', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'TrainingMonitor-recovery-'));
+  try {
+    const damaged = '{"theme":';
+    const configuration = path.join(directory, 'preferences.json');
+    const prompt = path.join(directory, 'recovery-prompt.json');
+    const bootstrap = path.join(directory, 'bootstrap.cjs');
+    await writeFile(configuration, damaged);
+    await writeFile(bootstrap, `
+      const { dialog } = require('electron');
+      const { writeFileSync } = require('node:fs');
+      dialog.showMessageBox = async (options) => {
+        writeFileSync(${JSON.stringify(prompt)}, JSON.stringify(options));
+        return { response: 0, checkboxChecked: false };
+      };
+      require(${JSON.stringify(path.resolve('dist/main.cjs'))});
+    `);
+    const app = await electron.launch({ chromiumSandbox: true, args: [bootstrap, `--user-data-dir=${directory}`] });
+    try {
+      const main = await app.firstWindow();
+      expect(await main.evaluate(() => window.monitor.getPreferences())).toMatchObject({ theme: 'system' });
+      const backups = (await readdir(directory)).filter((name) => name.startsWith('preferences.json.corrupt-'));
+      expect(backups).toHaveLength(1);
+      const backup = path.join(directory, backups[0]!);
+      expect(await readFile(backup, 'utf8')).toBe(damaged);
+      const recoveryPrompt = JSON.parse(await readFile(prompt, 'utf8'));
+      expect(recoveryPrompt).toMatchObject({ type: 'warning', buttons: [expect.any(String), expect.any(String)], defaultId: 0 });
+      expect(recoveryPrompt.detail).toContain(backup);
+    } finally {
+      await app.close();
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('fits off-screen saved geometry to the work area and remembers a resized window', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'TrainingMonitor-geometry-'));
+  const mainEntry = path.resolve('dist/main.cjs');
+  const profile = `--user-data-dir=${directory}`;
+  try {
+    await writeFile(path.join(directory, 'preferences.json'), JSON.stringify({
+      theme: 'system',
+      windowBounds: { main: { x: 50000, y: -50000, width: 1080, height: 720, isMaximized: false } },
+    }));
+    const first = await electron.launch({ chromiumSandbox: true, args: [mainEntry, profile] });
+    const executable = first.process().spawnfile;
+    try {
+      const main = await first.firstWindow();
+      const nativeWindow = await first.browserWindow(main);
+      await expect.poll(() => nativeWindow.evaluate((window) => window.isVisible())).toBe(true);
+      const workArea = await first.evaluate(({ BrowserWindow, screen }) => {
+        const bounds = BrowserWindow.getAllWindows()[0]!.getBounds();
+        const display = screen.getPrimaryDisplay().workArea;
+        return bounds.x >= display.x && bounds.y >= display.y &&
+          bounds.x + bounds.width <= display.x + display.width &&
+          bounds.y + bounds.height <= display.y + display.height;
+      });
+      expect(workArea).toBe(true);
+      await nativeWindow.evaluate((window) => window.setSize(1060, 690));
+      await expect.poll(() => nativeWindow.evaluate((window) => window.getSize())).toEqual([1060, 690]);
+      await expect.poll(() => main.evaluate(async () => (await window.monitor.getPreferences()).windowBounds?.main))
+        .toMatchObject({ width: 1060, height: 690, isMaximized: false });
+      await main.evaluate(async () => {
+        const preferences = await window.monitor.getPreferences();
+        await window.monitor.savePreferences({ ...preferences, minimizeToTrayOnClose: false });
+      });
+    } finally {
+      await first.close();
+    }
+
+    // The attached Playwright debugger can hold Electron open after App.quit().
+    // Relaunch without a debugger to check that closing the last window exits.
+    const bootstrap = path.join(directory, 'reopen.cjs');
+    await writeFile(bootstrap, `
+      const { app } = require('electron');
+      app.once('browser-window-created', (_event, window) => {
+        window.webContents.once('did-finish-load', () => {
+          console.log('RESTORED_WINDOW_SIZE ' + JSON.stringify(window.getSize()));
+          setImmediate(() => window.close());
+        });
+      });
+      require(${JSON.stringify(mainEntry)});
+    `);
+    const { stdout } = await promisify(execFile)(executable, [bootstrap, profile], { timeout: 10_000 });
+    expect(stdout).toContain('RESTORED_WINDOW_SIZE [1060,690]');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

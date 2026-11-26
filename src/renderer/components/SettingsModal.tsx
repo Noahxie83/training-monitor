@@ -25,6 +25,7 @@ interface SettingsModalProps {
   onClose: () => void;
   preferences: Preferences;
   onUpdatePreferences: (newPrefs: Preferences) => Promise<Preferences | void> | void;
+  isSavingPreferences?: boolean;
   registry: Registry | null;
   onUpdateRegistry: (newRegistry: Registry) => Promise<Registry | void> | void;
   onReloadRegistry?: () => Promise<Registry | void> | void;
@@ -203,6 +204,7 @@ export function SettingsModal({
   onClose,
   preferences,
   onUpdatePreferences,
+  isSavingPreferences = false,
   registry,
   onUpdateRegistry,
   onReloadRegistry,
@@ -931,7 +933,8 @@ export function SettingsModal({
                 <label className="setting-check-row">
                   <input
                     type="checkbox"
-                    checked={Boolean(preferences.minimizeToTrayOnClose)}
+                    checked={preferences.minimizeToTrayOnClose ?? true}
+                    disabled={isSavingPreferences}
                     onChange={(e) => void savePreferencePatch({ minimizeToTrayOnClose: e.target.checked })}
                   />
                   <span>{t('settings.minimizeToTray')}</span>
@@ -939,7 +942,8 @@ export function SettingsModal({
                 <label className="setting-check-row">
                   <input
                     type="checkbox"
-                    checked={Boolean(preferences.launchAtLogin)}
+                    checked={preferences.launchAtLogin ?? false}
+                    disabled={isSavingPreferences}
                     onChange={(e) => void savePreferencePatch({ launchAtLogin: e.target.checked })}
                   />
                   <span>{t('settings.launchAtLogin')}</span>

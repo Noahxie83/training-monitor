@@ -38,19 +38,7 @@ export function createMockApi(options: { demo?: boolean } = {}): MonitorApi {
   let refreshCount = 0;
   const snapshot = (): MonitorSnapshot => {
     if (options.demo === true) return projectRegistrySnapshot(structuredClone(demoSnapshot), registry);
-    const hosts = registry.hosts.map((host) => ({
-      version: 1 as const, hostId: host.hostId, kind: host.target.kind, connection: 'unobserved' as const,
-      lastSuccessAt: null, lastProbeDurationMs: null, scanComplete: false, errorCode: null,
-      observedAt: null, freshness: 'unobserved' as const,
-    }));
-    const tasks = registry.tasks.map((registration) => ({
-      ...structuredClone(demoSnapshot.tasks[0]!), taskId: registration.taskId, hostId: registration.hostId,
-      lifecycle: 'unknown' as const, reason: '尚无可用观测',
-    }));
-    const sources = registry.tasks.flatMap((registration) => registration.sources.map((source) => ({
-      ...structuredClone(demoSnapshot.sources[0]!), sourceId: source.sourceId, taskId: registration.taskId,
-    })));
-    return { version: 1, demo: false, hosts, tasks, sources };
+    return projectRegistrySnapshot({ version: 1, demo: false, hosts: [], tasks: [], sources: [] }, registry);
   };
   const publishSnapshot = () => { const update: MonitorUpdate = { kind: 'snapshot', snapshot: snapshot() }; for (const listener of [...listeners]) listener(structuredClone(update)); };
   const publishDemoRedraw = () => {

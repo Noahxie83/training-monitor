@@ -1,7 +1,7 @@
 import { _electron as electron, expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import path from 'node:path';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 
 let app: ElectronApplication;
@@ -9,11 +9,10 @@ let page: Page;
 let testData: string;
 
 async function launchIsolated(demo = true): Promise<ElectronApplication> {
-  const root = path.join(testData, demo ? 'demo' : 'normal');
-  await mkdir(root, { recursive: true });
-  const bootstrap = path.join(root, 'bootstrap.cjs');
-  await writeFile(bootstrap, `const {app}=require('electron');app.setPath('appData',${JSON.stringify(root)});require(${JSON.stringify(path.resolve('dist/main.cjs'))});`);
-  return electron.launch({ args: [bootstrap, ...(demo ? ['--demo'] : []), `--user-data-dir=${path.join(root, 'lock')}`] });
+  const profile = path.join(testData, demo ? 'demo' : 'normal');
+  return electron.launch({
+    args: [path.resolve('dist/main.cjs'), ...(demo ? ['--demo'] : []), `--user-data-dir=${profile}`],
+  });
 }
 
 test.beforeAll(async () => {

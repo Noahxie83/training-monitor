@@ -434,7 +434,7 @@ function pathWithin(root: string, candidate: string): boolean {
   const isWin = /^[A-Za-z]:[\\/]/.test(root) || /^[A-Za-z]:[\\/]/.test(candidate);
   const ops = isWin ? path.win32 : path.posix;
   const relative = ops.relative(ops.resolve(root), ops.resolve(candidate));
-  return relative === '' || (!relative.startsWith('..') && !ops.isAbsolute(relative));
+  return !ops.isAbsolute(relative) && relative !== '..' && !relative.startsWith('../') && !relative.startsWith('..\\');
 }
 
 function pathScopes(host: HostRegistration, task: TaskRegistration): { hostAllowedRoots: string[]; taskAllowedDirectories: string[] } {

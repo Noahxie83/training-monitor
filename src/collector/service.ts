@@ -1,6 +1,5 @@
 import { cancelChangedServerWaits, flushPendingRemoteCancels, type PendingRemoteCancel } from '../launch/reconcile';
 import { AutoStartController } from '../launch/controller';
-import type { LaunchLedger } from '../launch/ledger';
 import { randomUUID } from 'node:crypto';
 import type {
   ControlTaskRequest,
@@ -71,7 +70,6 @@ export interface ProductionMonitorOptions {
   registrySaver?: (registry: Registry) => Promise<Registry>;
   transportProvider: (host: HostRegistration, registry: Registry) => MaybePromise<Transport>;
   clock: () => number;
-  launchLedger?: LaunchLedger;
   monotonicClock?: () => number;
   bindingStateProvider?: (taskId: string) => BindingState;
   preferencesProvider?: () => Promise<Preferences>;
@@ -83,6 +81,7 @@ export interface ProductionMonitorOptions {
 export interface ProductionMonitorApi extends MonitorApi {
   start(): Promise<void>;
   stop(): Promise<void>;
+  setCollectionPaused(paused: boolean): void;
   /** Diagnostic helper for verifying host epoch rotation on reconnect/reboot. */
   getHostEpoch?(hostId: string): string | null;
 }
@@ -489,13 +488,13 @@ class ProductionMonitor implements ProductionMonitorApi {
   private lastRetentionAtMs = 0;
   private started = false;
   private stopped = false;
+  private collectionPaused = false;
   private preferences: Preferences = { theme: 'system' };
 
   private readonly autoStart: AutoStartController;
   private readonly alertEngine: AlertEngine;
   constructor(private readonly options: ProductionMonitorOptions) {
     this.autoStart = new AutoStartController({
-      ledger: options.launchLedger,
       clock: options.clock,
       monotonicClock: options.monotonicClock,
       registryProvider: options.registryProvider,
@@ -538,7 +537,13 @@ class ProductionMonitor implements ProductionMonitorApi {
     }
     if (this.options.preferencesProvider) this.preferences = await this.options.preferencesProvider();
     this.syncHostSchedules(registry);
-    this.scheduler.start();
+    if (!this.collectionPaused) this.scheduler.start();
+  }
+
+  setCollectionPaused(paused: boolean): void {
+    this.collectionPaused = paused;
+    if (paused) this.scheduler.pause();
+    else if (this.started && !this.stopped) this.scheduler.start();
   }
 
   async stop(): Promise<void> {
@@ -590,7 +595,7 @@ class ProductionMonitor implements ProductionMonitorApi {
       }
     }
 
-    if (staleHostIds.length > 0 && !this.stopped) {
+    if (staleHostIds.length > 0 && !this.stopped && !this.collectionPaused) {
       void this.refreshSelectedHosts(registry, staleHostIds, {}, false).catch(() => undefined);
     }
 
@@ -854,7 +859,7 @@ class ProductionMonitor implements ProductionMonitorApi {
   }
 
   async getPreferences(): Promise<Preferences> {
-    return structuredClone(this.preferences);
+    return structuredClone(await this.options.preferencesProvider?.() ?? this.preferences);
   }
 
   async savePreferences(value: Preferences): Promise<Preferences> {
@@ -910,7 +915,7 @@ class ProductionMonitor implements ProductionMonitorApi {
   }
 
   private async runScheduledHostTick(hostId: string): Promise<void> {
-    if (this.stopped || this.abort.signal.aborted) return;
+    if (this.stopped || this.collectionPaused) return;
     const retry = this.hostRetry.get(hostId);
     if (retry?.nextRetryAtMs !== null && retry?.nextRetryAtMs !== undefined && this.options.clock() < retry.nextRetryAtMs) {
       return;
@@ -922,7 +927,7 @@ class ProductionMonitor implements ProductionMonitorApi {
     const host = registry.hosts.find((item) => item.hostId === hostId);
     if (!host || !host.enabled) return;
     await this.enqueueHostWork(host.hostId, async () => {
-      if (this.stopped || this.abort.signal.aborted) return;
+      if (this.stopped || this.collectionPaused) return;
       const latestRegistry = await this.options.registryProvider();
       const latestHost = latestRegistry.hosts.find((item) => item.hostId === hostId);
       if (!latestHost || !latestHost.enabled) return;

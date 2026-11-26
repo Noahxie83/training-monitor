@@ -49,4 +49,29 @@ describe('collector scheduler', () => {
     expect(module.nextBackoffMs(40_000)).toBe(60_000);
     expect(module.nextBackoffMs(60_000)).toBe(60_000);
   });
+
+  it('pauses polling while in-flight work drains and resumes with one timer per host', async () => {
+    const { CollectorScheduler } = await import('../../src/collector/scheduler');
+    vi.useFakeTimers();
+    const scheduler = new CollectorScheduler();
+    const collect = vi.fn(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    });
+    scheduler.schedule(50, 'host-a', collect);
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(50);
+    scheduler.pause();
+    expect(scheduler.activeTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(500);
+    await scheduler.waitIdle();
+    expect(collect).toHaveBeenCalledTimes(1);
+
+    scheduler.start();
+    scheduler.start();
+    expect(scheduler.activeTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(60);
+    expect(collect).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+    await scheduler.waitIdle();
+  });
 });

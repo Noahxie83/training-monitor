@@ -54,7 +54,7 @@ function componentWithin(root: string, candidate: string): boolean {
   const isWin = /^[A-Za-z]:[\\/]/.test(root) || /^[A-Za-z]:[\\/]/.test(candidate);
   const ops = isWin ? path.win32 : path.posix;
   const relative = ops.relative(ops.resolve(root), ops.resolve(candidate));
-  return relative === '' || (!relative.startsWith('..') && !ops.isAbsolute(relative));
+  return !ops.isAbsolute(relative) && relative !== '..' && !relative.startsWith('../') && !relative.startsWith('..\\');
 }
 
 export async function loadRotationCatalog(filename: string, registryProvider: () => Promise<Registry>): Promise<RotationCatalogLoad> {

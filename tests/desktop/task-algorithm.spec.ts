@@ -1,19 +1,14 @@
 import { _electron as electron, expect, test } from '@playwright/test';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
 test('saves and reopens an arbitrary algorithm name through the production UI and IPC', async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'TrainingMonitor-algorithm-'));
-  const appData = path.join(directory, 'data');
-  const configDirectory = path.join(appData, 'TrainingMonitor');
-  await mkdir(configDirectory, { recursive: true });
+  const configDirectory = await mkdtemp(path.join(os.tmpdir(), 'TrainingMonitor-algorithm-'));
   await writeFile(path.join(configDirectory, 'registry.json'), JSON.stringify({ version: 1, revision: 0, tasks: [],
     hosts: [{ hostId: 'algorithm-test', label: '测试宿主', enabled: false, allowedRoots: ['/simulated'], target: { kind: 'wsl', distribution: 'Ubuntu-26.04' } }] }));
   await writeFile(path.join(configDirectory, 'preferences.json'), JSON.stringify({ theme: 'light' }));
-  const bootstrap = path.join(directory, 'main.cjs');
-  await writeFile(bootstrap, `const {app}=require('electron');app.setPath('appData',${JSON.stringify(appData)});require(${JSON.stringify(path.resolve('dist/main.cjs'))});`);
-  const app = await electron.launch({ args: [bootstrap, `--user-data-dir=${path.join(directory, 'lock')}`] });
+  const app = await electron.launch({ args: [path.resolve('dist/main.cjs'), `--user-data-dir=${configDirectory}`] });
   try {
     const page = await app.firstWindow();
     await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.setContentSize(1100, 800));
@@ -45,6 +40,6 @@ test('saves and reopens an arbitrary algorithm name through the production UI an
     await expect(page.getByLabel('日志识别')).toHaveValue('generic');
   } finally {
     await app.close();
-    if (path.resolve(directory).startsWith(path.resolve(os.tmpdir()) + path.sep)) await rm(directory, { recursive: true, force: true });
+    await rm(configDirectory, { recursive: true, force: true });
   }
 });

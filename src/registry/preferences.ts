@@ -1,17 +1,17 @@
-import { copyFile, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { ConfigRecoveryNotice, Preferences, WindowBounds } from '../shared/contracts';
 import { validatePreferences } from '../shared/validate';
+import { backUpCorruptConfig, ConfigRecoveryDeclined, type ConfigRecoveryOptions } from './recovery';
 
-export interface PreferencesStoreOptions {
-  onRecovery?: (notice: ConfigRecoveryNotice) => void;
-  clock?: () => number;
-}
+export type PreferencesStoreOptions = ConfigRecoveryOptions;
 
 export interface PreferencesStore {
   load(): Promise<Preferences>;
   save(value: Preferences): Promise<Preferences>;
+  saveWindowBounds(kind: 'main' | 'gpu', bounds: WindowBounds): Promise<void>;
+  flush(): Promise<void>;
   getRecoveryNotice(): ConfigRecoveryNotice | null;
 }
 
@@ -21,8 +21,8 @@ function parseWindowBounds(value: unknown): WindowBounds | undefined {
   if (
     typeof b.x !== 'number' || !Number.isFinite(b.x) ||
     typeof b.y !== 'number' || !Number.isFinite(b.y) ||
-    typeof b.width !== 'number' || !Number.isFinite(b.width) || b.width <= 0 ||
-    typeof b.height !== 'number' || !Number.isFinite(b.height) || b.height <= 0
+    typeof b.width !== 'number' || !Number.isFinite(b.width) || b.width < 1 ||
+    typeof b.height !== 'number' || !Number.isFinite(b.height) || b.height < 1
   ) {
     return undefined;
   }
@@ -60,9 +60,11 @@ export function migratePreferences(raw: unknown): Preferences {
   if (typeof row.launchAtLogin === 'boolean') {
     migrated.launchAtLogin = row.launchAtLogin;
   }
-  const bounds = parseWindowBounds(row.windowBounds);
-  if (bounds) {
-    migrated.windowBounds = bounds;
+  if (row.windowBounds && typeof row.windowBounds === 'object' && !Array.isArray(row.windowBounds)) {
+    const nested = row.windowBounds as Record<string, unknown>;
+    const main = parseWindowBounds(nested.main) ?? parseWindowBounds(nested);
+    const gpu = parseWindowBounds(nested.gpu);
+    if (main || gpu) migrated.windowBounds = { ...(main ? { main } : {}), ...(gpu ? { gpu } : {}) };
   }
   if (row.alerts && typeof row.alerts === 'object' && !Array.isArray(row.alerts)) {
     try {
@@ -97,27 +99,27 @@ export function createPreferencesStore(userDataDirectory: string, options: Prefe
   const filename = path.join(path.resolve(userDataDirectory), 'preferences.json');
   const clock = options.clock ?? Date.now;
   let lastRecoveryNotice: ConfigRecoveryNotice | null = null;
+  let tail = Promise.resolve();
 
-  async function quarantineCorrupt(raw: string, errorCode: string): Promise<Preferences> {
-    const timestamp = new Date(clock()).toISOString().replace(/[:.]/g, '-');
-    const backupPath = `${filename}.corrupt-${timestamp}.bak`;
-    try {
-      await atomicWrite(backupPath, raw);
-      await rm(filename, { force: true }).catch(() => undefined);
-    } catch {
-      try { await copyFile(filename, backupPath); } catch { /* Best-effort quarantine. */ }
-    }
-    const notice: ConfigRecoveryNotice = {
-      file: 'preferences',
-      backupPath,
-      errorCode,
-      recoveredAt: new Date(clock()).toISOString(),
-      message: `preferences.json 损坏或格式无效 (${errorCode})，已自动隔离备份至 ${path.basename(backupPath)} 并恢复默认偏好。`,
-    };
+  function enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const current = tail.then(operation);
+    tail = current.then(() => undefined, () => undefined);
+    return current;
+  }
+
+  async function write(value: Preferences): Promise<Preferences> {
+    await atomicWrite(filename, `${JSON.stringify(value, null, 2)}\n`);
+    return value;
+  }
+
+  async function quarantineCorrupt(errorCode: string): Promise<Preferences> {
+    const notice = await backUpCorruptConfig(filename, 'preferences', errorCode, clock);
     lastRecoveryNotice = notice;
     console.error(`[preferences] ${notice.message}`);
+    if (options.confirmRecovery && !await options.confirmRecovery(notice)) throw new ConfigRecoveryDeclined(notice.message);
+    const preferences = await write({ theme: 'system' });
     options.onRecovery?.(notice);
-    return { theme: 'system' };
+    return preferences;
   }
 
   async function load(): Promise<Preferences> {
@@ -132,18 +134,19 @@ export function createPreferencesStore(userDataDirectory: string, options: Prefe
     try {
       parsed = JSON.parse(raw);
     } catch {
-      return quarantineCorrupt(raw, 'PREFERENCES_CORRUPT');
+      return quarantineCorrupt('PREFERENCES_CORRUPT');
     }
     try {
       return migratePreferences(parsed);
     } catch {
-      return quarantineCorrupt(raw, 'PREFERENCES_INVALID');
+      return quarantineCorrupt('PREFERENCES_INVALID');
     }
   }
 
   return {
     getRecoveryNotice() { return lastRecoveryNotice ? { ...lastRecoveryNotice } : null; },
-    load,
+    load: () => enqueue(load),
+    flush: () => tail,
     async save(value) {
       let preferences: Preferences;
       try {
@@ -151,8 +154,19 @@ export function createPreferencesStore(userDataDirectory: string, options: Prefe
       } catch {
         throw new Error('PREFERENCES_INVALID');
       }
-      await atomicWrite(filename, `${JSON.stringify(preferences, null, 2)}\n`);
-      return structuredClone(preferences);
+      return enqueue(async () => {
+        const windowBounds = preferences.windowBounds ?? (await load()).windowBounds;
+        return write(windowBounds ? { ...preferences, windowBounds } : preferences);
+      });
+    },
+    saveWindowBounds(kind, bounds) {
+      return enqueue(async () => {
+        const current = await load();
+        await write(validatePreferences({
+          ...current,
+          windowBounds: { ...current.windowBounds, [kind]: bounds },
+        }));
+      });
     },
   };
 }

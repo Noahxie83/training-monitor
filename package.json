@@ -1,19 +1,31 @@
 {
   "name": "training-monitor",
   "version": "0.1.0",
+  "description": "Desktop monitoring for local, WSL, and remote machine learning training jobs.",
+  "productName": "Training Monitor",
+  "homepage": "https://github.com/Noahxie83/training-monitor",
+  "author": {
+    "name": "Training Monitor contributors",
+    "email": "Noahxie83@users.noreply.github.com"
+  },
   "private": true,
   "type": "module",
   "main": "dist/main.cjs",
   "scripts": {
     "build": "node scripts/build.mjs",
     "start": "npm run build && node scripts/start.mjs",
+    "dev": "node scripts/dev.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:unit": "node scripts/test-workers.mjs && vitest run --config vitest.config.ts",
+    "test:python": "python -B -m unittest discover -s tests -p \"test_*.py\"",
     "test:desktop": "npm run build && playwright test --config playwright.electron.config.ts",
     "test:runtime": "node scripts/build-runtime.mjs && node scripts/runtime-check.mjs",
-    "package:dir": "npm run build && electron-builder --win dir --x64 --publish never",
+    "package:dir": "npm run build && electron-builder --dir --publish never -c.electronDist=node_modules/electron/dist",
     "test:packaged": "node scripts/packaged-smoke.mjs",
-    "package:win": "npm run build && electron-builder --win zip --x64 --publish never",
+    "package:win": "npm run build && electron-builder --win --publish never",
+    "package:mac": "npm run build && electron-builder --mac --publish never",
+    "package:linux": "npm run build && electron-builder --linux --publish never",
+    "test:all": "npm run typecheck && npm run test:unit && npm run test:python && npm run build && npm run test:runtime && npm run test:desktop && npm run package:dir && npm run test:packaged",
     "test:simulations": "vitest run --config vitest.config.ts tests/simulations"
   },
   "dependencies": {

@@ -1,4 +1,4 @@
-import React, { useLayoutEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useMonitor } from './hooks/useMonitor';
 import { I18nProvider, translate } from './i18n';
 import { Header } from './components/Header';
@@ -52,6 +52,12 @@ export function App() {
     markAlertsRead,
     clearAlerts,
   } = useMonitor();
+
+  useEffect(() => {
+    void window.desktop?.setActiveTask?.(activeTaskId).catch((error: unknown) => {
+      console.warn('Failed to update taskbar progress', error);
+    });
+  }, [activeTaskId]);
 
   const [isEvidenceOpen, setIsEvidenceOpen] = useState(false);
   const [settingsModal, setSettingsModal] = useState<{ open: boolean; tab: SettingsTab }>({
@@ -461,6 +467,7 @@ export function App() {
           onClose={() => setSettingsModal((prev) => ({ ...prev, open: false }))}
           preferences={preferences}
           onUpdatePreferences={updatePreferences}
+          isSavingPreferences={isSavingPreferences}
           registry={registry}
           onUpdateRegistry={updateRegistry}
           onReloadRegistry={reloadRegistry}

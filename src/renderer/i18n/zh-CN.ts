@@ -28,6 +28,16 @@ export const zhCN = {
     unobserved: '等待检测',
     none: '—',
   },
+  recovery: {
+    title: '此窗口遇到了错误',
+    description: '可重载窗口恢复使用，或复制诊断信息以报告问题。',
+    unknownError: '渲染时发生了意外错误。',
+    reload: '重载窗口',
+    copy: '复制诊断信息',
+    copied: '已复制诊断信息。',
+    copyFailed: '请选中下方的诊断文本进行手动复制。',
+    diagnostic: '诊断信息',
+  },
   header: {
     hostStatusAria: '宿主连接状态',
     switchHostAria: '切换到 {hostId}',

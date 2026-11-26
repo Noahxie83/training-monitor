@@ -5,7 +5,17 @@ import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/re
 import { SettingsModal } from "../../src/renderer/components/SettingsModal";
 import { TaskEditor } from "../../src/renderer/components/TaskEditor";
 import { validateRegistry } from "../../src/shared/validate";
-import type { Registry, Preferences, HostRegistration, TaskRegistration } from "../../src/shared/contracts";
+import type {
+  HostRegistration,
+  HostSnapshot,
+  LogEvent,
+  LogSourceSnapshot,
+  Preferences,
+  ProcessKey,
+  Registry,
+  TaskRegistration,
+  TaskSnapshot,
+} from "../../src/shared/contracts";
 
 const defaultPrefs: Preferences = {
   theme: "system",
@@ -271,8 +281,8 @@ describe("T7 Fix 3 Requirements - Group B: Log Requests, Events, Cancellation & 
           sourceId: "flow-log",
           generation: "gen-current",
           kind: "line",
-          startOffset: 0,
-          endOffset: 10,
+          startOffset: "0",
+          endOffset: "10",
           ingestedAt: "2026-10-18T20:30:00Z",
           text: "Initial log line",
           reason: null,
@@ -304,8 +314,8 @@ describe("T7 Fix 3 Requirements - Group B: Log Requests, Events, Cancellation & 
             sourceId: "flow-log",
             generation: "gen-old", // STALE GENERATION!
             kind: "line",
-            startOffset: 10,
-            endOffset: 20,
+            startOffset: "10",
+            endOffset: "20",
             ingestedAt: "2026-10-18T20:31:00Z",
             text: "DROPPED_STALE_GEN_EVENT",
             reason: null,
@@ -322,8 +332,8 @@ describe("T7 Fix 3 Requirements - Group B: Log Requests, Events, Cancellation & 
             sourceId: "flow-log",
             generation: "gen-current",
             kind: "line",
-            startOffset: 20,
-            endOffset: 30,
+            startOffset: "20",
+            endOffset: "30",
             ingestedAt: "2026-10-18T20:31:01Z",
             text: "DROPPED_WRONG_TASK_EVENT",
             reason: null,
@@ -340,8 +350,8 @@ describe("T7 Fix 3 Requirements - Group B: Log Requests, Events, Cancellation & 
             sourceId: "flow-log",
             generation: "gen-current", // VALID
             kind: "line",
-            startOffset: 30,
-            endOffset: 40,
+            startOffset: "30",
+            endOffset: "40",
             ingestedAt: "2026-10-18T20:31:02Z",
             text: "ACCEPTED_CURRENT_GEN_EVENT",
             reason: null,
@@ -509,8 +519,8 @@ describe("T7 Fix 3 Requirements - Group B: Log Requests, Events, Cancellation & 
               sourceId: "flow-log",
               generation: "gen-1",
               kind: "line",
-              startOffset: 0,
-              endOffset: 10,
+              startOffset: "0",
+              endOffset: "10",
               ingestedAt: "2026-10-18T20:30:00Z",
               text: "Search hit restarted successfully",
               reason: null,
@@ -607,8 +617,8 @@ describe("T7 Fix 3 Requirements - Group B: Log Requests, Events, Cancellation & 
           sourceId: "flow-log",
           generation: "gen-1",
           kind: "line",
-          startOffset: 0,
-          endOffset: rawBytes.byteLength,
+          startOffset: "0",
+          endOffset: String(rawBytes.byteLength),
           ingestedAt: "2026-10-18T20:30:00Z",
           text: longChunk,
           reason: null,
@@ -660,8 +670,8 @@ describe("T7 Fix 3 Requirements - Group B: Log Requests, Events, Cancellation & 
             sourceId: "flow-log",
             generation: "gen-1",
             kind: "line",
-            startOffset: 0,
-            endOffset: 10,
+            startOffset: "0",
+            endOffset: "10",
             ingestedAt: "2026-10-18T20:30:00Z",
             text: "Recovered after retry",
             reason: null,
@@ -705,7 +715,6 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
 
   it("I7: source states, freshness distinction across states, observedAt, and BigInt > 2^53 comparison", async () => {
     const staleCatchupSource: LogSourceSnapshot = {
-      version: 1,
       sourceId: "flow-log",
       taskId: "flow-cifar10",
       state: "catching_up",
@@ -716,8 +725,8 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
       committedOffset: "9007199254740993",
       maxObservedOffset: "9007199254740995",
       continuityState: "tracking",
-      catchupBytesRead: 1024,
-      catchupBytesTotal: 4096,
+      catchupBytesRead: "1024",
+      catchupBytesTotal: "4096",
       errorCode: null,
     };
 
@@ -1069,16 +1078,15 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
     });
 
     it("I6: manual scroll lock, anchor tracking, and compensation on prepending/shifting logs", async () => {
-      let subscribeListener = null;
-      const initialEvents = Array.from({ length: 10 }, (_, i) => ({
+      const initialEvents = Array.from({ length: 10 }, (_, i): LogEvent => ({
         version: 1,
         eventId: "ev-" + i,
         taskId: "flow-cifar10",
         sourceId: "flow-log",
         generation: "gen-1",
         kind: "line",
-        startOffset: i * 10,
-        endOffset: (i + 1) * 10,
+        startOffset: String(i * 10),
+        endOffset: String((i + 1) * 10),
         ingestedAt: "2026-10-18T20:30:00Z",
         text: "Log line " + i,
         reason: null,
@@ -1099,12 +1107,6 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
         },
         logs: initialEvents,
       });
-      api.subscribe = vi.fn().mockImplementation((listener) => {
-        subscribeListener = listener;
-        return () => {
-          subscribeListener = null;
-        };
-      });
       (window as any).monitor = api;
 
       render(<App />);
@@ -1118,7 +1120,9 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
       // Simulate user scrolling up manually
       Object.defineProperty(viewport, "scrollHeight", { value: 1000, configurable: true });
       Object.defineProperty(viewport, "clientHeight", { value: 300, configurable: true });
-      Object.defineProperty(viewport, "scrollTop", { value: 100, configurable: true, writable: true });
+      Object.defineProperty(viewport, "scrollTop", { value: 700, configurable: true, writable: true });
+      fireEvent.scroll(viewport);
+      viewport.scrollTop = 100;
       fireEvent.scroll(viewport);
 
       // Scroll lock should be engaged
@@ -1127,8 +1131,7 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
       });
 
       // Emit new log event while locked
-      expect(subscribeListener).toBeDefined();
-      subscribeListener({
+      act(() => api.emitUpdate({
         kind: "logs",
         sourceId: "flow-log",
         events: [
@@ -1139,8 +1142,8 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
             sourceId: "flow-log",
             generation: "gen-1",
             kind: "line",
-            startOffset: 100,
-            endOffset: 110,
+            startOffset: "100",
+            endOffset: "110",
             ingestedAt: "2026-10-18T20:31:00Z",
             text: "Log line 10",
             reason: null,
@@ -1151,7 +1154,7 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
             bindingId: null,
           },
         ],
-      });
+      }));
 
       // Floating unread banner must appear with unread count
       await waitFor(() => {
@@ -1221,12 +1224,12 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
         },
       };
       const { container: c1 } = render(<DualProgressBar task={taskNull} algorithm="flow" />);
-      const globalFill1 = c1.querySelector(".progress-fill-global");
-      const sessionFill1 = c1.querySelector(".progress-fill-session");
-      expect(globalFill1.style.width).toBe("0%");
-      expect(globalFill1.className).toContain("fill-empty");
-      expect(sessionFill1.style.width).toBe("0%");
-      expect(sessionFill1.className).toContain("fill-empty");
+      const globalFill1 = c1.querySelector<HTMLElement>(".progress-fill-global");
+      const sessionFill1 = c1.querySelector<HTMLElement>(".progress-fill-session");
+      expect(globalFill1?.style.width).toBe("0%");
+      expect(globalFill1?.className).toContain("fill-empty");
+      expect(sessionFill1?.style.width).toBe("0%");
+      expect(sessionFill1?.className).toContain("fill-empty");
       cleanup();
 
       // 2. Non-zero fraction: 52.3% and 100%
@@ -1239,10 +1242,10 @@ describe("T7 Fix 3 Requirements - Group C: Observation, Resources, Focus & Non-L
         },
       };
       const { container: c2 } = render(<DualProgressBar task={taskFraction} algorithm="flow" />);
-      const globalFill2 = c2.querySelector(".progress-fill-global");
-      const sessionFill2 = c2.querySelector(".progress-fill-session");
-      expect(globalFill2.style.width).toBe("52.3%");
-      expect(sessionFill2.style.width).toBe("100%");
+      const globalFill2 = c2.querySelector<HTMLElement>(".progress-fill-global");
+      const sessionFill2 = c2.querySelector<HTMLElement>(".progress-fill-session");
+      expect(globalFill2?.style.width).toBe("52.3%");
+      expect(sessionFill2?.style.width).toBe("100%");
     });
   });
 

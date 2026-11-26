@@ -455,7 +455,7 @@ export interface Preferences {
   locale?: 'zh-CN' | 'en-US';
   minimizeToTrayOnClose?: boolean;
   launchAtLogin?: boolean;
-  windowBounds?: WindowBounds;
+  windowBounds?: Partial<Record<'main' | 'gpu', WindowBounds>>;
   alerts?: AlertPreferences;
 }
 

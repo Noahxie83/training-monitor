@@ -6,11 +6,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ProbeBoundaryTests(unittest.TestCase):
-    def test_t1_contains_no_executable_remote_probe(self):
+    def test_probe_directory_contains_only_the_readonly_payload(self):
         probe_dir = ROOT / "src" / "probe"
         names = sorted(path.name for path in probe_dir.iterdir() if not (path.name == "__pycache__" and path.is_dir()))
-        self.assertEqual(names, ["README.txt", "readonly_probe.py"])
-        self.assertTrue((probe_dir / "README.txt").is_file())
+        self.assertEqual(names, ["readonly_probe.py"])
         self.assertTrue((probe_dir / "readonly_probe.py").is_file())
 
     def test_mock_data_has_no_remote_transport_execution_dependency(self):

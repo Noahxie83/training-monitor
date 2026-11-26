@@ -592,7 +592,7 @@ describe('bounded child execution and WSL behavior', () => {
     const registry: Registry = {
       version: 2, revision: 4,
       hosts: [{ hostId: 'h', label: 'h', enabled: true, allowedRoots: ['/allowed'], target: { kind: 'ssh', alias: 'gpu-node' } }],
-      tasks: [{ taskId: 't', hostId: 'h', label: 't', enabled: true, algorithm: 'flow', allowedDirectories: ['/allowed/run'], entryPaths: [], sources: [{ sourceId: 's', path: '/allowed/run/a.log', kind: 'log' }], checkpointDirectories: [] }],
+      tasks: [{ taskId: 't', hostId: 'h', label: 't', enabled: true, algorithm: 'flow', allowedDirectories: ['/allowed/..cache'], entryPaths: [], sources: [{ sourceId: 's', path: '/allowed/..cache/..logs', kind: 'log' }], checkpointDirectories: [] }],
     };
     const spawn = vi.fn(() => {
       const child = new FakeChild();
@@ -607,7 +607,7 @@ describe('bounded child execution and WSL behavior', () => {
     const catalog = {
       status: 'configured' as const,
       listCandidates: () => [{ kind: 'registered_rotation' as const, sourceId: 's', candidateId: 'candidate', registrationId: 'registration' }],
-      resolveCandidate: async () => ({ kind: 'registered_rotation' as const, sourceId: 's', candidateId: 'candidate', registrationId: 'registration', taskId: 't', path: '/allowed/run/a.log.1', currentPath: '/allowed/run/a.log', allowedDirectories: ['/allowed/run'] }),
+      resolveCandidate: async () => ({ kind: 'registered_rotation' as const, sourceId: 's', candidateId: 'candidate', registrationId: 'registration', taskId: 't', path: '/allowed/..cache/..logs.1', currentPath: '/allowed/..cache/..logs', allowedDirectories: ['/allowed/..cache'] }),
     };
     const transport = createTransport({ hostId: 'h', host: registry.hosts[0]!, registry }, { probeSource: 'print(1)', spawn: spawn as never, rotationCatalog: catalog });
     try {

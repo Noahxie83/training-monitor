@@ -4,5 +4,5 @@
     "jsx": "react-jsx", "strict": true, "noEmit": true, "skipLibCheck": true, "allowSyntheticDefaultImports": true,
     "esModuleInterop": true, "types": ["node", "vite/client"], "resolveJsonModule": true, "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts", "vitest.config.ts", "playwright.electron.config.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts", "vitest.config.ts", "playwright.electron.config.ts", "tests/**/*.ts", "tests/**/*.tsx"]
 }
