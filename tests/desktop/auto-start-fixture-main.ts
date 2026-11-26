@@ -1,0 +1,14 @@
+import { app } from 'electron';
+import { createWindow } from '../../src/desktop/window';
+import { registerMonitorIpc } from '../../src/desktop/ipc';
+import { createControlledMockApi, testFlowTask, testHostConnected, testRegistry } from '../ui/fixtures';
+import type { MonitorSnapshot } from '../../src/shared/api';
+const registry=structuredClone(testRegistry);registry.hosts=[registry.hosts[0]!];registry.tasks=[registry.tasks[0]!];
+const registration=registry.tasks[0]!;
+registration.autoStart={execution:'server_tmux',enabled:true,armId:'12345678-1234-4234-8234-123456789abc',gpuDeviceIds:[],idleSeconds:60,maxUtilizationPercent:5,maxMemoryMiB:1024,launch:{pythonPath:'/usr/bin/python3',entryPath:registration.entryPaths[0]!,cwd:registration.allowedDirectories[0]!,arguments:'--batch-size 32',logSourceId:registration.sources.find(s=>s.kind==='log')!.sourceId}};
+registration.label='待启动训练';
+const task=structuredClone(testFlowTask);task.lifecycle='ready_not_training';task.currentRun=null;task.processes={main:null,queue:null,workers:[]};task.autoStart={execution:'server_tmux',remoteConfirmed:true,sessionName:'tm-wait-'+ 'a'.repeat(40),selectedDeviceId:'GPU 6',armId:registration.autoStart.armId,phase:'countdown',idleElapsedSeconds:25,requiredIdleSeconds:60,lastCheckedAt:'2026-11-11T00:00:00Z',startedAt:null,pid:null,errorCode:null,message:'所选 GPU 持续空闲，等待启动'};
+const observedAt='2026-11-11T00:00:00Z';const metrics=Array.from({length:8},(_,index)=>task.resources.filter(m=>m.scope==='device').map(m=>({...m,deviceId:`GPU ${index}`,observedAt,value:m.name==='gpu_memory_used'||m.name==='gpu_utilization'?0:m.value}))).flat();
+const snapshot:MonitorSnapshot={version:1,demo:true,tasks:[task],sources:[],hosts:[{...testHostConnected,gpu:{state:'available',observedAt,errorCode:null,metrics}}]};
+app.on('window-all-closed',()=>app.quit());
+void app.whenReady().then(()=>{const api=createControlledMockApi({registry,snapshot,preferences:{theme:'light'}});const dispose=registerMonitorIpc(api);app.once('before-quit',dispose);createWindow().once('closed',()=>app.quit());});

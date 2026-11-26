@@ -1,0 +1,7 @@
+export const PAGE_EVENT_LIMIT = 500;
+export const PAGE_TEXT_BUDGET_BYTES = 1024 * 1024;
+export const SEARCH_LITERAL_LIMIT = 256;
+export const UI_EVENT_LIMIT = 10_000;
+export const UI_TEXT_BUDGET_BYTES = 8 * 1024 * 1024;
+export const EVENT_PREVIEW_BYTES = 64 * 1024;
+export const SUBSCRIPTION_TEXT_BUDGET_BYTES = 1024 * 1024;

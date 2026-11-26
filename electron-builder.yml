@@ -1,0 +1,13 @@
+appId: local.training-monitor.desktop
+productName: Training Monitor
+directories:
+  output: release
+files:
+  - dist/**/*
+  - package.json
+asar: true
+win:
+  target:
+    - target: dir
+      arch: [x64]
+  signAndEditExecutable: false

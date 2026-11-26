@@ -1,0 +1,18 @@
+# Local visual brainstorming sessions contain temporary session credentials.
+.superpowers/
+node_modules/
+dist/
+release/
+test-results/
+playwright-report/
+
+# Local test/runtime caches and Python bytecode
+/.vitest/
+/NVIDIA Corporation/
+**/__pycache__/
+*.pyc
+
+# Local temporary task logs/reports and one-off scripts
+/task-*.log
+/task-*-report.md
+/apply_changes.py
