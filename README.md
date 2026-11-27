@@ -206,7 +206,7 @@ npm run package:linux
 ├── assets/icons/    # Cross-platform app & high-DPI tray icons (.ico / .icns / .png)
 ├── scripts/         # Build, dev watch, runtime canary & packaged smoke test scripts
 ├── tests/           # Unit, domain, store, transport, simulation, Python probe/launch, UI & Electron E2E
-├── docs/            # Design specs, architecture notes, screenshots & prompt history
+├── docs/            # Design specs, architecture notes & showcase screenshots
 └── DESIGN.md        # Design system tokens, typography & layout specification
 ```
 
