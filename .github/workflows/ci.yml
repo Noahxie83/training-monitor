@@ -26,6 +26,7 @@ jobs:
         run: |
           npx playwright install-deps chromium
           sudo apt-get install -y openbox xvfb xauth fonts-noto-cjk
+          node node_modules/electron/install.js
           sudo chown root:root node_modules/electron/dist/chrome-sandbox
           sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
       - run: npm run typecheck
@@ -61,7 +62,11 @@ jobs:
         with:
           python-version: '3.12'
       - run: npm ci
+      - run: npm run typecheck
+        if: runner.os == 'Windows'
       - run: npm run test:python
+        if: runner.os == 'Windows'
+      - run: npm run test:unit
         if: runner.os == 'Windows'
       - run: npm run test:desktop
         if: runner.os == 'Windows'

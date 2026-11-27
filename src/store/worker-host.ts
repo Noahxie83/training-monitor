@@ -21,6 +21,7 @@ const READ_ONLY_METHODS = new Set<StoreOperation['method']>([
 
 export async function installStoreWorker(data: WorkerData, testOnly = false): Promise<void> {
   if (!parentPort) throw new Error('STORE_WORKER_REQUIRES_PARENT_PORT');
+  const sendMigrationProgress = () => parentPort!.postMessage({ kind: 'migrating' });
   let freeOverride: bigint | null = null;
   let failNext: FaultPoint | null = null;
   let pauseAt: FaultPoint | null = null;
@@ -35,7 +36,9 @@ export async function installStoreWorker(data: WorkerData, testOnly = false): Pr
   };
   // Production always uses live wall-clock Date.now() instead of a frozen startup timestamp.
   const clock = testOnly ? () => Date.parse(data.openedAt) : () => Date.now();
+  sendMigrationProgress();
   const engine = new StoreEngine(data.databasePath, clock, {
+    migrationProgress: sendMigrationProgress,
     beforeCursorWrite: () => injected('beforeCursorWrite'),
     beforeGenerationSeal: async () => {
       injected('beforeGenerationSeal');
@@ -55,7 +58,9 @@ export async function installStoreWorker(data: WorkerData, testOnly = false): Pr
       else { work.cleanupBlocks++; work.cleanupMaxBlock = Math.max(work.cleanupMaxBlock, current); work.cleanupCurrent = 0; }
     },
   });
-  try { await engine.retain(data.openedAt); } catch (error) { engine.close().catch(() => {}); throw error; }
+  if (testOnly) {
+    try { await engine.retain(data.openedAt); } catch (error) { await engine.close().catch(() => {}); throw error; }
+  }
   parentPort.postMessage({ kind: 'ready', runtime: { electron: process.versions.electron ?? null, node: process.versions.node, ...engine.runtimeInfo() } });
   port?.on('message', (message: { kind: string; id?: number; point?: FaultPoint; bytes?: string; globalBytes?: string; taskBytes?: string; threshold?: number }) => {
     if (!testOnly) return;
@@ -78,8 +83,15 @@ export async function installStoreWorker(data: WorkerData, testOnly = false): Pr
   // - Read-only queries execute concurrently on StoreEngine's independent readOnly SQLite connection
   //   without waiting behind writes (unless a test fault-injection pause is explicitly active).
   let writeTail = Promise.resolve();
+  let closing = false;
+  function enqueueWrite<T>(run: () => T | Promise<T>): Promise<T> {
+    const result = writeTail.then(run);
+    writeTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
   parentPort.on('message', (message: WorkerRequest) => {
-    if (!message || typeof message.id !== 'number' || !message.operation) return;
+    if (closing || !message || typeof message.id !== 'number' || !message.operation) return;
+    if (message.operation.method === 'close') closing = true;
     const run = async () => {
       try {
         const value = await dispatch(engine, message.operation);
@@ -101,9 +113,28 @@ export async function installStoreWorker(data: WorkerData, testOnly = false): Pr
     if (isReadOnly && !holdForTestFaultPause) {
       void run();
     } else {
-      writeTail = writeTail.then(run, run);
+      void enqueueWrite(run);
     }
   });
+
+  // Queue one maintenance operation at a time so normal writes can run between batches.
+  async function maintainAfterReady(): Promise<void> {
+    const pendingMigration = engine.hasPendingLogMigration();
+    const retain = () => enqueueWrite(() => engine.retain(data.openedAt)).catch((error: unknown) => {
+      console.warn('STORE_STARTUP_RETAIN_FAILED', error);
+    });
+    await yieldToMessages();
+    if (closing) return;
+    if (!testOnly) await retain();
+    if (!pendingMigration) return;
+    while (true) {
+      await yieldToMessages();
+      if (closing) return;
+      if (!await enqueueWrite(() => engine.runBackgroundMigrationStep())) break;
+    }
+    if (!closing) await retain();
+  }
+  void maintainAfterReady().catch((error: unknown) => console.warn('STORE_BACKGROUND_MIGRATION_FAILED', error));
 }
 
 function isFault(value: unknown): value is FaultPoint { return value === 'beforeCursorWrite' || value === 'beforeGenerationSeal'; }

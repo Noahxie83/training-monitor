@@ -35,6 +35,7 @@ import type { CommitReadResult, ReconcileRequest } from './protocol';
 import type { PersistedObservation } from './engine';
 
 type ReadyMessage = { kind: 'ready'; runtime: { electron: string | null; node: string; sqlite: string } };
+type MigratingMessage = { kind: 'migrating' };
 type OpenOptions = { directory: string; now: () => number; maxRestarts?: number };
 type InternalClient = StoreClientContract & {
   diagnostics(): Promise<StoreDiagnostics>;
@@ -42,7 +43,8 @@ type InternalClient = StoreClientContract & {
   crashCount?: () => number;
   forceTerminateWorkerForTest?: () => Promise<number>;
 };
-const READY_TIMEOUT_MS = 5_000;
+const READY_TIMEOUT_MS = 30_000;
+const READY_TIMEOUT_LIMIT_MS = 120_000;
 const CLOSE_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_RESTARTS = 5;
 
@@ -52,6 +54,7 @@ class StoreClientImpl implements InternalClient {
   private readyResolve!: (message: ReadyMessage) => void;
   private readyReject!: (error: Error) => void;
   private readonly ready: Promise<ReadyMessage>;
+  private renewReadyTimeout?: () => void;
   private closed = false;
   private terminalError: Error | null = null;
   private closing: Promise<void> | null = null;
@@ -59,8 +62,9 @@ class StoreClientImpl implements InternalClient {
 
   constructor(private readonly worker: Worker, private readonly clock: () => number, private readonly onUnexpectedExit?: (error: Error) => void) {
     this.ready = new Promise((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject; });
-    worker.on('message', (message: ReadyMessage | WorkerResponse) => {
+    worker.on('message', (message: ReadyMessage | MigratingMessage | WorkerResponse) => {
       if ('kind' in message && message.kind === 'ready') { this.runtime = message.runtime; this.readyResolve(message); return; }
+      if ('kind' in message && message.kind === 'migrating') { this.renewReadyTimeout?.(); return; }
       if (!('id' in message)) return;
       const item = this.pending.get(message.id);
       if (!item) return;
@@ -84,7 +88,25 @@ class StoreClientImpl implements InternalClient {
   }
   isFailed(): boolean { return this.terminalError !== null; }
   async terminateRaw(): Promise<number> { return this.worker.terminate(); }
-  async start(): Promise<void> { await this.withTimeout(this.ready, READY_TIMEOUT_MS, 'STORE_READY_TIMEOUT'); }
+  async start(): Promise<void> {
+    const deadline = performance.now() + READY_TIMEOUT_LIMIT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      this.renewReadyTimeout = () => {
+        clearTimeout(timer);
+        const remaining = Math.min(READY_TIMEOUT_MS, deadline - performance.now());
+        if (remaining <= 0) reject(new Error('STORE_READY_TIMEOUT'));
+        else timer = setTimeout(() => reject(new Error('STORE_READY_TIMEOUT')), remaining);
+      };
+      this.renewReadyTimeout();
+    });
+    try {
+      await Promise.race([this.ready, timeout]);
+    } finally {
+      clearTimeout(timer);
+      this.renewReadyTimeout = undefined;
+    }
+  }
   private async withTimeout<T>(promise: Promise<T>, ms: number, reason: string): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try { return await Promise.race([promise, new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error(reason)), ms); })]); }

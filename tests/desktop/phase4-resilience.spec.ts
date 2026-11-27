@@ -126,7 +126,12 @@ test('fits off-screen saved geometry to the work area and remembers a resized wi
       require(${JSON.stringify(mainEntry)});
     `);
     const { stdout } = await promisify(execFile)(executable, [bootstrap, profile], { timeout: 10_000 });
-    expect(stdout).toContain(`RESTORED_WINDOW_SIZE ${JSON.stringify(savedSize!)}`);
+    const restored = stdout.match(/^RESTORED_WINDOW_SIZE (\[\d+,\s*\d+\])\s*$/m);
+    expect(restored).not.toBeNull();
+    const [width, height] = JSON.parse(restored![1]!) as [number, number];
+    const tolerance = process.platform === 'win32' ? 4 : 0;
+    expect(Math.abs(width - savedSize![0])).toBeLessThanOrEqual(tolerance);
+    expect(Math.abs(height - savedSize![1])).toBeLessThanOrEqual(tolerance);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

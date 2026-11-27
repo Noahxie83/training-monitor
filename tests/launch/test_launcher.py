@@ -33,7 +33,7 @@ class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.host = Path(self.temp.name) / "host"
+        self.host = Path(self.temp.name).resolve() / "host"
         self.task = self.host / "run"
         self.logs = self.task / "logs"
         self.logs.mkdir(parents=True)

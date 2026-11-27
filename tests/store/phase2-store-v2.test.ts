@@ -1,16 +1,52 @@
 import { DatabaseSync } from 'node:sqlite';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import type { Worker } from 'node:worker_threads';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { StoreEngine } from '../../src/store/engine';
-import { openStore } from '../../src/store/client';
+import { connectStoreWorker, openStore } from '../../src/store/client';
 import { NOW, observation, readReply } from './helpers/fixtures';
 
 const dirs: string[] = [];
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
+
+function seedLargeV1(dbPath: string): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      PRAGMA user_version = 1;
+      CREATE TABLE source_registry(source_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, recovery_json TEXT);
+      INSERT INTO source_registry(source_id, task_id) VALUES ('src', 'task');
+      CREATE TABLE raw_chunks(
+        chunk_id INTEGER PRIMARY KEY AUTOINCREMENT, source_id TEXT NOT NULL, generation TEXT NOT NULL,
+        start_offset TEXT NOT NULL, end_offset TEXT NOT NULL, bytes BLOB NOT NULL, ingested_at TEXT NOT NULL,
+        UNIQUE(source_id, generation, start_offset)
+      );
+      INSERT INTO raw_chunks(source_id, generation, start_offset, end_offset, bytes, ingested_at)
+      VALUES ('src', 'g1', '12', '34', zeroblob(22), '2020-01-01T00:00:00.000Z');
+      CREATE TABLE log_events(
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL, source_id TEXT NOT NULL,
+        task_id TEXT NOT NULL, generation TEXT NOT NULL, start_offset TEXT, end_offset TEXT,
+        ingested_at TEXT NOT NULL, text TEXT, event_json TEXT NOT NULL
+      );
+      CREATE INDEX log_events_text ON log_events(source_id, text, seq DESC);
+      WITH RECURSIVE rows(i) AS (VALUES (1) UNION ALL SELECT i+1 FROM rows WHERE i<50001)
+      INSERT INTO log_events(event_id, source_id, task_id, generation, ingested_at, text, event_json)
+      SELECT 'legacy-' || i, 'src', 'task', 'g1', '${NOW}', 'historical-marker ' || i,
+        json_object('text', 'historical-marker ' || i, 'rawAnsi', NULL) FROM rows;
+      UPDATE log_events SET start_offset='12', end_offset='34' WHERE seq=3;
+      UPDATE log_events SET text=NULL WHERE seq=2;
+      UPDATE log_events SET text=text || ' 🚀x' WHERE seq=50000;
+      UPDATE log_events SET event_json=json_set(event_json, '$.rawAnsi', 'legacy ANSI') WHERE seq=29999;
+    `);
+  } finally {
+    db.close();
+  }
+}
 
 describe('Phase 2 SQLite v2 store, FTS5, time-series, and worker resilience', () => {
   it('migrates v1 SQLite database transactionally to v2, drops dead tables/index, slims event_json, and backfills FTS5', async () => {
@@ -80,6 +116,122 @@ describe('Phase 2 SQLite v2 store, FTS5, time-series, and worker resilience', ()
     const slimRow = check.prepare("SELECT event_json FROM log_events WHERE event_id='ev-v1-1'").get() as { event_json: string };
     expect(slimRow.event_json).not.toContain('CUDA_MIGRATION_MARKER');
     check.close();
+  });
+
+  it('defers large v1 backfill, keeps history searchable, and resumes durable batches after reopen', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'monitor-large-v1-'));
+    dirs.push(dir);
+    const dbPath = path.join(dir, 'monitor.sqlite');
+    seedLargeV1(dbPath);
+    const check = new DatabaseSync(dbPath);
+    let engine = new StoreEngine(dbPath, () => Date.parse(NOW));
+    const search = (literal = 'historical-marker 2') => engine.searchLogs({
+      requestId: 'historical-search', sourceIds: ['src'], literal,
+      continuation: null, mode: 'literal',
+    }, NOW);
+    const ftsCount = (query: string) => check.prepare('SELECT count(*) AS n FROM log_events_fts WHERE log_events_fts MATCH ?')
+      .get(query)?.n;
+    const historical = '"historical-marker"';
+    const cursor = (key: string) => check.prepare('SELECT value FROM store_meta WHERE key=?').get(key)?.value;
+    try {
+      expect(check.prepare('PRAGMA user_version').get()?.user_version).toBe(2);
+      expect(ftsCount(historical)).toBe(0);
+      expect(cursor('fts_backfill_cursor')).toBe('0');
+      expect(cursor('json_slim_cursor')).toBe('0');
+      expect(check.prepare("SELECT 1 FROM sqlite_schema WHERE name='log_events_text'").get()).toBeDefined();
+      expect((await search()).events.find((event) => event.eventId === 'legacy-29999')?.rawAnsi).toBe('legacy ANSI');
+      expect((await search('🚀x')).events.map((event) => event.eventId)).toEqual(['legacy-50000']);
+
+      expect(engine.runBackgroundMigrationStep(7)).toBe(true);
+      expect(cursor('fts_backfill_cursor')).toBe('7');
+      expect(ftsCount(historical)).toBe(6);
+      check.exec(`
+        UPDATE log_events SET text='updated-marker' WHERE seq IN (1, 10);
+        UPDATE log_events SET text='second-update-marker' WHERE seq=11;
+        DELETE FROM log_events WHERE seq=11;
+        DELETE FROM log_events WHERE seq IN (4, 50001);
+        INSERT INTO log_events(event_id, source_id, task_id, generation, ingested_at, text, event_json)
+        VALUES ('new', 'src', 'task', 'g1', '${NOW}', NULL, '{}'),
+          ('gap', 'src', 'task', 'g1', '${NOW}', NULL, '{}');
+        UPDATE log_events SET text='new-live-marker' WHERE event_id='new';
+      `);
+      expect(ftsCount('"new-live-marker"')).toBe(1);
+      expect(ftsCount('"updated-marker"')).toBe(2);
+      expect(ftsCount('"second-update-marker"')).toBe(0);
+
+      await engine.close();
+      engine = new StoreEngine(dbPath, () => Date.parse(NOW));
+      expect(cursor('json_slim_cursor')).toBe('7');
+      let steps = 0;
+      while (engine.runBackgroundMigrationStep()) steps++;
+      expect(steps).toBeGreaterThan(1);
+      expect(cursor('fts_backfill_cursor')).toBeUndefined();
+      expect(cursor('json_slim_cursor')).toBeUndefined();
+      expect(check.prepare(`SELECT count(*) AS n FROM log_events
+        WHERE json_type(event_json, '$.text') IS NOT NULL OR json_type(event_json, '$.rawAnsi') IS NOT NULL`).get()?.n).toBe(0);
+      expect(check.prepare('SELECT start_key, end_key FROM log_events WHERE seq=3').get())
+        .toMatchObject({ start_key: '0000000002:12', end_key: '0000000002:34' });
+      expect(ftsCount(historical)).toBe(49_995);
+      expect(ftsCount('"updated-marker"')).toBe(2);
+      expect(ftsCount('"new-live-marker"')).toBe(1);
+      check.exec("INSERT INTO log_events_fts(log_events_fts, rank) VALUES('integrity-check', 1)");
+      expect(check.prepare("SELECT 1 FROM sqlite_schema WHERE name='log_events_text'").get()).toBeUndefined();
+      expect((await search()).events.find((event) => event.eventId === 'legacy-29999')?.rawAnsi).toBe('legacy ANSI');
+      expect((await search('🚀x')).events.map((event) => event.eventId)).toEqual(['legacy-50000']);
+    } finally {
+      await engine.close();
+      check.close();
+    }
+  }, 10_000);
+
+  it('opens a large legacy database through the production worker and completes background backfill', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'monitor-large-worker-'));
+    dirs.push(dir);
+    const dbPath = path.join(dir, 'monitor.sqlite');
+    seedLargeV1(dbPath);
+    const client = await openStore({ directory: dir, now: () => Date.parse(NOW) });
+    const check = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const page = await client.searchLogs({
+        requestId: 'worker-migration', sourceIds: ['src'], literal: 'historical-marker 50001',
+        continuation: null, mode: 'literal',
+      });
+      expect(page.events.map((event) => event.eventId)).toEqual(['legacy-50001']);
+      await expect.poll(() => check.prepare('SELECT count(*) AS n FROM store_meta').get()?.n, { timeout: 5_000 }).toBe(0);
+      await expect.poll(() => check.prepare('SELECT 1 FROM log_events WHERE seq=3').get()).toBeUndefined();
+    } finally {
+      check.close();
+      await client.close();
+    }
+  }, 10_000);
+
+  it('extends worker readiness on migration heartbeats up to the total timeout', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      const worker = Object.assign(new EventEmitter(), { terminate: vi.fn(async () => 0) });
+      const ready = connectStoreWorker(worker as unknown as Worker, () => Date.parse(NOW));
+      await vi.advanceTimersByTimeAsync(29_000);
+      worker.emit('message', { kind: 'migrating' });
+      await vi.advanceTimersByTimeAsync(29_000);
+      const runtime = { electron: null, node: '22', sqlite: '3' };
+      worker.emit('message', { kind: 'ready', runtime });
+      expect((await ready).runtime).toEqual(runtime);
+
+      const slowWorker = Object.assign(new EventEmitter(), { terminate: vi.fn(async () => 0) });
+      const result = connectStoreWorker(slowWorker as unknown as Worker, () => Date.parse(NOW));
+      const rejected = expect(result).rejects.toThrow('STORE_READY_TIMEOUT');
+      for (let i = 0; i < 4; i++) {
+        await vi.advanceTimersByTimeAsync(25_000);
+        slowWorker.emit('message', { kind: 'migrating' });
+      }
+      await vi.advanceTimersByTimeAsync(19_999);
+      expect(slowWorker.terminate).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await rejected;
+      expect(slowWorker.terminate).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('deduplicates continuous CR tqdm redraws into 1 row without causing STALE_CONTINUATION', async () => {

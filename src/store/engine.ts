@@ -35,7 +35,7 @@ import { prepareArchiveRead, prepareRead } from '../logs/bytes';
 import { nextCursorAnchors } from '../logs/continuity';
 import { initialCursor, decideGenerationTransition } from '../logs/generation';
 import type { ArchiveReadEvidence, GapState, GenerationDecision, PreparedRead, ReadReply, SourceObservation } from '../logs/types';
-import { initializeSchema } from './schema';
+import { hasPendingFtsBackfill, hasPendingMigration, initializeSchema, migrateLegacyBatch } from './schema';
 import type {
   CommitReadResult,
   GpuSampleRow,
@@ -63,6 +63,7 @@ const EPOCH = 0;
 const DEFAULT_MAX_SERIES_POINTS = 240;
 
 type EngineHooks = {
+  migrationProgress?: () => void;
   beforeCursorWrite?: () => void;
   beforeGenerationSeal?: () => void | Promise<void>;
   freeBytes?: () => Promise<bigint>;
@@ -150,6 +151,7 @@ function encodeEventMeta(event: LogEvent): string {
 
 function eventFromRow(row: EventRow): LogEvent {
   const meta = JSON.parse(row.event_json) as Partial<LogEvent>;
+  const rawAnsi = row.raw_ansi ?? (typeof meta.rawAnsi === 'string' ? meta.rawAnsi : undefined);
   return {
     version: 1,
     eventId: meta.eventId ?? row.event_id,
@@ -161,7 +163,7 @@ function eventFromRow(row: EventRow): LogEvent {
     endOffset: meta.endOffset !== undefined ? meta.endOffset : row.end_offset,
     ingestedAt: meta.ingestedAt ?? row.ingested_at,
     text: row.text,
-    ...(row.raw_ansi ? { rawAnsi: row.raw_ansi } : {}),
+    ...(rawAnsi ? { rawAnsi } : {}),
     reason: meta.reason ?? null,
     displayTruncated: meta.displayTruncated ?? false,
     recordComplete: meta.recordComplete ?? null,
@@ -252,7 +254,7 @@ export class StoreEngine {
     this.now = now;
     this.hooks = hooks;
     this.db = new DatabaseSync(databasePath);
-    initializeSchema(this.db);
+    initializeSchema(this.db, hooks.migrationProgress);
     this.stmtFindEvent = this.db.prepare('SELECT seq, text, raw_ansi, event_json FROM log_events WHERE event_id = ?');
     this.stmtInsertEvent = this.db.prepare(
       'INSERT INTO log_events(event_id,source_id,task_id,generation,start_offset,end_offset,ingested_at,text,raw_ansi,event_json,start_key,end_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -281,6 +283,29 @@ export class StoreEngine {
   private begin(): void { this.assertOpen(); this.db.exec('BEGIN IMMEDIATE'); }
   private commit(): void { this.db.exec('COMMIT'); }
   private rollback(): void { try { this.db.exec('ROLLBACK'); } catch { /* A failed BEGIN has no transaction to roll back. */ } }
+
+  hasPendingLogMigration(): boolean {
+    this.assertOpen();
+    return hasPendingMigration(this.db);
+  }
+
+  /** Returns whether another batch is needed. */
+  runBackgroundMigrationStep(batchSize = 2000): boolean {
+    this.assertOpen();
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1) throw new RangeError('INVALID_MIGRATION_BATCH_SIZE');
+    if (!this.hasPendingLogMigration()) return false;
+    this.begin();
+    let remaining: boolean;
+    try {
+      remaining = migrateLegacyBatch(this.db, batchSize);
+      this.commit();
+    } catch (error) {
+      this.rollback();
+      throw error;
+    }
+    if (!remaining) this.db.exec('PRAGMA incremental_vacuum(2000)');
+    return remaining;
+  }
 
   private cursor(sourceId: string, conn: DatabaseSync = this.db): CursorState | null {
     const row = conn.prepare('SELECT cursor_json FROM source_cursors WHERE source_id = ?').get(sourceId) as CursorRow | undefined;
@@ -1164,7 +1189,8 @@ export class StoreEngine {
       }
       const literalLower = !caseSensitive ? query.literal.toLowerCase() : null;
       // FTS5 trigram accelerates any literal substring query >= 3 characters without false negatives!
-      const useFts = mode === 'literal' && query.literal.length >= 3 && query.literal.length <= 256 && !/[\u0000]/.test(query.literal);
+      const useFts = mode === 'literal' && query.literal.length <= 256 && [...query.literal].length >= 3
+        && !/[\u0000]/.test(query.literal) && !hasPendingFtsBackfill(this.readDb);
       const ftsQuery = useFts ? `"${query.literal.replace(/"/g, '""')}"` : null;
 
       const events: LogEvent[] = [];
@@ -1188,7 +1214,7 @@ export class StoreEngine {
           rows = this.readDb.prepare(
             `SELECT e.seq,e.event_id,e.source_id,e.task_id,e.generation,e.start_offset,e.end_offset,e.ingested_at,e.text,e.raw_ansi,e.event_json
              FROM log_events e
-             WHERE ${sourceClause} AND e.seq<=? AND e.seq<?
+             WHERE ${sourceClause} AND e.text IS NOT NULL AND e.seq<=? AND e.seq<?
              ORDER BY e.seq DESC LIMIT ?`,
           ).all(...token.sourceIds, token.highWater, beforeSeq, SEARCH_BATCH) as EventRow[];
         }
@@ -1494,7 +1520,9 @@ export class StoreEngine {
           work++; workBytes += size;
         }
       }
-      this.processEventCleanup();
+      // Offset keys for older legacy rows may still be filling in. Keep queued evictions
+      // until the cleanup range can see every row. Reads already respect raw retention.
+      if (!hasPendingFtsBackfill(this.db)) this.processEventCleanup();
       this.pruneSeriesAndContentChanges(nowMs);
       this.db.exec('PRAGMA incremental_vacuum(128)');
       this.commit();
