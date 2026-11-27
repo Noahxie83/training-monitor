@@ -15,6 +15,7 @@
 | **Phase 5a** | [`05a-backend-desktop-fixes.md`](./05a-backend-desktop-fixes.md) | **收官复核修复（后端/探针/自动启动/桌面端/测试，建议 Codex）**：修 Checkpoint 字段错位、ANSI/`\r` 字节校验、`log_only`/`inferred_tree` 进度、共享锁 `EXDEV`、`restart` 故障、`main.ts` 刷新卸 IPC、Windows Python/Desktop 测试全绿及物理清理根目录脏文件 | `fix(core,desktop): ...` |
 | **Phase 5b** | [`05b-frontend-polish-and-wiring.md`](./05b-frontend-polish-and-wiring.md) | **收官复核精修（前端交互/双语/对比度/小屏微调，建议 Gemini）**：补离线 `forceLocal` 确认弹窗、导出取消态、清零 193 行残留中文与 `GpuMonitor` i18n、修深色 2.77:1 对比度与窄窗/macOS 标题栏重叠、优化 `960×650` 头部紧凑度与 `DESIGN.md` 对齐 | `fix(ui): ...` |
 | **Phase 5c** | [`05c-final-windows-tests-and-960px-fix.md`](./05c-final-windows-tests-and-960px-fix.md) | **最终 3 项微修（Windows 测试全绿 + 960px 胶囊防裁切）**：修 `phase4-resilience.spec.ts` Windows `electron.exe` 路径、补 `test_phase2_launch.py` POSIX 守卫、修 `960×650` 自动启动条条件胶囊半字裁切 | `fix(tests,ui): ...` |
+| **Phase 5d** | [`05d-sqlite-v2-large-db-migration-fix.md`](./05d-sqlite-v2-large-db-migration-fix.md) | **大体积旧库迁移超时根治（建议 Codex）**：解决 1.66 GB / 75 万行旧版 `monitor.sqlite` 升级 v2 触发 5 秒 `STORE_READY_TIMEOUT`（改原生 `json_remove` + 大库异步分批 FTS5 回填 + 异步 `retain()` + 放宽超时），并顺手修平 Windows HiDPI 窗口恢复 3px 断言 | `fix(store,tests): ...` |
 
 ---
 
