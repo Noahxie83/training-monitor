@@ -1,6 +1,7 @@
 import { _electron as electron, expect, test } from '@playwright/test';
 import { execFile } from 'node:child_process';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -73,6 +74,7 @@ test('backs up a damaged configuration and continues when the user chooses reset
 test('fits off-screen saved geometry to the work area and remembers a resized window', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'TrainingMonitor-geometry-'));
   const mainEntry = path.resolve('dist/main.cjs');
+  const executable = createRequire(import.meta.url)('electron') as string;
   const profile = `--user-data-dir=${directory}`;
   try {
     await writeFile(path.join(directory, 'preferences.json'), JSON.stringify({
@@ -81,7 +83,6 @@ test('fits off-screen saved geometry to the work area and remembers a resized wi
     }));
     let savedSize: number[];
     const first = await electron.launch({ chromiumSandbox: true, args: [mainEntry, profile] });
-    const executable = first.process().spawnfile;
     try {
       const main = await first.firstWindow();
       const nativeWindow = await first.browserWindow(main);

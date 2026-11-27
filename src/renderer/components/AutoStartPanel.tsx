@@ -82,6 +82,33 @@ export function AutoStartPanel({
         ? t('autoStart.summaryAllPoolAny')
         : t('autoStart.summaryAllPool', { count: gpuCount });
 
+  const conditionLabels = [
+    poolLabel,
+    t('autoStart.summaryIdleDuration', { seconds: config.idleSeconds }),
+    ...(config.minFreeMemoryMiB
+      ? [t('autoStart.summaryFreeMem', { mem: formatMiBAsGiB(config.minFreeMemoryMiB) })]
+      : [
+          t('autoStart.summaryUtil', { pct: config.maxUtilizationPercent }),
+          t('autoStart.summaryMem', { mem: formatMiBAsGiB(config.maxMemoryMiB) }),
+        ]),
+  ];
+  if (config.gpuSharing) {
+    conditionLabels.push(t('autoStart.summarySharing', {
+      devices: config.gpuSharing.maxDevices,
+      workers: config.gpuSharing.maxWorkersPerDevice,
+    }));
+  }
+  const secondaryLabels = [];
+  if (config.retryOnExit) secondaryLabels.push(t('autoStart.summaryRetry'));
+  if (!unconfirmed &&
+    config.execution === 'server_tmux' &&
+    status?.remoteConfirmed &&
+    phase !== 'started' &&
+    phase !== 'failed' &&
+    status.errorCode !== 'SERVER_WAIT_CANCELLED') {
+    secondaryLabels.push(t('autoStart.serverHostedChip'));
+  }
+
   const selectedDevicesLabel = status?.selectedDeviceIds?.length
     ? `${status.selectedDeviceIds.join(', ')} · `
     : status?.selectedDeviceId
@@ -138,40 +165,15 @@ export function AutoStartPanel({
           </span>
 
           {config.enabled && (
-            <div className="auto-start-summary-inline">
-              <span className="auto-start-summary-chip">{poolLabel}</span>
-              <span className="auto-start-summary-chip">{t('autoStart.summaryIdleDuration', { seconds: config.idleSeconds })}</span>
-              {config.minFreeMemoryMiB ? (
-                <span className="auto-start-summary-chip">
-                  {t('autoStart.summaryFreeMem', { mem: formatMiBAsGiB(config.minFreeMemoryMiB) })}
+            <div className="auto-start-summary-inline" title={[...conditionLabels, ...secondaryLabels].join(' · ')}>
+              {conditionLabels.map((label) => (
+                <span className="auto-start-summary-chip" key={label}>{label}</span>
+              ))}
+              {secondaryLabels.map((label) => (
+                <span className="auto-start-summary-chip auto-start-summary-chip-secondary" key={label}>
+                  {label}
                 </span>
-              ) : (
-                <>
-                  <span className="auto-start-summary-chip">
-                    {t('autoStart.summaryUtil', { pct: config.maxUtilizationPercent })}
-                  </span>
-                  <span className="auto-start-summary-chip">
-                    {t('autoStart.summaryMem', { mem: formatMiBAsGiB(config.maxMemoryMiB) })}
-                  </span>
-                </>
-              )}
-              {config.gpuSharing && (
-                <span className="auto-start-summary-chip">
-                  {t('autoStart.summarySharing', {
-                    devices: config.gpuSharing.maxDevices,
-                    workers: config.gpuSharing.maxWorkersPerDevice,
-                  })}
-                </span>
-              )}
-              {config.retryOnExit && <span className="auto-start-summary-chip">{t('autoStart.summaryRetry')}</span>}
-              {!unconfirmed &&
-                config.execution === 'server_tmux' &&
-                status?.remoteConfirmed &&
-                phase !== 'started' &&
-                phase !== 'failed' &&
-                status.errorCode !== 'SERVER_WAIT_CANCELLED' && (
-                  <span className="auto-start-summary-chip">{t('autoStart.serverHostedChip')}</span>
-                )}
+              ))}
             </div>
           )}
         </div>

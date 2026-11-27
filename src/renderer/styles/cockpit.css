@@ -982,7 +982,7 @@
   }
   .auto-start-panel-head {
     flex-wrap: nowrap;
-    gap: 6px;
+    gap: 4px;
     min-width: 0;
   }
   .auto-start-panel-ident {
@@ -992,17 +992,25 @@
     min-width: 0;
     overflow: hidden;
   }
+  .auto-start-phase {
+    padding-inline: 5px;
+  }
   .auto-start-summary-inline {
     flex-wrap: nowrap;
-    gap: 4px;
+    gap: 3px;
     flex: 1;
     min-width: 0;
-    overflow: hidden;
+    padding-right: 4px;
   }
   .auto-start-summary-chip {
-    padding: 0 5px;
+    padding: 0 2px;
     font-size: 10.5px;
-    flex-shrink: 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .auto-start-summary-chip-secondary {
+    display: none;
   }
   .auto-start-panel-actions {
     gap: 4px;
@@ -1010,7 +1018,8 @@
   }
   .auto-start-panel-actions .btn-xs {
     height: 20px;
-    padding: 0 6px;
+    padding: 0 3px;
+    gap: 3px;
     font-size: 11px;
   }
   .auto-start-row-bottom {

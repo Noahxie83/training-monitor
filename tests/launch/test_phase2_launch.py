@@ -98,6 +98,7 @@ class Phase2LaunchTests(unittest.TestCase):
             )
             return popen_mock.call_args.args[0], popen_mock.call_args.kwargs
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process, permission, or runtime directory semantics")
     def test_ngpu_simultaneous_idle_wait_and_index_vs_uuid_mode(self):
         request = {
             "version": 1,
