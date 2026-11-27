@@ -357,6 +357,7 @@ test.describe('isolated simulated renderer fixture geometry',()=>{
     }, fixturePath);
     await expect.poll(() => app.windows().map(window => window.url())).toContain(fixtureUrl);
     fixturePage = app.windows().find(window => window.url() === fixtureUrl)!;
+    await fixturePage.setViewportSize({ width: 1200, height: 800 });
     await expect(fixturePage.locator('.log-console-footer')).toContainText('500');
   });
   test.afterEach(async()=>{await fixturePage?.close();});
@@ -384,7 +385,14 @@ test.describe('isolated simulated renderer fixture geometry',()=>{
     await fixturePage.evaluate(()=>{window.getSelection()!.removeAllRanges();document.dispatchEvent(new Event('selectionchange'));});await assertAnchor(selectedAnchor);
     // Establish a real nonzero intra-row reading offset after proving that the
     // async-load selection itself captured an anchor without any prior scroll.
-    await viewport.evaluate(el=>{el.scrollTop+=9;el.dispatchEvent(new Event('scroll'));});
+    await viewport.evaluate(el => {
+      const top = el.getBoundingClientRect().top;
+      const nextRow = Array.from(el.querySelectorAll('.log-event-row'))
+        .find(row => row.getBoundingClientRect().top > top + 4);
+      if (!nextRow) throw new Error('Expected a visible row to scroll into');
+      el.scrollTop += nextRow.getBoundingClientRect().top - top + 8;
+      el.dispatchEvent(new Event('scroll'));
+    });
     const readingAnchor=await anchor();expect(readingAnchor.top).toBeLessThan(-2);
     await fixturePage.getByRole('button',{name:/加载更早日志/}).click();await assertAnchor(readingAnchor);
     await command('push',10000,25);await assertAnchor(readingAnchor);await expect(fixturePage.getByText('当前阅读位置已被缓冲区淘汰')).toBeHidden();
