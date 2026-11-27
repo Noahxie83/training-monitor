@@ -12,6 +12,9 @@
     <img src="https://img.shields.io/badge/TypeScript-7-161A22?logo=typescript&logoColor=60A5FA" alt="TypeScript" />
     <img src="https://img.shields.io/badge/Python-3.7%2B-161A22?logo=python&logoColor=34D399" alt="Python 3.7+" />
     <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-2563EB" alt="Cross-platform" />
+    <a href="./LICENSE">
+      <img src="https://img.shields.io/badge/License-MIT-34D399" alt="MIT License" />
+    </a>
   </p>
 
   <p>
@@ -230,3 +233,9 @@ npm run test:all      # Run the complete verification & packaging pipeline
 - [Contributing Guide](./CONTRIBUTING.md)
 - [Security Architecture & Reporting](./SECURITY.md)
 - [简体中文文档](./README.zh-CN.md)
+
+---
+
+## License
+
+Released under the [MIT License](./LICENSE).

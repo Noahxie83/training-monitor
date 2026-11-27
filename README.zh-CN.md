@@ -12,6 +12,9 @@
     <img src="https://img.shields.io/badge/TypeScript-7-161A22?logo=typescript&logoColor=60A5FA" alt="TypeScript" />
     <img src="https://img.shields.io/badge/Python-3.7%2B-161A22?logo=python&logoColor=34D399" alt="Python 3.7+" />
     <img src="https://img.shields.io/badge/平台-Windows%20%7C%20macOS%20%7C%20Linux-2563EB" alt="跨平台" />
+    <a href="./LICENSE">
+      <img src="https://img.shields.io/badge/License-MIT-34D399" alt="MIT License" />
+    </a>
   </p>
 
   <p>
@@ -192,3 +195,9 @@ npm run test:all      # 一键执行完整回归与打包烟测
 - [贡献指南](./CONTRIBUTING.md)
 - [安全模型与漏洞反馈](./SECURITY.md)
 - [English Documentation](./README.md)
+
+---
+
+## 开源协议
+
+本项目基于 [MIT License](./LICENSE) 开源。
