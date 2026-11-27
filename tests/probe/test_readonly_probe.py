@@ -614,7 +614,17 @@ class ReadOnlyProbeTests(unittest.TestCase):
             source.write_bytes(b"small")
             offset = str(2**53 + 17)
             expected = {"generation": "g1", "revision": 9, "committedOffset": offset}
-            result = probe._read_log({"path": str(source), "currentPath": str(source), "hostAllowedRoots": [directory], "taskAllowedDirectories": [directory], "offset": offset, "limitBytes": 256, "anchors": [], "expected": expected, "kind": "current"})
+            real_seek = os.lseek
+
+            def seek(fd, position, whence):
+                # The test offset exceeds the maximum file size of some filesystems.
+                if position == int(offset) and whence == os.SEEK_SET:
+                    return real_seek(fd, 0, os.SEEK_END)
+                return real_seek(fd, position, whence)
+
+            with mock.patch.object(probe.os, "lseek", side_effect=seek) as seek_calls:
+                result = probe._read_log({"path": str(source), "currentPath": str(source), "hostAllowedRoots": [directory], "taskAllowedDirectories": [directory], "offset": offset, "limitBytes": 256, "anchors": [], "expected": expected, "kind": "current"})
+            seek_calls.assert_any_call(mock.ANY, int(offset), os.SEEK_SET)
             self.assertTrue(result["ok"])
             self.assertEqual(result["startOffset"], offset)
             self.assertEqual(result["expected"], expected)

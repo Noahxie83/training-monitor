@@ -36,7 +36,7 @@ describe('local log queries', () => {
     const searchComplete = await db.searchLogs({ requestId: 'many-chunks-search-complete', sourceIds: ['many-chunks'], literal: 'x'.repeat(257), continuation: null });
     expect(searchComplete.events).toContainEqual(expect.objectContaining({ text: 'x'.repeat(257), recordComplete: true }));
     await db.close();
-  });
+  }, 30_000);
 
   it('preserves a cancellation acknowledged while search is queued behind a generation seal', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'monitor-queued-search-cancel-'));

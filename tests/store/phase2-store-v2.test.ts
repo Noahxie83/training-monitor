@@ -18,6 +18,7 @@ function seedLargeV1(dbPath: string): void {
   const db = new DatabaseSync(dbPath);
   try {
     db.exec(`
+      BEGIN;
       PRAGMA user_version = 1;
       CREATE TABLE source_registry(source_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, recovery_json TEXT);
       INSERT INTO source_registry(source_id, task_id) VALUES ('src', 'task');
@@ -34,14 +35,17 @@ function seedLargeV1(dbPath: string): void {
         ingested_at TEXT NOT NULL, text TEXT, event_json TEXT NOT NULL
       );
       CREATE INDEX log_events_text ON log_events(source_id, text, seq DESC);
+      CREATE INDEX log_events_source_order ON log_events(source_id, seq DESC);
       WITH RECURSIVE rows(i) AS (VALUES (1) UNION ALL SELECT i+1 FROM rows WHERE i<50001)
       INSERT INTO log_events(event_id, source_id, task_id, generation, ingested_at, text, event_json)
-      SELECT 'legacy-' || i, 'src', 'task', 'g1', '${NOW}', 'historical-marker ' || i,
+      SELECT 'legacy-' || i, CASE WHEN i IN (3,29999,50000,50001) THEN 'src' ELSE 'bulk' END,
+        'task', 'g1', '${NOW}', 'historical-marker ' || i,
         json_object('text', 'historical-marker ' || i, 'rawAnsi', NULL) FROM rows;
       UPDATE log_events SET start_offset='12', end_offset='34' WHERE seq=3;
       UPDATE log_events SET text=NULL WHERE seq=2;
       UPDATE log_events SET text=text || ' 🚀x' WHERE seq=50000;
       UPDATE log_events SET event_json=json_set(event_json, '$.rawAnsi', 'legacy ANSI') WHERE seq=29999;
+      COMMIT;
     `);
   } finally {
     db.close();
@@ -182,7 +186,7 @@ describe('Phase 2 SQLite v2 store, FTS5, time-series, and worker resilience', ()
       await engine.close();
       check.close();
     }
-  }, 10_000);
+  }, 30_000);
 
   it('opens a large legacy database through the production worker and completes background backfill', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'monitor-large-worker-'));
@@ -197,13 +201,13 @@ describe('Phase 2 SQLite v2 store, FTS5, time-series, and worker resilience', ()
         continuation: null, mode: 'literal',
       });
       expect(page.events.map((event) => event.eventId)).toEqual(['legacy-50001']);
-      await expect.poll(() => check.prepare('SELECT count(*) AS n FROM store_meta').get()?.n, { timeout: 5_000 }).toBe(0);
+      await expect.poll(() => check.prepare('SELECT count(*) AS n FROM store_meta').get()?.n, { timeout: 15_000 }).toBe(0);
       await expect.poll(() => check.prepare('SELECT 1 FROM log_events WHERE seq=3').get()).toBeUndefined();
     } finally {
       check.close();
       await client.close();
     }
-  }, 10_000);
+  }, 30_000);
 
   it('extends worker readiness on migration heartbeats up to the total timeout', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });

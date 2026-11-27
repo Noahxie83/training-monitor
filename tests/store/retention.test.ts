@@ -282,14 +282,19 @@ describe('cache retention', () => {
 
       const raw = new DatabaseSync(path.join(directory, 'monitor.sqlite'));
       const event = raw.prepare('SELECT source_id,generation,end_offset FROM log_events WHERE source_id=? AND text IS NOT NULL').get(`support-${intervalCount}`) as { source_id: string; generation: string; end_offset: string };
-      raw.prepare('DELETE FROM raw_support WHERE source_id=?').run(event.source_id);
-      const insert = raw.prepare('INSERT INTO raw_support(source_id,generation,start_offset,end_offset,start_key,end_key,ingested_at) VALUES(?,?,?,?,?,?,?)');
-      for (let index = 0; index < intervalCount + 1; index++) {
-        const start = String(index); const end = String(index + 1);
-        const key = (value: string) => `${String(value.length).padStart(10, '0')}:${value}`;
-        insert.run(event.source_id, event.generation, start, end, key(start), key(end), new Date(Date.parse(NOW) + index).toISOString());
+      try {
+        raw.exec('BEGIN');
+        raw.prepare('DELETE FROM raw_support WHERE source_id=?').run(event.source_id);
+        const insert = raw.prepare('INSERT INTO raw_support(source_id,generation,start_offset,end_offset,start_key,end_key,ingested_at) VALUES(?,?,?,?,?,?,?)');
+        for (let index = 0; index < intervalCount + 1; index++) {
+          const start = String(index); const end = String(index + 1);
+          const key = (value: string) => `${String(value.length).padStart(10, '0')}:${value}`;
+          insert.run(event.source_id, event.generation, start, end, key(start), key(end), new Date(Date.parse(NOW) + index).toISOString());
+        }
+        raw.exec('COMMIT');
+      } finally {
+        raw.close();
       }
-      raw.close();
 
       db = await openTestStore(directory, () => Date.parse(NOW));
       const page = await db.getLogs({ requestId: `support-page-${intervalCount}`, sourceId: event.source_id, before: null, limit: 10 });
