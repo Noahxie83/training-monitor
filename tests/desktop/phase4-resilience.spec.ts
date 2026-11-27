@@ -87,19 +87,25 @@ test('fits off-screen saved geometry to the work area and remembers a resized wi
       const main = await first.firstWindow();
       const nativeWindow = await first.browserWindow(main);
       await expect.poll(() => nativeWindow.evaluate((window) => window.isVisible())).toBe(true);
-      const workArea = await first.evaluate(({ BrowserWindow, screen }) => {
-        const bounds = BrowserWindow.getAllWindows()[0]!.getBounds();
+      const { fits, targetWidth, targetHeight } = await first.evaluate(({ BrowserWindow, screen }) => {
+        const window = BrowserWindow.getAllWindows()[0]!;
+        const bounds = window.getBounds();
         const display = screen.getPrimaryDisplay().workArea;
-        return bounds.x >= display.x && bounds.y >= display.y &&
-          bounds.x + bounds.width <= display.x + display.width &&
-          bounds.y + bounds.height <= display.y + display.height;
+        const [minWidth, minHeight] = window.getMinimumSize();
+        return {
+          fits: bounds.x >= display.x && bounds.y >= display.y &&
+            bounds.x + bounds.width <= display.x + display.width &&
+            bounds.y + bounds.height <= display.y + display.height,
+          targetWidth: Math.max(minWidth, Math.min(1060, display.width - 16)),
+          targetHeight: Math.max(minHeight, Math.min(690, display.height - 16)),
+        };
       });
-      expect(workArea).toBe(true);
-      await nativeWindow.evaluate((window) => window.setSize(1060, 690));
+      expect(fits).toBe(true);
+      await nativeWindow.evaluate((window, { width, height }) => window.setSize(width, height), { width: targetWidth, height: targetHeight });
       const tolerance = process.platform === 'win32' ? 2 : 0;
       await expect.poll(async () => {
         const [width, height] = await nativeWindow.evaluate((window) => window.getSize());
-        return Math.max(Math.abs(width - 1060), Math.abs(height - 690));
+        return Math.max(Math.abs(width - targetWidth), Math.abs(height - targetHeight));
       }).toBeLessThanOrEqual(tolerance);
       const [width, height] = savedSize = await nativeWindow.evaluate((window) => window.getSize());
       await expect.poll(() => main.evaluate(async () => (await window.monitor.getPreferences()).windowBounds?.main))

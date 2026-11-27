@@ -1,7 +1,6 @@
 import { _electron as electron, expect, test } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { mkdtemp, rm, copyFile } from 'node:fs/promises';
 import { build } from 'esbuild';
 import os from 'node:os';
@@ -349,18 +348,18 @@ test.describe('isolated simulated renderer fixture geometry',()=>{
   });
   test.beforeEach(async()=>{
     const fixturePath = path.join(fixtureDirectory, 'index.html');
-    const fixtureUrl = pathToFileURL(fixturePath).href;
-    await app.evaluate(async({BrowserWindow,session},file)=>{
+    const fixtureUrl = await app.evaluate(async({BrowserWindow,session},file)=>{
       const isolated=session.fromPartition('fix4-renderer-fixture');isolated.webRequest.onBeforeRequest((details,callback)=>callback({cancel:!details.url.startsWith('file:')}));isolated.setPermissionCheckHandler(()=>false);isolated.setPermissionRequestHandler((_w,_p,callback)=>callback(false));
       const window=new BrowserWindow({width:1200,height:800,webPreferences:{contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true,session:isolated}});
       window.webContents.setWindowOpenHandler(()=>({action:'deny'}));window.webContents.on('will-navigate',event=>event.preventDefault());
       await window.loadFile(file);
+      return window.webContents.getURL();
     }, fixturePath);
     await expect.poll(() => app.windows().map(window => window.url())).toContain(fixtureUrl);
     fixturePage = app.windows().find(window => window.url() === fixtureUrl)!;
     await expect(fixturePage.locator('.log-console-footer')).toContainText('500');
   });
-  test.afterEach(async()=>{await fixturePage.close();});
+  test.afterEach(async()=>{await fixturePage?.close();});
 
   async function command(name:string,...args:unknown[]){await fixturePage.evaluate(({name,args})=>(window as any).simulatedRendererFixture[name](...args),{name,args});}
   async function bottom(){const v=fixturePage.locator('.log-viewport');await expect.poll(()=>v.evaluate(el=>Math.abs(el.scrollHeight-el.clientHeight-el.scrollTop))).toBeLessThan(5);}
