@@ -1,0 +1,24 @@
+name: Feature Request
+description: Suggest a new parser, accelerator backend, alert channel, or UX improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Workflow Need
+      description: Describe the training monitoring workflow or limitation you want to solve.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: How should this feature work in the UI, probe, or auto-start pipeline?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Environment / Framework Context (optional)
+      placeholder: e.g. Slurm cluster, AMD ROCm, Apple Silicon MPS, TensorBoard tfevents, W&B...

@@ -1,0 +1,58 @@
+name: Bug Report
+description: Report a bug in probing, SSH/WSL transport, auto-start, SQLite storage, or the desktop UI.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve Training Monitor! Please include concrete details so we can reproduce the issue quickly.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Connect to host (...)
+        2. Start training job with (...)
+        3. Observe (...)
+    validations:
+      required: true
+  - type: dropdown
+    id: client-os
+    attributes:
+      label: Desktop Client OS
+      options:
+        - Windows 11 / 10
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+    validations:
+      required: true
+  - type: dropdown
+    id: target-type
+    attributes:
+      label: Monitored Host Target
+      options:
+        - Remote SSH (Linux)
+        - Local WSL2
+        - Local Machine (native)
+        - Demo Mode
+    validations:
+      required: true
+  - type: input
+    id: framework
+    attributes:
+      label: Training Framework / Launcher (optional)
+      placeholder: e.g. PyTorch DDP (torchrun), HuggingFace Accelerate, DeepSpeed, Lightning, YOLO
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots
+      description: Paste sanitized startup logs (`logs/startup.log`), error messages, or screenshots. Please redact private IPs/tokens.
+      render: text
