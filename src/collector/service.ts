@@ -1,6 +1,7 @@
 import { cancelChangedServerWaits, flushPendingRemoteCancels, type PendingRemoteCancel } from '../launch/reconcile';
-import { AutoStartController } from '../launch/controller';
-import { randomUUID } from 'node:crypto';
+import { AutoStartController, launchConfigHash } from '../launch/controller';
+import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import type {
   ControlTaskRequest,
   ExportLogsQuery,
@@ -204,7 +205,7 @@ function extractHostSampleRow(hostId: string, observation: HostObservation): Hos
 
 function extractMetricSampleRows(snapshot: TaskSnapshot, observedAt: string): MetricSampleRow[] {
   const rows: MetricSampleRow[] = [];
-  const runId = snapshot.currentRun?.runId ?? null;
+  const runId = snapshot.currentRun?.runId ?? snapshot.progress.runId;
   const step = snapshot.progress.current ?? snapshot.progress.lastStepIndex ?? null;
   if (snapshot.progress.scalars) {
     for (const [metricName, value] of Object.entries(snapshot.progress.scalars)) {
@@ -644,7 +645,11 @@ class ProductionMonitor implements ProductionMonitorApi {
       await cancelChangedServerWaits(current, validated, this.options.transportProvider, this.abort.signal, {
         forceLocal: options?.forceLocal === true,
         now: this.options.clock,
-        onPendingCancel: (pending) => {
+        onPendingCancel: async (pending) => {
+          if (this.options.store.enqueueRemoteCancel) {
+            await this.options.store.enqueueRemoteCancel(pending);
+            return;
+          }
           this.pendingRemoteCancels = [
             ...this.pendingRemoteCancels.filter((p) => !(p.hostId === pending.hostId && p.taskId === pending.taskId && p.armId === pending.armId)),
             pending,
@@ -662,7 +667,7 @@ class ProductionMonitor implements ProductionMonitorApi {
       ).catch(() => undefined);
       await this.publishSnapshot(saved);
       const enabledIds = saved.hosts.filter((h) => h.enabled).map((h) => h.hostId);
-      if (enabledIds.length > 0 && !this.stopped) {
+      if (enabledIds.length > 0 && !this.stopped && !this.collectionPaused) {
         void this.refreshSelectedHosts(saved, enabledIds, {}, false).catch(() => undefined);
       }
       return structuredClone(saved);
@@ -808,18 +813,42 @@ class ProductionMonitor implements ProductionMonitorApi {
         return res;
       }
 
-      const result = await transport.signalTask(task, request.action, keys, this.abort.signal);
-      let finalResult: JobControlResult = result;
-      if (request.action === 'restart' && result.ok && task.autoStart && transport.launchTask) {
-        const armId = task.autoStart.armId;
-        const launched = await transport.launchTask(task, armId, `restart:${armId}:${this.options.clock()}`, this.abort.signal);
+      let finalResult: JobControlResult;
+      if (request.action === 'restart' && (!host.enabled || !task.enabled || !task.autoStart?.enabled || !transport.launchTask)) {
         finalResult = {
-          ...result,
-          ok: launched.status === 'started',
-          pid: launched.pid,
-          errorCode: launched.status === 'started' ? null : (launched.errorCode ?? 'RESTART_LAUNCH_FAILED'),
-          message: launched.status === 'started' ? 'Restarted training process' : `Signal succeeded but relaunch status=${launched.status}`,
+          ok: false, taskId: task.taskId, action: request.action,
+          errorCode: 'LAUNCH_SERVICE_UNAVAILABLE', message: 'Restart requires an enabled launch configuration.',
         };
+      } else {
+        finalResult = await transport.signalTask(task, request.action, keys, this.abort.signal);
+      }
+      if (request.action === 'restart' && finalResult.ok && transport.launchTask) {
+        const signal = this.abort.signal;
+        const deadline = performance.now() + 5_000;
+        let stopped = false;
+        do {
+          const observation = await transport.probeTask(task, signal);
+          stopped = observation.taskId === task.taskId && observation.hostId === task.hostId &&
+            observation.freshness === 'fresh' && observation.scanComplete && observation.processScanError === null &&
+            (observation.errorCode === null || observation.errorScope === 'source') &&
+            !observation.processes.some((proc) =>
+              keys.some((key) => areProcessKeysEqual(key, proc.key)) || isTaskTrackedProcess(task, proc));
+          if (!stopped) await delay(150, undefined, { signal });
+        } while (!stopped && performance.now() < deadline);
+        if (!stopped) {
+          finalResult = { ...finalResult, ok: false, errorCode: 'RESTART_STOP_UNCONFIRMED', message: 'Previous process exit could not be confirmed.' };
+        } else {
+          const armId = randomUUID();
+          const configHash = createHash('sha256').update(launchConfigHash(host, task)).update(armId).digest('hex');
+          const launched = await transport.launchTask(task, armId, configHash, signal, { restart: true });
+          finalResult = {
+            ...finalResult,
+            ok: launched.status === 'started',
+            pid: launched.pid,
+            errorCode: launched.status === 'started' ? null : (launched.errorCode ?? 'RESTART_LAUNCH_FAILED'),
+            message: launched.status === 'started' ? 'Restarted training process' : `Relaunch status=${launched.status}`,
+          };
+        }
       }
       await this.options.auditJobControl?.({
         timestamp,
@@ -1186,9 +1215,11 @@ class ProductionMonitor implements ProductionMonitorApi {
     }
 
     // Flush any queued forceLocal server-wait cancellations on reconnect!
-    if (transport && this.pendingRemoteCancels.some((p) => p.hostId === host.hostId)) {
-      const flushed = await flushPendingRemoteCancels(host.hostId, transport, this.pendingRemoteCancels, this.abort.signal);
-      this.pendingRemoteCancels = flushed.remaining;
+    if (transport) {
+      const pending = await this.options.store.getPendingRemoteCancels?.(host.hostId) ?? this.pendingRemoteCancels;
+      const { flushed } = await flushPendingRemoteCancels(host.hostId, transport, pending, this.abort.signal);
+      for (const item of flushed) await this.options.store.deleteRemoteCancel?.(item);
+      this.pendingRemoteCancels = this.pendingRemoteCancels.filter((item) => !flushed.includes(item));
     }
 
     for (const task of tasks) {
@@ -1298,7 +1329,7 @@ class ProductionMonitor implements ProductionMonitorApi {
         errorCode: result.error,
       };
       for (const batch of result.batches) {
-        bindingState = await this.applyBindings(task, taskObservation, bindingState, batch.ingestedAt);
+        bindingState = await this.applyBindings(task, taskObservation, bindingState, batch.ingestedAt, batch.events);
         for (const event of batch.events) {
           bindingState = ingestCompleteRecord(event, bindingState).state;
         }
@@ -1339,7 +1370,7 @@ class ProductionMonitor implements ProductionMonitorApi {
 
     this.bindings.set(task.taskId, bindingState);
     const prior = this.previousTasks.get(task.taskId) ?? null;
-    const { outputSamples, tailLogLines } = await this.sampleLogOutputs(task, taskObservation);
+    const { outputSamples, tailLogLines } = await this.sampleLogOutputs(task, taskObservation, newlyCommittedEvents, bindingState.completeRecords);
     observedAt = iso(this.options.clock());
 
     // Evaluate directory/file-level checkpoint scan when present
@@ -1404,20 +1435,22 @@ class ProductionMonitor implements ProductionMonitorApi {
     taskObservation: TaskObservation,
     state: BindingState,
     observedAt: string,
+    committedEvents: LogEvent[] = [],
   ): Promise<BindingState> {
-    const sourceInfo: Record<string, { generation: string; eofBytes: string; fileIdentity: { dev: string; inode: string } | null }> = {};
+    const sourceInfo: Record<string, { generation: string; eofBytes: string; fileIdentity: { dev: string; inode: string } | null; committedOffset: string }> = {};
     for (const source of taskObservation.sources) {
       const cursor = await this.options.store.getCursor(source.sourceId);
       if (!cursor) continue;
       sourceInfo[source.sourceId] = {
         generation: cursor.generation,
+        committedOffset: cursor.committedOffset,
         eofBytes: source.eofBytes ?? cursor.committedOffset,
         fileIdentity: source.fileIdentity,
       };
     }
     const observerEpoch = this.hostEpochs.get(task.hostId);
     if (!observerEpoch) return state;
-    const outputSamples = await this.latestOutputSample(task, taskObservation);
+    const { outputSamples } = await this.sampleLogOutputs(task, taskObservation, committedEvents, state.completeRecords);
     return updateBindings(state, {
       task,
       taskId: task.taskId,
@@ -1595,6 +1628,8 @@ class ProductionMonitor implements ProductionMonitorApi {
   private async sampleLogOutputs(
     task: TaskRegistration,
     taskObservation: TaskObservation,
+    committedEvents: LogEvent[] = [],
+    retainedRecords: LogEvent[] = [],
   ): Promise<{ outputSamples: Record<string, TrainerOutputObservation>; tailLogLines: string[] }> {
     const logSources = task.sources.filter((item) => item.kind === 'log');
     const outputSamples: Record<string, TrainerOutputObservation> = {};
@@ -1610,19 +1645,21 @@ class ProductionMonitor implements ProductionMonitorApi {
         before: null,
         limit: PAGE_SIZE,
       });
-      for (const item of page.events.slice(-30)) {
+      for (const item of page.events.slice(0, 30).reverse()) {
         if (item.text) tailLogLines.push(item.text);
       }
       if (!observed?.fileIdentity || !observed.observedAt) continue;
-      const event = [...page.events].reverse().find((item) =>
+      const batchSamples = committedEvents.filter((item) => item.sourceId === source.sourceId).reverse();
+      const history = retainedRecords.filter((item) => item.sourceId === source.sourceId).reverse();
+      const event = [...batchSamples, ...page.events, ...history].find((item) =>
         item.generation === cursor.generation &&
-        item.recordComplete === true && item.text && !item.displayTruncated &&
+        item.recordComplete === true && item.text && !item.displayTruncated && !item.prefixIncomplete && !item.reason &&
         item.startOffset !== null && item.endOffset !== null &&
         isTimestampValid(item.ingestedAt, this.options.clock()) &&
         parseRegisteredRecord(task, item.text, source.sourceId).isTrainingOutput);
       if (!event) continue;
       const rawByteLength = Buffer.byteLength(event.rawAnsi ?? event.text!, 'utf8');
-      const terminatorBytes = Number(BigInt(event.endOffset!) - BigInt(event.startOffset!)) - rawByteLength;
+      const terminatorBytes = Number(BigInt(event.endOffset!) - BigInt(event.frameStartOffset ?? event.startOffset!)) - rawByteLength;
       if (!Number.isInteger(terminatorBytes) || terminatorBytes < 0 || terminatorBytes > 2) continue;
       outputSamples[source.sourceId] = {
         sourceId: source.sourceId,
@@ -1630,6 +1667,8 @@ class ProductionMonitor implements ProductionMonitorApi {
         fileIdentity: { ...observed.fileIdentity },
         startOffset: event.startOffset!,
         endOffset: event.endOffset!,
+        frameStartOffset: event.frameStartOffset,
+        rawAnsi: event.rawAnsi,
         terminatorBytes: terminatorBytes as 0 | 1 | 2,
         observedAt: observed.observedAt,
         text: event.text!,
@@ -1637,10 +1676,6 @@ class ProductionMonitor implements ProductionMonitorApi {
     }
 
     return { outputSamples, tailLogLines: tailLogLines.slice(-40) };
-  }
-
-  private async latestOutputSample(task: TaskRegistration, taskObservation: TaskObservation): Promise<Record<string, TrainerOutputObservation>> {
-    return (await this.sampleLogOutputs(task, taskObservation)).outputSamples;
   }
 
   private storeSnapshotFor(projected: TaskSnapshot, task: TaskRegistration): TaskSnapshot {

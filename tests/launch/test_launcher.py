@@ -115,6 +115,8 @@ class LauncherTests(unittest.TestCase):
 
     def run_launch(self, request=None, **patch_options):
         patches = self.launch_patches(**patch_options)
+        if os.name == "nt":
+            patches.insert(-1, mock.patch.object(launcher.os, "fchmod", create=True))
         popen = patches[-1]
         for patcher in patches[:-1]:
             patcher.start()
@@ -386,6 +388,30 @@ class LauncherTests(unittest.TestCase):
         result, popen = self.run_launch()
         self.assertIn(result, [launcher._failed("ENTRY_PATH_INVALID"), launcher._failed("SCRIPT_PATH_INVALID")])
         popen.assert_not_called()
+
+    def test_module_environment_applies_only_literal_environment_deltas(self):
+        from subprocess import CompletedProcess
+        env = {"PATH": "/bin", "OLD": "remove"}
+        output = b"import os\nos.environ['PATH'] = '/cuda/bin:/bin'\ndel os.environ['OLD']\n_mlstatus = True\n"
+        with mock.patch.object(launcher.shutil, "which", return_value="/bin/modulecmd"), \
+             mock.patch.object(launcher.subprocess, "run", return_value=CompletedProcess([], 0, output)) as run:
+            launcher._load_module_environment(["cuda/12.4"], env)
+        self.assertEqual(env, {"PATH": "/cuda/bin:/bin"})
+        self.assertEqual(run.call_args.args[0], ["/bin/modulecmd", "python", "load", "cuda/12.4"])
+        with mock.patch.object(launcher.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(launcher._LaunchError, "MODULECMD_UNAVAILABLE"):
+                launcher._load_module_environment(["cuda/12.4"], env)
+
+    def test_gpu_sharing_pid_receipt_writes_in_slot_directory(self):
+        slot = Path(self.temp.name) / "local-locks" / "gpu.slot"
+        slot.parent.mkdir()
+        slot.write_text("{}", encoding="utf-8")
+        with mock.patch.object(launcher, "_atomic_write_json") as write:
+            launcher._update_sharing_slot_pid(str(slot), 42)
+        filename, directory, data = write.call_args.args
+        self.assertEqual(Path(filename).parent, slot.parent)
+        self.assertEqual(directory, str(slot.parent))
+        self.assertEqual(data["pid"], 42)
 
     def test_embedded_probe_exposes_helpers_without_running_main(self):
         source = PROBE_PATH.read_text(encoding="utf-8")

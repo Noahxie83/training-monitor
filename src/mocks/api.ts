@@ -23,7 +23,7 @@ function makeDemoEvent(index: number, eventId = `demo-event-${String(index).padS
 }
 
 const emptyRegistry: Registry = { version: 2, revision: 0, hosts: [], tasks: [] };
-export function createMockApi(options: { demo?: boolean } = {}): MonitorApi {
+export function createMockApi(options: { demo?: boolean; writeExport?: (file: string, content: string) => Promise<void> } = {}): MonitorApi {
   let registry: Registry = options.demo === true ? {
     version: 2, revision: 0,
     hosts: [{ hostId: 'demo-host', label: '模拟宿主', enabled: false, allowedRoots: ['/simulated'], target: { kind: 'ssh', alias: 'gpu-server-01' } }],
@@ -114,6 +114,9 @@ export function createMockApi(options: { demo?: boolean } = {}): MonitorApi {
     async getGpuSeries(query) { return { hostId: query.hostId, gpu: [], host: [] }; },
     async exportLogs(query) {
       const matched = events.filter((e) => query.sourceIds.includes(e.sourceId) && (!query.literal || (e.text ?? '').includes(query.literal)));
+      if (query.destinationPath && options.writeExport) {
+        await options.writeExport(query.destinationPath, matched.map((event) => event.rawAnsi ?? event.text ?? '').join('\n'));
+      }
       return { exportedCount: matched.length, path: query.destinationPath ?? null };
     },
     async discoverProcesses(_hostId) { return []; },

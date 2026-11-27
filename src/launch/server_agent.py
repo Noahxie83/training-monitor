@@ -246,7 +246,7 @@ def _validate_manager_request(request):
         if type(max_retries) is not int or not 0 <= max_retries <= 100:
             raise _AgentError("INVALID_REQUEST")
         common["maxRetries"] = max_retries
-        retry_backoff = request.get("retryBackoffSeconds", 0)
+        retry_backoff = request.get("retryBackoffSeconds", DEFAULT_RETRY_BACKOFF_SECONDS)
         if type(retry_backoff) is not int or not 0 <= retry_backoff <= 3600:
             raise _AgentError("INVALID_REQUEST")
         common["retryBackoffSeconds"] = retry_backoff
@@ -1071,6 +1071,30 @@ def _record_status(record):
     )
 
 
+def _queue_lock_path(state_root):
+    return os.path.join(state_root, ".server-queue.lock")
+
+
+def _queue_records(state_root, launcher):
+    records = []
+    for name in os.listdir(state_root):
+        if not re.fullmatch(r"\.server-wait-[a-f0-9]{64}\.json", name):
+            continue
+        try:
+            record = _read_json(os.path.join(state_root, name), launcher)
+            if record is not None:
+                _validate_record(record, job_key=name[len(".server-wait-"):-len(".json")])
+                records.append(record)
+        except _AgentError:
+            continue
+    return records
+
+
+def _queue_order(record):
+    order = record.get("queueOrder")
+    return (order if type(order) is int and order > 0 else 0, record["jobKey"])
+
+
 def _base_record(common, launch_request, backend="tmux"):
     job_key = _job_key(common["taskId"], common["armId"])
     return {
@@ -1360,8 +1384,15 @@ def ensure_server_wait(request, launcher, *, tmux_executable=None, worker_source
             previous = _read_json(path, launcher)
             record["retryCount"] = previous.get("retryCount", 0)
             record["attemptArmId"] = str(uuid.uuid4())
-        if not _write_json(path, state_root, record, launcher, exclusive=not restoring):
-            raise _AgentError("STATE_FILE_EXISTS")
+        queue_fd = _acquire_file_lock(_queue_lock_path(state_root), launcher)
+        try:
+            last_order = max((_queue_order(item)[0] for item in _queue_records(state_root, launcher)), default=0)
+            record["createdAt"] = _iso_now()
+            record["queueOrder"] = max(time.time_ns(), last_order + 1)
+            if not _write_json(path, state_root, record, launcher, exclusive=not restoring):
+                raise _AgentError("STATE_FILE_EXISTS")
+        finally:
+            _release_file_lock(queue_fd)
         try:
             _new_session(
                 executable,
@@ -1554,7 +1585,7 @@ def _parse_gpu_csv(csv_text, max_utilization, max_memory_mib, min_free_memory_mi
         for row in rows:
             if not row or all(not value.strip() for value in row):
                 continue
-            if len(row) != (6 if min_free_memory_mib else 5):
+            if len(row) not in (5, 6) or (min_free_memory_mib and len(row) != 6):
                 return None
             index = _gpu_number(row[0].strip())
             gpu_uuid = row[1].strip()
@@ -1719,6 +1750,28 @@ def _restrict_gpu_candidates(candidates, launch_resources, *, state_root=None, l
             unlocked.append(c)
         filtered = unlocked
     return filtered
+
+
+def _reserve_fifo_candidates(predecessors, csv_text, now, state_root, launcher):
+    reserved = set()
+    for earlier in predecessors:
+        resources = earlier["launchRequest"]
+        threshold = resources.get("minFreeMemoryMiB")
+        candidates = _update_idle_timers(
+            csv_text, resources["maxUtilizationPercent"], resources["maxMemoryMiB"],
+            now, _new_idle_state(), threshold,
+        )
+        eligible = _restrict_gpu_candidates(candidates, resources, state_root=state_root, launcher=launcher)
+        if resources.get("gpuSharing"):
+            lock_root = launcher._runtime_lock_dir() if resources.get("useLocalLocks") else state_root
+            eligible = [c for c in eligible if launcher._sharing_candidate_allowed(lock_root, resources, c["uuid"])]
+        eligible = [c for c in eligible if c["uuid"] not in reserved]
+        # Keep the older waiter's current selection when it is still eligible.
+        selected = earlier.get("selectedDeviceIds") or []
+        eligible.sort(key=lambda item: (item["deviceId"] not in selected, item["index"]))
+        chosen, _ = _select_candidates(eligible, earlier.get("requiredGpuCount", 1))
+        reserved.update(c["uuid"] for c in chosen)
+    return reserved
 
 
 def _chosen_launch_request(record, candidate_or_list):
@@ -1919,7 +1972,7 @@ def _retry_iteration(job_key, state_root, launcher, idle_state):
             record["lastCheckedAt"] = _iso_now()
             _write_json(path, state_root, record, launcher)
             return True
-        if _completion_reported(record, state_root, launcher):
+        if record["state"] == "started" and _completion_reported(record, state_root, launcher):
             record["retryFinished"] = True
             record["state"] = "started"
             record["errorCode"] = None
@@ -2007,9 +2060,19 @@ def _worker_iteration(
             finally:
                 _release_file_lock(control)
 
+    predecessors = [
+        earlier for earlier in sorted(_queue_records(state_root, launcher), key=_queue_order)
+        if _queue_order(earlier) < _queue_order(record)
+        and earlier["state"] in {"waiting", "countdown", "starting"}
+        and earlier.get("nextRetryAtEpoch", 0) <= time.time()
+        and _session_exists(tmux_executable, launcher._current_uid(), earlier["sessionName"], state_root,
+                            backend=earlier.get("backend", "tmux"), job_key=earlier["jobKey"])
+    ]
+    include_free = launch_resources.get("minFreeMemoryMiB") or any(
+        earlier["launchRequest"].get("minFreeMemoryMiB") for earlier in predecessors)
     query_started = _monotonic()
     try:
-        query = (launcher._probe()._query_linux_gpu(include_free=True) if launch_resources.get("minFreeMemoryMiB")
+        query = (launcher._probe()._query_linux_gpu(include_free=True) if include_free
                  else launcher._probe()._query_linux_gpu())
     except Exception:
         query = {"status": "unavailable", "errorCode": "NVIDIA_SMI_UNAVAILABLE"}
@@ -2033,21 +2096,12 @@ def _worker_iteration(
         query_error_code = "GPU_UNAVAILABLE"
         query_message = "GPU state is unavailable; idle timers were reset."
 
-    if launch_resources.get("gpuSharing"):
-        candidates = [c for c in candidates if launcher._sharing_candidate_allowed(state_root, launch_resources, c["uuid"])]
-        if not candidates and query_message is None:
-            query_error_code = "GPU_SHARING_WAITING"
-            query_message = "Waiting for free GPU memory and shared GPU slot."
-    elif launch_resources.get("minFreeMemoryMiB") and not candidates and query_message is None:
-        query_error_code = "GPU_FREE_MEMORY_LOW"
-        query_message = "Waiting for GPU free memory threshold."
-
-    eligible = _restrict_gpu_candidates(candidates, launch_resources, state_root=state_root, launcher=launcher)
     required_gpu_count = max(1, int(record.get("requiredGpuCount", launch_resources.get("requiredGpuCount", 1))))
-    chosen, effective_elapsed = _select_candidates(eligible, required_gpu_count)
 
     control_fd = _acquire_file_lock(_control_lock_path(state_root, record["taskId"]), launcher)
+    queue_fd = None
     try:
+        queue_fd = _acquire_file_lock(_queue_lock_path(state_root), launcher)
         record = _read_json(path, launcher)
         if record is None:
             return False
@@ -2063,6 +2117,29 @@ def _worker_iteration(
             )
             _write_json(path, state_root, record, launcher)
             return False
+
+        earlier_keys = {earlier["jobKey"] for earlier in predecessors}
+        current_predecessors = [
+            earlier for earlier in sorted(_queue_records(state_root, launcher), key=_queue_order)
+            if earlier["jobKey"] in earlier_keys and earlier["state"] in {"waiting", "countdown", "starting"}
+        ]
+        reserved = _reserve_fifo_candidates(current_predecessors, query.get("csv") if isinstance(query, dict) else None,
+                                            query_finished, state_root, launcher)
+        eligible = _restrict_gpu_candidates(candidates, launch_resources, state_root=state_root, launcher=launcher)
+        if launch_resources.get("gpuSharing"):
+            lock_root = launcher._runtime_lock_dir() if launch_resources.get("useLocalLocks") else state_root
+            eligible = [c for c in eligible if launcher._sharing_candidate_allowed(lock_root, launch_resources, c["uuid"])]
+            if not eligible and query_message is None:
+                query_error_code = "GPU_SHARING_WAITING"
+                query_message = "Waiting for free GPU memory and shared GPU slot."
+        elif launch_resources.get("minFreeMemoryMiB") and not candidates and query_message is None:
+            query_error_code = "GPU_FREE_MEMORY_LOW"
+            query_message = "Waiting for GPU free memory threshold."
+
+        eligible = [c for c in eligible if c["uuid"] not in reserved]
+        available_uuids = {candidate["uuid"] for candidate in eligible}
+        _reset_candidate_idle_state(idle_state, [c for c in candidates if c["uuid"] not in available_uuids])
+        chosen, effective_elapsed = _select_candidates(eligible, required_gpu_count)
 
         try:
             dummy_devices = chosen if chosen else [{"deviceId": "GPU 0", "uuid": "GPU-server-waiter"}]
@@ -2106,6 +2183,7 @@ def _worker_iteration(
         _write_json(path, state_root, record, launcher)
         return True
     finally:
+        _release_file_lock(queue_fd)
         _release_file_lock(control_fd)
 
 

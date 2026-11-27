@@ -169,7 +169,7 @@ function toProcessInstance(
 
 export function projectTask(previous: TaskSnapshot | null, input: TaskEvidence): TaskSnapshot {
   const { task, taskObservation, hostObservation, observedAt } = input;
-  const procs = taskObservation.processes || [];
+  const procs = taskObservation.scanComplete ? (taskObservation.processes || []) : [];
 
   const obsTime = parseIsoMs(observedAt);
 
@@ -193,7 +193,10 @@ export function projectTask(previous: TaskSnapshot | null, input: TaskEvidence):
     (taskObservation.errorCode === null || taskObservation.errorScope === "source") &&
     taskTimeValid;
 
-  if (!hostSuccess || !taskProcessScanComplete) {
+  const logOnlyObserved = task.attributionMode === "log_only" && input.logOnlyActive === true &&
+    taskObservation.taskId === task.taskId && taskObservation.hostId === task.hostId &&
+    taskObservation.freshness === "fresh" && taskTimeValid;
+  if (!hostSuccess || (!taskProcessScanComplete && !logOnlyObserved)) {
     const previousRun = previous?.currentRun;
     const priorContextValid = !!previous &&
       previous.taskId === task.taskId && previous.hostId === task.hostId &&
@@ -466,14 +469,17 @@ export function projectTask(previous: TaskSnapshot | null, input: TaskEvidence):
     JSON.stringify(bindingState.registeredTask) === JSON.stringify(task)
     ? bindingState
     : null;
-  let progress = canonicalBindingState && currentRun
+  const progressRun = currentRun ?? (attributionConfidence === "log_only" && canonicalBindingState?.activeRunId
+    ? { runId: canonicalBindingState.activeRunId, mainProcessKey: null }
+    : null);
+  let progress = canonicalBindingState && progressRun
     ? deriveProgress({
         taskId: task.taskId,
         hostId: task.hostId,
         observedAt,
         freshness: taskObservation.freshness,
         algorithm: "unknown",
-        currentRun,
+        currentRun: progressRun,
         bindings: [],
         boundEvents: [],
         bindingState: canonicalBindingState,

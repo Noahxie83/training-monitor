@@ -1,9 +1,10 @@
-import { BrowserWindow, clipboard, ipcMain, type IpcMainEvent, type IpcMainInvokeEvent, type WebContents } from 'electron';
+import { BrowserWindow, clipboard, dialog, ipcMain, type IpcMainEvent, type IpcMainInvokeEvent, type WebContents } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CopyCommandRequest, MonitorApi, OpenSshTerminalRequest } from '../shared/api';
 import type { Preferences, Registry, SaveRegistryOptions } from '../shared/contracts';
 import { MONITOR_API_KEYS } from '../shared/api';
+import type { HostUnreachableReconcileError } from '../launch/reconcile';
 import { CHANNELS } from './channels';
 import { rendererEntryUrl, syncWindowTheme } from './window';
 import { discoverSshHosts, discoverWslDistros } from '../transport/discovery';
@@ -37,6 +38,7 @@ const MAX_CONTENTS_SUBSCRIPTIONS = 8;
 interface MonitorWindows {
   openGpuWindow: (hostId?: string) => void;
   setActiveTask?: (taskId: string | null, source: WebContents) => void;
+  clearAlerts?: (source: WebContents) => void;
   onPreferencesChanged?: (preferences: Preferences) => void;
 }
 
@@ -117,7 +119,14 @@ export function registerMonitorIpc(api: MonitorApi, windows?: MonitorWindows): (
           options = wrapped.options as SaveRegistryOptions;
         }
       }
-      const registry = validateRegistry(await api.saveRegistry(validateRegistry(rawRegistry), options));
+      const registry = await api.saveRegistry(validateRegistry(rawRegistry), options).then(validateRegistry).catch((error: unknown) => {
+        const reconcile = error as Partial<HostUnreachableReconcileError>;
+        if (reconcile?.errorCode === 'HOST_UNREACHABLE_RECONCILE' && Number.isSafeInteger(reconcile.errorParams?.taskCount)) {
+          // Electron serializes the invoke error message across the process boundary.
+          throw new Error(`${reconcile.errorCode}:${reconcile.errorParams!.taskCount}`);
+        }
+        throw error;
+      });
       for (const window of BrowserWindow.getAllWindows()) {
         if (!window.isDestroyed()) window.webContents.send(CHANNELS.registryChanged, registry);
       }
@@ -152,7 +161,14 @@ export function registerMonitorIpc(api: MonitorApi, windows?: MonitorWindows): (
       assertSender(event);
       const query = validateExportLogsQuery(arg);
       if (!api.exportLogs) return { exportedCount: 0, path: null };
-      return api.exportLogs(query);
+      const parent = BrowserWindow.fromWebContents(event.sender);
+      if (!parent || parent.isDestroyed()) throw new Error('EXPORT_WINDOW_UNAVAILABLE');
+      const { canceled, filePath } = await dialog.showSaveDialog(parent, {
+        defaultPath: 'training.log',
+        filters: [{ name: 'Log files', extensions: ['log', 'txt'] }],
+      });
+      if (canceled || !filePath) return { exportedCount: 0, path: null, cancelled: true };
+      return api.exportLogs({ ...query, destinationPath: filePath });
     }],
     [CHANNELS.discoverProcesses, async (event, arg) => {
       assertSender(event);
@@ -185,6 +201,10 @@ export function registerMonitorIpc(api: MonitorApi, windows?: MonitorWindows): (
       assertSender(event);
       if (arg !== null && (typeof arg !== 'string' || !arg || arg.length > 256)) throw new TypeError('INVALID_TASK_ID');
       windows?.setActiveTask?.(arg, event.sender);
+    }],
+    [CHANNELS.clearAlerts, (event) => {
+      assertSender(event);
+      windows?.clearAlerts?.(event.sender);
     }],
     [CHANNELS.copyDiagnostic, (event, arg) => {
       assertSender(event);

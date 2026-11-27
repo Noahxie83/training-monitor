@@ -847,10 +847,10 @@ class ServerAgentTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
 
-    def retry_record(self, *, started=True):
+    def retry_record(self, *, started=True, **options):
         status_file = self.task / "status.json"
         status_file.write_text(json.dumps({"status": "failed", "pid": 42}), encoding="utf-8")
-        request = self.ensure_request(retryOnExit=True, idle_seconds=60)
+        request = self.ensure_request(retryOnExit=True, idle_seconds=60, **options)
         request["launchRequest"]["sources"].append({"sourceId": "status", "kind": "status_json", "path": str(status_file)})
         agent.ensure_server_wait(request, launcher, worker_source=b"worker-source")
         record = self.read_job()
@@ -860,8 +860,61 @@ class ServerAgentTests(unittest.TestCase):
             self.write_job(record)
         return record, status_file
 
+    def test_fifo_reserves_gpus_before_a_later_waiter_starts_countdown(self):
+        first = self.ensure_request(idle_seconds=60)
+        agent.ensure_server_wait(first, launcher, worker_source=b"worker-source")
+        older = self.read_job()
+        arm = str(uuid.uuid4())
+        second = self.ensure_request(arm_id=arm, taskId="later", idle_seconds=60)
+        second["launchRequest"]["taskId"] = "later"
+        agent.ensure_server_wait(second, launcher, worker_source=b"worker-source")
+        state_root = str(self.host / agent.STATE_DIRECTORY)
+        later_key = agent._job_key("later", arm)
+        later_path = Path(agent._job_path(state_root, later_key))
+        later = json.loads(later_path.read_text(encoding="utf-8"))
+        self.assertLess(older["queueOrder"], later["queueOrder"])
+        fake_probe = types.SimpleNamespace(
+            _query_linux_gpu=lambda: {"status": "ok", "csv": "0, GPU-one, 0, 0, 24576"},
+            _canonical_task_roots=lambda h, t: (h, t),
+        )
+        with mock.patch.object(launcher, "_probe", return_value=fake_probe), \
+             mock.patch.object(launcher, "_scan_for_registered_process", return_value=None), \
+             mock.patch.object(launcher, "_is_gpu_locked", return_value=False):
+            self.assertTrue(agent._worker_iteration(later_key, state_root, launcher, agent._new_idle_state(),
+                                                    tmux_executable="/usr/bin/tmux"))
+        later = json.loads(later_path.read_text(encoding="utf-8"))
+        self.assertEqual(later["selectedDeviceIds"], [])
+
+    def test_waiting_retry_ignores_completion_from_a_previous_launch(self):
+        record, status_file = self.retry_record(started=False)
+        status_file.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+        with mock.patch.object(agent, "_completion_reported", return_value=True) as completion:
+            result = agent._retry_iteration(record["jobKey"], str(self.job_path().parent), launcher, agent._new_idle_state())
+        self.assertIsNone(result)
+        completion.assert_not_called()
+        self.assertEqual(self.read_job()["retryBackoffSeconds"], 10)
+
+    def test_local_gpu_sharing_checks_the_local_lock_directory(self):
+        request = self.ensure_request()
+        request["launchRequest"].update(useLocalLocks=True, minFreeMemoryMiB=500,
+                                        gpuSharing={"groupId": "group", "maxDevices": 1, "maxWorkersPerDevice": 2})
+        agent.ensure_server_wait(request, launcher, worker_source=b"worker-source")
+        record = self.read_job()
+        fake_probe = types.SimpleNamespace(
+            _query_linux_gpu=lambda **_: {"status": "ok", "csv": "0, GPU-one, 0, 0, 24576, 24576"},
+            _canonical_task_roots=lambda h, t: (h, t),
+        )
+        with mock.patch.object(launcher, "_probe", return_value=fake_probe), \
+             mock.patch.object(launcher, "_scan_for_registered_process", return_value=None), \
+             mock.patch.object(launcher, "_runtime_lock_dir", return_value="/local-locks"), \
+             mock.patch.object(launcher, "_sharing_candidate_allowed", return_value=False) as sharing:
+            agent._worker_iteration(record["jobKey"], str(self.job_path().parent), launcher, agent._new_idle_state(),
+                                    tmux_executable="/usr/bin/tmux")
+        self.assertEqual(sharing.call_args.args[0], "/local-locks")
+        self.assertEqual(sharing.call_args.args[2], "GPU-one")
+
     def test_exit_recounts_idle_time_and_can_switch_from_gpu5_to_gpu6(self):
-        record, _status = self.retry_record()
+        record, _status = self.retry_record(retryBackoffSeconds=0)
         state_root = str(self.host / agent.STATE_DIRECTORY)
         idle = agent._new_idle_state()
         idle["idleSince"]["GPU-old"] = 1

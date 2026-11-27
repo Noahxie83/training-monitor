@@ -193,6 +193,7 @@ class Phase2LaunchTests(unittest.TestCase):
         self.assertEqual(mod_argv[:4], ["/usr/bin/python3", "-u", "-m", "mypkg.train"])
         self.assertEqual(mod_argv[4:], ["--lr", "1e-4"])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process, permission, or runtime directory semantics")
     def test_local_tmpfs_socket_and_gc_beyond_256_files(self):
         uid = os.getuid() if hasattr(os, "getuid") else 1000
         sock_dir = agent._runtime_socket_dir(uid)
@@ -212,6 +213,7 @@ class Phase2LaunchTests(unittest.TestCase):
         remaining = list(self.state.glob(".server-wait-*.json"))
         self.assertEqual(len(remaining), 0)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process, permission, or runtime directory semantics")
     def test_retry_on_exit_stops_at_max_retries_and_on_zero_exit_code(self):
         request = {
             "version": 1,
@@ -273,6 +275,7 @@ class Phase2LaunchTests(unittest.TestCase):
         self.assertTrue(done["retryFinished"])
         self.assertEqual(done["exitCode"], 0)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process, permission, or runtime directory semantics")
     def test_signal_task_verifies_process_key_before_signaling(self):
         fake_key = {"hostBootId": "boot-sig", "pid": 4321, "startTicks": "9999"}
         fields = ["0"] * 22

@@ -45,7 +45,7 @@ import {
 } from './budgets';
 
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
-const WHITESPACE_OR_CONTROL = /[\s\u0000-\u001f\u007f]/;
+
 const WINDOWS_DRIVE_ABS = /^[A-Za-z]:[\\/]/;
 
 const PROGRESS_UNITS = ['step', 'epoch', 'token', 'sample', 'percent', 'completed_iterations', 'unknown'] as const;
@@ -129,12 +129,26 @@ export function isValidAbsolutePath(value: unknown, allowWindowsDrive = false): 
   return false;
 }
 
-function isSafeSshToken(value: unknown, maxLength: number): value is string {
-  return typeof value === 'string' &&
-    value.length > 0 &&
-    value.length <= maxLength &&
-    !value.startsWith('-') &&
-    !WHITESPACE_OR_CONTROL.test(value);
+export function isSafeSshToken(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string' && value.length <= maxLength &&
+    /^[A-Za-z0-9_:.\[][A-Za-z0-9_.:\[\]-]*$/.test(value);
+}
+
+export function isSafeSshUser(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 128 && /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(value);
+}
+
+export function isSafeSshProxyJump(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 512) return false;
+  return value.split(',').every((hop) => {
+    const match = /^(?:([A-Za-z0-9_][A-Za-z0-9_.-]*)@)?(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9_][A-Za-z0-9_.-]*)(?::([0-9]{1,5}))?$/.exec(hop);
+    return !!match && (!match[1] || match[1].length <= 128) && match[2]!.length <= 255 &&
+      (!match[3] || (Number(match[3]) > 0 && Number(match[3]) <= 65535));
+  });
+}
+
+export function isSafeRemotePythonPath(value: unknown): value is string {
+  return isSafePathOption(value) && !value.startsWith('-') && !/[\\'"\`$;|&<>()]/.test(value);
 }
 
 function isSafePathOption(value: unknown, maxLength = 1024): value is string {
@@ -153,15 +167,15 @@ export function validateHostTarget(value: unknown, code = 'INVALID_REGISTRY'): H
     if (!hasAlias && !hasHostname) throw new TypeError(code);
     if (hasAlias && !isSafeSshToken(target.alias, 255)) throw new TypeError(code);
     if (hasHostname && !isSafeSshToken(target.hostname, 255)) throw new TypeError(code);
-    if (target.user !== undefined && !isSafeSshToken(target.user, 128)) throw new TypeError(code);
+    if (target.user !== undefined && !isSafeSshUser(target.user)) throw new TypeError(code);
     if (target.port !== undefined && (typeof target.port !== 'number' || !Number.isSafeInteger(target.port) || target.port < 1 || target.port > 65535)) {
       throw new TypeError(code);
     }
     if (target.identityFile !== undefined && (!isSafePathOption(target.identityFile, 1024) || target.identityFile.startsWith('-'))) {
       throw new TypeError(code);
     }
-    if (target.proxyJump !== undefined && !isSafeSshToken(target.proxyJump, 512)) throw new TypeError(code);
-    if (target.pythonPath !== undefined && (!isSafePathOption(target.pythonPath, 1024) || /['"`$;|&<>]/.test(target.pythonPath))) {
+    if (target.proxyJump !== undefined && !isSafeSshProxyJump(target.proxyJump)) throw new TypeError(code);
+    if (target.pythonPath !== undefined && !isSafeRemotePythonPath(target.pythonPath)) {
       throw new TypeError(code);
     }
     return structuredClone(target) as unknown as HostTarget;
@@ -178,7 +192,7 @@ export function validateHostTarget(value: unknown, code = 'INVALID_REGISTRY'): H
     ) {
       throw new TypeError(code);
     }
-    if (target.pythonPath !== undefined && (!isSafePathOption(target.pythonPath, 1024) || /['"`$;|&<>]/.test(target.pythonPath))) {
+    if (target.pythonPath !== undefined && !isSafeRemotePythonPath(target.pythonPath)) {
       throw new TypeError(code);
     }
     return structuredClone(target) as unknown as HostTarget;
@@ -640,7 +654,7 @@ export function validateLogEvent(value: unknown): LogEvent {
   const e = object(value, 'INVALID_LOG_EVENT');
   exact(e, [
     'version', 'eventId', 'taskId', 'sourceId', 'generation', 'kind',
-    'startOffset', 'endOffset', 'ingestedAt', 'text', 'rawAnsi', 'reason',
+    'startOffset', 'endOffset', 'frameStartOffset', 'ingestedAt', 'text', 'rawAnsi', 'reason',
     'displayTruncated', 'recordComplete', 'prefixIncomplete', 'runId', 'bindingId',
   ], 'INVALID_LOG_EVENT');
   if (
@@ -656,6 +670,13 @@ export function validateLogEvent(value: unknown): LogEvent {
     throw new TypeError('INVALID_LOG_EVENT');
   }
   for (const k of ['startOffset', 'endOffset'] as const) if (e[k] !== null) parseBytes(e[k] as string);
+  if (e.frameStartOffset !== undefined) {
+    const frameStart = parseBytes(e.frameStartOffset as string);
+    if (e.startOffset === null || e.endOffset === null ||
+        frameStart < parseBytes(e.startOffset as string) || frameStart > parseBytes(e.endOffset as string)) {
+      throw new TypeError('INVALID_LOG_EVENT');
+    }
+  }
   return e as unknown as LogEvent;
 }
 
@@ -935,7 +956,7 @@ export function validateDiscoveredSshHosts(value: unknown): DiscoveredSshHost[] 
       result.hostname = h.hostname;
     }
     if (h.user !== undefined) {
-      if (!isSafeSshToken(h.user, 128)) throw new TypeError('INVALID_DISCOVERED_HOSTS');
+      if (!isSafeSshUser(h.user)) throw new TypeError('INVALID_DISCOVERED_HOSTS');
       result.user = h.user;
     }
     if (h.port !== undefined) {
@@ -947,7 +968,7 @@ export function validateDiscoveredSshHosts(value: unknown): DiscoveredSshHost[] 
       result.identityFile = h.identityFile;
     }
     if (h.proxyJump !== undefined) {
-      if (!isSafeSshToken(h.proxyJump, 512)) throw new TypeError('INVALID_DISCOVERED_HOSTS');
+      if (!isSafeSshProxyJump(h.proxyJump)) throw new TypeError('INVALID_DISCOVERED_HOSTS');
       result.proxyJump = h.proxyJump;
     }
     return result;

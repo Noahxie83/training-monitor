@@ -208,7 +208,7 @@ export interface Transport {
   getServerWait?(task: TaskRegistration, configHash: string, signal: AbortSignal): Promise<ServerWaitResult>;
   cancelServerWait?(task: TaskRegistration, configHash: string, signal: AbortSignal): Promise<ServerWaitResult>;
   checkTaskStopped?(task: TaskRegistration, signal: AbortSignal): Promise<{ scanComplete: boolean; running: boolean; errorCode: string | null }>;
-  launchTask?(task: TaskRegistration, armId: string, configHash: string, signal: AbortSignal): Promise<LaunchResult>;
+  launchTask?(task: TaskRegistration, armId: string, configHash: string, signal: AbortSignal, options?: { restart?: boolean }): Promise<LaunchResult>;
   discoverProcesses?(signal: AbortSignal): Promise<DiscoveredProcess[]>;
   signalTask?(
     task: TaskRegistration,

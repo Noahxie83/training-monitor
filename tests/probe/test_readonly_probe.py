@@ -175,51 +175,60 @@ class ReadOnlyProbeTests(unittest.TestCase):
                     return probe._dispatch(request)
                 return probe.scan_registered_processes(proc_root, "boot", registration)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_actual_scanner_extracts_flags_after_pos_and_emits_writer(self):
         result = self._scan_fake_proc(["$ENTRY"], "pos:\t0\nflags:\t0100001\nmnt_id:\t2\n")
         self.assertTrue(result["scanComplete"], result)
         self.assertEqual(len(result["candidates"]), 1, result)
         self.assertEqual(result["candidates"][0]["writerSources"], [result["candidates"][0]["scriptEntry"].replace("train.py", "train.log")])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_actual_scanner_marks_fd_replacement_incomplete(self):
         result = self._scan_fake_proc(["$ENTRY"], "flags:\t0100001\npos:\t0\n", replace_fd=True)
         self.assertFalse(result["scanComplete"])
         self.assertEqual(len(result["candidates"]), 1, result)
         self.assertFalse(result["candidates"][0]["writerEvidenceComplete"])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_actual_scanner_keeps_read_only_fd_as_complete_negative(self):
         result = self._scan_fake_proc(["$ENTRY"], "pos:\t0\nflags:\t0100000\nmnt_id:\t2\n")
         self.assertTrue(result["scanComplete"], result)
         self.assertEqual(result["candidates"][0]["writerSources"], [])
         self.assertTrue(result["candidates"][0]["writerEvidenceComplete"])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_actual_scanner_rejects_stale_source_eof(self):
         result = self._scan_fake_proc(["$ENTRY"], "flags:\t0100001\npos:\t0\n", source_eof="999")
         self.assertFalse(result["scanComplete"])
         self.assertEqual(result["candidates"][0]["writerSources"], [])
         self.assertFalse(result["candidates"][0]["writerEvidenceComplete"])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_actual_scanner_marks_unreadable_fdinfo_incomplete(self):
         result = self._scan_fake_proc(["$ENTRY"], None)
         self.assertFalse(result["scanComplete"])
         self.assertFalse(result["candidates"][0]["writerEvidenceComplete"])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_actual_scanner_ignores_unreadable_cwd_for_unmatched_entry(self):
         result = self._scan_fake_proc(["unrelated.py"], "pos:\t0\nflags:\t0100001\n", cwd_error=True)
         self.assertTrue(result["scanComplete"], result)
         self.assertEqual(result["candidates"], [])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_missing_cwd_on_unmatched_process_does_not_invalidate_the_scan(self):
         result = self._scan_fake_proc(["unrelated.py"], "flags:\t0100001\n", cwd_missing=True)
         self.assertTrue(result["scanComplete"], result)
         self.assertEqual(result["candidates"], [])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_absolute_registered_entry_is_checked_when_cwd_disappears(self):
         result = self._scan_fake_proc(["$ENTRY"], "flags:\t0100001\n", cwd_missing=True)
         self.assertTrue(result["scanComplete"], result)
         self.assertEqual(len(result["candidates"]), 1)
         self.assertTrue(result["candidates"][0]["writerEvidenceComplete"])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_actual_scanner_checks_absolute_registered_entry_when_cwd_is_unreadable(self):
         result = self._scan_fake_proc(["$ENTRY"], None, cwd_error=True)
         self.assertFalse(result["scanComplete"])
@@ -227,6 +236,7 @@ class ReadOnlyProbeTests(unittest.TestCase):
         self.assertIsNone(result["candidates"][0]["cwd"])
         self.assertFalse(result["candidates"][0]["writerEvidenceComplete"])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_actual_scanner_does_not_attach_new_inode_writer_to_old_source_observation(self):
         result = self._scan_fake_proc(["$ENTRY"], "flags:\t0100001\npos:\t0\n", source_identity={"dev": "old", "inode": "old"})
         self.assertFalse(result["scanComplete"])
@@ -234,6 +244,7 @@ class ReadOnlyProbeTests(unittest.TestCase):
         self.assertEqual(result["candidates"][0]["writerSources"], [])
         self.assertFalse(result["candidates"][0]["writerEvidenceComplete"])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_dispatch_with_source_replacement_between_sampling_and_scan_withholds_writer(self):
         result = self._scan_fake_proc(["$ENTRY"], "pos:\t0\nflags:\t0100001\n", dispatch=True, replace_source=True)
         self.assertFalse(result["scanComplete"])
@@ -308,6 +319,7 @@ class ReadOnlyProbeTests(unittest.TestCase):
             "phase": "archive_scan",
         })
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_actual_scanner_ignores_unmatched_python_processes_with_unknown_options(self):
         for argv in (["-cprint(1)", "$ENTRY"], ["-mfoo", "$ENTRY"],
                      ["-I", "-S", "-B", "-"], ["--future-option", "$ENTRY"]):
@@ -352,6 +364,7 @@ class ReadOnlyProbeTests(unittest.TestCase):
             result = probe.open_readonly(str(other / "secret.log"), [str(host)], [str(task)])
             self.assertEqual(result['errorCode'], "PATH_OUTSIDE_TASK_ROOT")
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_argv_argument_containing_registered_path_is_not_script_entry_and_external_cwd_is_allowed(self):
         registration = {"allowedDirectories": ["/registered/run"], "hostAllowedRoots": ["/registered"], "entryPaths": ["/registered/run/train.py"], "sourcePaths": ["/registered/run/train.log"]}
         impostor = probe.project_task_process(registration, "/home/cy", ["python3", "unrelated.py", "--reference", "/registered/run/train.py"], {"hostBootId": "b", "pid": 1, "startTicks": "2"}, ["/registered/run/train.log"])
@@ -389,6 +402,7 @@ class ReadOnlyProbeTests(unittest.TestCase):
         self.assertFalse(result["scanComplete"])
         self.assertEqual(result["errorCode"], "PROCESS_CANDIDATE_LIMIT")
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_component_boundary_rejects_similar_prefix(self):
         self.assertTrue(probe.path_is_within("/data2/cy/xzn", "/data2/cy/xzn/run.py"))
         self.assertFalse(probe.path_is_within("/data2/cy/xzn", "/data2/cy/xzn-other/run.py"))
@@ -500,6 +514,7 @@ class ReadOnlyProbeTests(unittest.TestCase):
                 str(run), ["python", "start_worker.py"], None, [])
             self.assertFalse(escaped["entryVerified"])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_cwd_or_command_line_path_alone_does_not_confirm_task_role(self):
         registration = {
             "allowedDirectories": ["/data2/cy/xzn/run"],
@@ -515,6 +530,7 @@ class ReadOnlyProbeTests(unittest.TestCase):
         )
         self.assertFalse(result["confirmed"])
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX /proc or path semantics")
     def test_bare_entry_from_another_cwd_needs_launcher_handle_and_direct_writer(self):
         registration = {"hostAllowedRoots": ["/"], "allowedDirectories": ["/data/run"], "entryPaths": ["start_worker6.py"],
                         "sourcePaths": ["/data/run/worker6.log"]}

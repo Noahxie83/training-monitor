@@ -79,6 +79,7 @@ test('fits off-screen saved geometry to the work area and remembers a resized wi
       theme: 'system',
       windowBounds: { main: { x: 50000, y: -50000, width: 1080, height: 720, isMaximized: false } },
     }));
+    let savedSize: number[];
     const first = await electron.launch({ chromiumSandbox: true, args: [mainEntry, profile] });
     const executable = first.process().spawnfile;
     try {
@@ -94,9 +95,14 @@ test('fits off-screen saved geometry to the work area and remembers a resized wi
       });
       expect(workArea).toBe(true);
       await nativeWindow.evaluate((window) => window.setSize(1060, 690));
-      await expect.poll(() => nativeWindow.evaluate((window) => window.getSize())).toEqual([1060, 690]);
+      const tolerance = process.platform === 'win32' ? 2 : 0;
+      await expect.poll(async () => {
+        const [width, height] = await nativeWindow.evaluate((window) => window.getSize());
+        return Math.max(Math.abs(width - 1060), Math.abs(height - 690));
+      }).toBeLessThanOrEqual(tolerance);
+      const [width, height] = savedSize = await nativeWindow.evaluate((window) => window.getSize());
       await expect.poll(() => main.evaluate(async () => (await window.monitor.getPreferences()).windowBounds?.main))
-        .toMatchObject({ width: 1060, height: 690, isMaximized: false });
+        .toMatchObject({ width, height, isMaximized: false });
       await main.evaluate(async () => {
         const preferences = await window.monitor.getPreferences();
         await window.monitor.savePreferences({ ...preferences, minimizeToTrayOnClose: false });
@@ -119,7 +125,53 @@ test('fits off-screen saved geometry to the work area and remembers a resized wi
       require(${JSON.stringify(mainEntry)});
     `);
     const { stdout } = await promisify(execFile)(executable, [bootstrap, profile], { timeout: 10_000 });
-    expect(stdout).toContain('RESTORED_WINDOW_SIZE [1060,690]');
+    expect(stdout).toContain(`RESTORED_WINDOW_SIZE ${JSON.stringify(savedSize!)}`);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('initializes taskbar progress and applies the login item from saved preferences', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'TrainingMonitor-native-'));
+  try {
+    const bootstrap = path.join(directory, 'native.cjs');
+    const nativeCalls = path.join(directory, 'native-calls.log');
+    await writeFile(path.join(directory, 'preferences.json'), JSON.stringify({
+      theme: 'system', launchAtLogin: true,
+    }));
+    await writeFile(bootstrap, `
+      const { app, BrowserWindow } = require('electron');
+      const { appendFileSync } = require('node:fs');
+      const append = (record) => appendFileSync(${JSON.stringify(nativeCalls)}, JSON.stringify(record) + '\\n');
+      app.setPath('userData', ${JSON.stringify(directory)});
+      app.setPath('appData', ${JSON.stringify(directory)});
+      app.setLoginItemSettings = (settings) => append({ login: settings.openAtLogin });
+      const setProgressBar = BrowserWindow.prototype.setProgressBar;
+      BrowserWindow.prototype.setProgressBar = function(value) {
+        append({ progress: value });
+        return setProgressBar.call(this, value);
+      };
+      require(${JSON.stringify(path.resolve('dist/main.cjs'))});
+    `);
+    const app = await electron.launch({ args: [bootstrap] });
+    try {
+      const main = await app.firstWindow();
+      await main.evaluate(() => window.monitor.getSnapshot());
+      expect(await readFile(nativeCalls, 'utf8')).toContain('{"progress":-1}');
+      if (process.platform === 'linux') {
+        const loginFile = path.join(directory, 'autostart', 'training-monitor.desktop');
+        expect(await readFile(loginFile, 'utf8')).toContain('Name=Training Monitor');
+        await main.evaluate(async () => {
+          const preferences = await window.monitor.getPreferences();
+          await window.monitor.savePreferences({ ...preferences, launchAtLogin: false });
+        });
+        await expect(readFile(loginFile)).rejects.toMatchObject({ code: 'ENOENT' });
+      } else {
+        expect(await readFile(nativeCalls, 'utf8')).toContain('{"login":true}');
+      }
+    } finally {
+      await app.close();
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

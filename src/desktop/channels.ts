@@ -19,6 +19,7 @@ export const CHANNELS = Object.freeze({
   testWebhook: 'monitor:test-webhook',
   openGpu: 'desktop:open-gpu',
   activeTask: 'desktop:active-task',
+  clearAlerts: 'desktop:clear-alerts',
   copyDiagnostic: 'desktop:copy-diagnostic',
   update: 'monitor:update',
   gpuHost: 'desktop:gpu-host',

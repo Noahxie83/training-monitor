@@ -150,6 +150,14 @@ describe('domain progress derivation and flow counting semantics', () => {
     expect(mixedStreams.runId).toBeNull();
   });
 
+  it('retains canonical progress when a second registered source reports independent training output', () => {
+    const primary = { ...boundEvent, endOffset: '6000' };
+    const secondary = { ...boundEvent, eventId: 'auxiliary', sourceId: 'other-log', endOffset: '1900',
+      text: '1/10 [00:01<00:09, 1.0it/s]' };
+    const progress = deriveProgress(canonicalFlowEvidence([primary, secondary]));
+    expect(progress.session).toMatchObject({ sourceId, completedCount: 80106, targetCount: 169999 });
+  });
+
   it('handles Flow boundary values at n=0, n=1, and n=169999 with strict index and count semantics', () => {
     // n = 0
     const n0 = flow({ b: 30000, T: 200000, n: 0 });

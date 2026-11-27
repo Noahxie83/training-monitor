@@ -105,6 +105,7 @@ const desktop: DesktopApi = {
     if (hostId !== undefined && (typeof hostId !== 'string' || !hostId || hostId.length > 256)) throw new TypeError('INVALID_HOST_ID');
     await ipcRenderer.invoke(c.openGpu, hostId);
   },
+  async clearAlerts() { await ipcRenderer.invoke(c.clearAlerts); },
   async setActiveTask(taskId) { await ipcRenderer.invoke(c.activeTask, taskId); },
   async copyDiagnosticText(text) { await ipcRenderer.invoke(c.copyDiagnostic, text); },
   onGpuHostSelected(listener) {

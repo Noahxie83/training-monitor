@@ -451,6 +451,7 @@ export function LogConsole({
           ...(effectiveCase ? { caseSensitive: true } : {}),
           ...(effectiveLevel !== 'all' ? { level: effectiveLevel } : {}),
         });
+        if (res.cancelled) return;
         setExportNotice(t('logs.exportSuccess', { count: res.exportedCount }));
         setTimeout(() => setExportNotice(null), 2500);
         return;

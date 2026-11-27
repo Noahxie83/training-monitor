@@ -20,7 +20,7 @@ const DEFAULT_STALL_MINUTES = 15;
 const DEFAULT_DISCONNECT_SECONDS = 60;
 
 const CUDA_OOM_RE = /CUDA out of memory|torch\.OutOfMemoryError|OutOfMemoryError|HIP out of memory/i;
-const LOSS_NAN_INF_RE = /\b(?:loss|train_loss|training_loss|val_loss|eval_loss)\s*[:=]\s*(?:nan|[-+]?inf(?:inity)?)\b/i;
+const LOSS_NAN_INF_RE = /\b(?:loss|train_loss|training_loss|val_loss|eval_loss)["']?\s*[:=]\s*["']?(?:nan|[-+]?inf(?:inity)?)\b/i;
 const CRASH_LOG_RE = /Traceback \(most recent call last\):|Segmentation fault|SIGSEGV|SIGKILL|NCCL (?:unhandled )?(?:system |internal )?error|Fatal Python error/i;
 
 export function buildWebhookPayload(channel: WebhookChannelConfig, alert: AlertEvent): Record<string, unknown> {
@@ -275,10 +275,14 @@ export class AlertEngine {
         null;
 
       const gpuUtils = current.resources
-        .filter((m) => m.name === 'gpu_utilization' && typeof m.value === 'number' && Number.isFinite(m.value))
+        .filter((m) => m.name === 'gpu_utilization' && m.scope === 'process' && m.freshness === 'fresh' &&
+          typeof m.value === 'number' && Number.isFinite(m.value))
         .map((m) => m.value!);
-      const maxGpuUtil = gpuUtils.length > 0 ? Math.max(...gpuUtils) : null;
-      const isGpuIdle = maxGpuUtil === null || maxGpuUtil < 2;
+      if (progressVal === null || gpuUtils.length === 0) {
+        this.stallTrackers.delete(current.taskId);
+        return emitted;
+      }
+      const isGpuIdle = Math.max(...gpuUtils) < 2;
 
       let tracker = this.stallTrackers.get(current.taskId);
       if (!tracker || tracker.runId !== current.currentRun.runId) {

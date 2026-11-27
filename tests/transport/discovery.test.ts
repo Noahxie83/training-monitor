@@ -141,3 +141,18 @@ describe('WSL distribution discovery', () => {
     expect(spawn).toHaveBeenCalledTimes(2);
   });
 });
+
+it('drops unsafe SSH directives and caps the result at the discovery validation limit', async () => {
+  const entries = Array.from({ length: 520 }, (_, index) => `Host gpu-${index}`);
+  const config = [
+    'Host -bad bad;alias valid',
+    '  ProxyJump safe,-invalid',
+    '  HostName unsafe$hostname',
+    '  User ' + 'u'.repeat(129),
+    '  IdentityFile ' + 'i'.repeat(1025),
+    ...entries,
+  ].join('\n');
+  const hosts = await parseSshConfig(config);
+  expect(hosts).toHaveLength(512);
+  expect(hosts[0]).toEqual({ alias: 'valid' });
+});

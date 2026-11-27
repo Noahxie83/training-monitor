@@ -15,7 +15,7 @@ class Child extends EventEmitter {
 
 const signal = new AbortController().signal;
 
-async function setup(wsl = false) {
+async function setup(wsl = false, localFallback = false) {
   const registry: Registry = {
     version: 2,
     revision: 1,
@@ -24,7 +24,7 @@ async function setup(wsl = false) {
       label: 'h',
       enabled: true,
       allowedRoots: ['/allowed'],
-      target: wsl ? { kind: 'wsl', distribution: 'Ubuntu-24.04' } : { kind: 'ssh', alias: 'gpu-node' },
+      target: localFallback ? { kind: 'local' } : wsl ? { kind: 'wsl', distribution: 'Ubuntu-24.04' } : { kind: 'ssh', alias: 'gpu-node' },
     }],
     tasks: [{
       taskId: 't',
@@ -79,6 +79,14 @@ async function setup(wsl = false) {
       return child;
     }
     const isServe = args.some((a) => a.includes('--serve'));
+    if (localFallback && !isServe && command === 'python') {
+      queueMicrotask(() => child.emit('error', Object.assign(new Error('ENOENT'), { code: 'ENOENT' })));
+      return child;
+    }
+    if (localFallback && !isServe && command === 'py') {
+      queueMicrotask(() => child.emit('close', 126));
+      return child;
+    }
     if (isServe) {
       let headerParsed = false;
       let expectedSourceBytes = 0;
@@ -127,7 +135,9 @@ async function setup(wsl = false) {
         expect(Buffer.from(embedded, 'base64').toString()).toBe(probeSource);
         expect(source).not.toContain(request.launch.arguments);
       }
-      const payload = { status: 'started', pid: 42, processKey: null, startedAt: '2026-11-11T00:00:00Z', errorCode: null };
+      const payload = request.op === 'signal_task'
+        ? { ok: false, pidsSignaled: [], errorCode: 'NO_MATCHING_LIVE_PROCESS' }
+        : { status: 'started', pid: 42, processKey: null, startedAt: '2026-11-11T00:00:00Z', errorCode: null };
       const body = encodeFrame(Buffer.from(JSON.stringify({ version: 1, requestId: request.requestId, sourceId: null, payload })));
       child.stdout.end(body);
       child.stderr.end();
@@ -135,7 +145,7 @@ async function setup(wsl = false) {
     });
     return child;
   };
-  const transport = createTransport({ hostId: 'h', host: registry.hosts[0]!, registry }, { probeSource, launcherSource, spawn: spawn as never, registryProvider: async () => registry });
+  const transport = createTransport({ hostId: 'h', host: registry.hosts[0]!, registry }, { probeSource, launcherSource, spawn: spawn as never, ...(localFallback ? { platform: 'win32' as const } : {}), registryProvider: async () => registry });
   return { transport, registry, requests, calls, stop: () => { running = false; } };
 }
 
@@ -150,6 +160,36 @@ describe('registered launch transport', () => {
       expect(f.requests.at(-1)).toMatchObject({ op: 'launch_task', gpuDevices: [{ deviceId: 'GPU 6', uuid: 'GPU-a' }], taskAllowedDirectories: ['/allowed/run'], hostAllowedRoots: ['/allowed'] });
       expect(f.requests.find((r) => r.op === 'probe_launch_readiness').task.sources).toEqual([]);
       expect(f.calls.every((call) => call.options.shell === false && call.options.windowsHide)).toBe(true);
+    } finally {
+      await f.transport.close?.();
+    }
+  });
+
+  it('uses each local Python fallback for one-shot restart and forwards launch options', async () => {
+    const f = await setup(false, true);
+    try {
+      const host = f.registry.hosts[0]!;
+      host.allowJobControl = true;
+      host.stateDir = '/var/lib/training-monitor';
+      const task = f.registry.tasks[0]!;
+      task.autoStart!.gpuDeviceIds = [];
+      task.autoStart!.cudaVisibleDevicesMode = 'uuid';
+      await f.transport.probeHost(signal);
+      const startIndex = f.calls.length;
+      const rejected = await f.transport.signalTask!(task, 'restart', [{
+        hostBootId: 'boot', pid: 42, startTicks: '10',
+      }], signal);
+      expect(rejected).toMatchObject({ ok: false, errorCode: 'NO_MATCHING_LIVE_PROCESS', pidsSignaled: [] });
+      expect(f.requests.at(-1)).toMatchObject({ op: 'signal_task', action: 'stop' });
+      expect(f.calls.slice(startIndex).map((call) => call.command)).toEqual(['python', 'py', 'python3']);
+
+      const armId = '12345678-1234-4234-8234-abcdefabcdef';
+      const result = await f.transport.launchTask!(task, armId, 'a'.repeat(64), signal, { restart: true });
+      expect(result.status).toBe('started');
+      expect(f.requests.at(-1)).toMatchObject({
+        op: 'launch_task', armId, stateDir: host.stateDir, useSupervisor: true, useLocalLocks: true,
+        cudaVisibleDevicesMode: 'uuid', gpuDevices: [{ deviceId: 'GPU 6', uuid: 'GPU-a' }],
+      });
     } finally {
       await f.transport.close?.();
     }

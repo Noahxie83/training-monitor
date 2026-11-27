@@ -4,18 +4,9 @@ import path from 'node:path';
 import { spawn as nodeSpawn } from 'node:child_process';
 import type { DiscoveredSshHost, DiscoveredWslDistro } from '../shared/contracts';
 import type { SpawnLike } from './types';
+import { isSafeSshProxyJump, isSafeSshToken, isSafeSshUser } from '../shared/validate';
 
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
-const WHITESPACE_OR_CONTROL = /[\s\u0000-\u001f\u007f]/;
-
-function isConcreteSshAlias(pattern: string): boolean {
-  if (!pattern || pattern.length > 255) return false;
-  if (pattern.startsWith('!') || pattern.startsWith('-')) return false;
-  if (/[*?]/.test(pattern)) return false;
-  if (WHITESPACE_OR_CONTROL.test(pattern)) return false;
-  return true;
-}
-
 function tokenizeSshLine(line: string): string[] {
   const tokens: string[] = [];
   let current = '';
@@ -170,7 +161,7 @@ export async function parseSshConfig(content: string, options: ParseSshConfigOpt
         currentBlock = { patterns: values };
         blocks.push(currentBlock);
         for (const pattern of values) {
-          if (isConcreteSshAlias(pattern) && !seenAliases.has(pattern)) {
+          if (concreteAliases.length < 512 && isSafeSshToken(pattern, 255) && !seenAliases.has(pattern)) {
             seenAliases.add(pattern);
             concreteAliases.push(pattern);
           }
@@ -186,18 +177,18 @@ export async function parseSshConfig(content: string, options: ParseSshConfigOpt
 
       if (!currentBlock) continue;
       const firstValue = values[0]!;
-      if (key === 'hostname' && currentBlock.hostname === undefined && !WHITESPACE_OR_CONTROL.test(firstValue) && !firstValue.startsWith('-')) {
+      if (key === 'hostname' && currentBlock.hostname === undefined && isSafeSshToken(firstValue, 255)) {
         currentBlock.hostname = firstValue;
-      } else if (key === 'user' && currentBlock.user === undefined && !WHITESPACE_OR_CONTROL.test(firstValue) && !firstValue.startsWith('-')) {
+      } else if (key === 'user' && currentBlock.user === undefined && isSafeSshUser(firstValue)) {
         currentBlock.user = firstValue;
       } else if (key === 'port' && currentBlock.port === undefined) {
         const port = Number(firstValue);
         if (/^\d+$/.test(firstValue) && Number.isSafeInteger(port) && port >= 1 && port <= 65535) {
           currentBlock.port = port;
         }
-      } else if (key === 'identityfile' && currentBlock.identityFile === undefined && !CONTROL_CHARS.test(firstValue)) {
+      } else if (key === 'identityfile' && currentBlock.identityFile === undefined && firstValue.length <= 1024 && !firstValue.startsWith('-') && !CONTROL_CHARS.test(firstValue)) {
         currentBlock.identityFile = firstValue;
-      } else if (key === 'proxyjump' && currentBlock.proxyJump === undefined && !WHITESPACE_OR_CONTROL.test(firstValue) && !firstValue.startsWith('-')) {
+      } else if (key === 'proxyjump' && currentBlock.proxyJump === undefined && isSafeSshProxyJump(firstValue)) {
         currentBlock.proxyJump = firstValue;
       }
     }

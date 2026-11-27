@@ -1,3 +1,4 @@
+import type { PendingRemoteCancel } from '../launch/reconcile';
 import type {
   CursorState,
   HostSnapshot,
@@ -61,6 +62,9 @@ export interface HostSampleRow {
 }
 
 export interface StoreClient {
+  enqueueRemoteCancel?(item: PendingRemoteCancel): Promise<void>;
+  getPendingRemoteCancels?(hostId: string): Promise<PendingRemoteCancel[]>;
+  deleteRemoteCancel?(item: PendingRemoteCancel): Promise<void>;
   getCursor(sourceId: string): Promise<CursorState | null>;
   registerSource(sourceId: string, observation: SourceObservation, taskId: string): Promise<CursorState>;
   saveObservation(observation: PersistedObservation): Promise<void>;
@@ -85,6 +89,9 @@ export interface StoreClient {
 }
 
 export type StoreOperation =
+  | { method: 'enqueueRemoteCancel'; args: [PendingRemoteCancel] }
+  | { method: 'getPendingRemoteCancels'; args: [string] }
+  | { method: 'deleteRemoteCancel'; args: [PendingRemoteCancel] }
   | { method: 'getCursor'; args: [string] }
   | { method: 'registerSource'; args: [string, SourceObservation, string] }
   | { method: 'saveObservation'; args: [PersistedObservation] }

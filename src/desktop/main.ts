@@ -1,6 +1,6 @@
 import { app, type BrowserWindow } from 'electron';
 import path from 'node:path';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { createMockApi } from '../mocks/api';
 import { createProductionApi, type ProductionMonitorApi } from '../collector/service';
 import { createPreferencesStore } from '../registry/preferences';
@@ -146,7 +146,7 @@ function startDesktop(userData: string, isolated: boolean): void {
     preferences = await preferencesStore.load();
     let api: MonitorApi;
     if (demo) {
-      api = { ...createMockApi({ demo: true }), getPreferences: () => preferencesStore.load(), savePreferences };
+      api = { ...createMockApi({ demo: true, writeExport: (file, content) => writeFile(file, content, 'utf8') }), getPreferences: () => preferencesStore.load(), savePreferences };
     } else {
       const registryStore = createRegistryStore(userData, { confirmRecovery });
       const registryProvider = () => registryStore.loadRegistry();
@@ -225,6 +225,11 @@ function startDesktop(userData: string, isolated: boolean): void {
         selectedTaskId = taskId;
         updateProgress();
       },
+      clearAlerts(source) {
+        if (mainWindow?.webContents !== source) return;
+        activeAlertCount = 0;
+        updateTray();
+      },
       onPreferencesChanged(value) {
         preferences = value;
         updateTray();
@@ -254,7 +259,11 @@ function startDesktop(userData: string, isolated: boolean): void {
     let initialLoad: Promise<void> | undefined;
     createMainWindow((loading) => { initialLoad = loading; });
     updateTray();
-    await initialLoad;
+    await initialLoad?.catch((error: Error & { code?: string; errno?: number }) => {
+      if (error.code !== 'ERR_ABORTED' && error.errno !== -3 && !/^ERR_ABORTED(?: \(-3\))?/.test(error.message)) {
+        throw error;
+      }
+    });
   }).catch(async (error) => {
     shutdownStarted = true;
     await releaseResources().catch((reason) => console.error('MONITOR_SHUTDOWN_FAILED', reason));

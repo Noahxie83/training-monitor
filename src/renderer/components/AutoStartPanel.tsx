@@ -37,6 +37,10 @@ export function AutoStartPanel({
   const { t } = useI18n();
   const [copiedTmux, setCopiedTmux] = useState(false);
 
+  const errorKey = status?.errorCode ? `autoStart.errors.${status.errorCode}` : null;
+  const translated = errorKey ? t(errorKey, status?.errorParams ?? undefined) : null;
+  const statusMessage = translated && translated !== errorKey ? translated : status?.message;
+
   const phase = status?.phase ?? null;
   const unconfirmed = status?.remoteConfirmed === false;
   const isStarting = phase === 'starting';
@@ -207,11 +211,11 @@ export function AutoStartPanel({
                 <div className="auto-start-countdown-fill" style={{ width: `${countdownPct}%` }} />
               </div>
             </div>
-          ) : (phase === 'blocked' || unconfirmed) && status?.message ? (
-            <p className="auto-start-note auto-start-note-blocked">{status.message}</p>
+          ) : (phase === 'blocked' || unconfirmed) && statusMessage ? (
+            <p className="auto-start-note auto-start-note-blocked">{statusMessage}</p>
           ) : phase === 'failed' ? (
             <p className="auto-start-note auto-start-note-failed">
-              {status?.message ?? t('autoStart.phaseFailed')}
+              {statusMessage ?? t('autoStart.phaseFailed')}
               {status?.errorCode ? ` (${status.errorCode})` : ''}
             </p>
           ) : phase === 'started' && status?.pid ? (

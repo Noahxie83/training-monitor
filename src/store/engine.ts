@@ -1,3 +1,4 @@
+import type { PendingRemoteCancel } from '../launch/reconcile';
 import { DatabaseSync } from 'node:sqlite';
 import { statfs, stat, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -138,7 +139,7 @@ function offsetKey(value: string): string {
 }
 
 function emptyParserState(cursor: CursorState): CursorState['parserState'] {
-  return { ...cursor.parserState, recordStartOffset: cursor.committedOffset, utf8CarryBase64: '', pendingCR: false, recordInvalidUtf8: false, boundedPreview: '', displayTruncated: true, prefixIncomplete: true };
+  return { ...cursor.parserState, recordStartOffset: cursor.committedOffset, frameStartOffset: undefined, utf8CarryBase64: '', pendingCR: false, recordInvalidUtf8: false, boundedPreview: '', displayTruncated: true, prefixIncomplete: true };
 }
 
 /** Serialize LogEvent metadata WITHOUT duplicating `text` or `rawAnsi` into `event_json`. */
@@ -397,6 +398,26 @@ export class StoreEngine {
     if (right) this.db.prepare('DELETE FROM raw_support WHERE support_id=?').run(right.support_id);
     this.db.prepare('INSERT INTO raw_support(source_id,generation,start_offset,end_offset,start_key,end_key,ingested_at) VALUES(?,?,?,?,?,?,?)')
       .run(sourceId, generation, mergedStart, mergedEnd, offsetKey(mergedStart), offsetKey(mergedEnd), ingestedAt);
+  }
+
+  enqueueRemoteCancel(item: PendingRemoteCancel): void {
+    this.db.prepare(`
+      INSERT INTO pending_remote_cancels (host_id, task_id, arm_id, config_hash, payload_json)
+      VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
+    `).run(item.hostId, item.taskId, item.armId, item.configHash, JSON.stringify(item));
+  }
+
+  getPendingRemoteCancels(hostId: string): PendingRemoteCancel[] {
+    const rows = this.db.prepare(
+      'SELECT payload_json FROM pending_remote_cancels WHERE host_id=? ORDER BY rowid'
+    ).all(hostId) as { payload_json: string }[];
+    return rows.map((row) => JSON.parse(row.payload_json) as PendingRemoteCancel);
+  }
+
+  deleteRemoteCancel(item: PendingRemoteCancel): void {
+    this.db.prepare(`
+      DELETE FROM pending_remote_cancels WHERE host_id=? AND task_id=? AND arm_id=? AND config_hash=?
+    `).run(item.hostId, item.taskId, item.armId, item.configHash);
   }
 
   async getCursor(sourceId: string): Promise<CursorState | null> { this.assertOpen(); return this.cursor(sourceId, this.readDb); }
@@ -734,7 +755,9 @@ export class StoreEngine {
       observation.hostObservation.freshness === 'fresh' &&
       observation.hostObservation.scanComplete === true &&
       observation.taskObservation.freshness === 'fresh' &&
-      observation.taskObservation.scanComplete === true;
+      (observation.taskObservation.scanComplete === true ||
+        (observation.task.attributionMode === 'log_only' && base.attributionConfidence === 'log_only' &&
+          base.freshness === 'fresh'));
     if (connected) {
       return {
         ...base,
@@ -1394,7 +1417,7 @@ export class StoreEngine {
       WHERE observed_at <= ? AND id NOT IN (
         SELECT MAX(id) FROM gpu_samples
         WHERE observed_at <= ?
-        GROUP BY host_id, device_id, substr(observed_at, 1, 15)
+        GROUP BY host_id, device_id, CAST(strftime('%s', observed_at) / 300 AS INTEGER)
       )
     `).run(fineCutoffIso, fineCutoffIso);
     this.db.prepare(`
@@ -1402,7 +1425,7 @@ export class StoreEngine {
       WHERE observed_at <= ? AND id NOT IN (
         SELECT MAX(id) FROM host_samples
         WHERE observed_at <= ?
-        GROUP BY host_id, substr(observed_at, 1, 15)
+        GROUP BY host_id, CAST(strftime('%s', observed_at) / 300 AS INTEGER)
       )
     `).run(fineCutoffIso, fineCutoffIso);
     this.db.prepare(`
@@ -1410,7 +1433,7 @@ export class StoreEngine {
       WHERE observed_at <= ? AND id NOT IN (
         SELECT MAX(id) FROM metric_samples
         WHERE observed_at <= ?
-        GROUP BY task_id, metric_name, substr(observed_at, 1, 15)
+        GROUP BY task_id, run_id, metric_name, CAST(strftime('%s', observed_at) / 300 AS INTEGER)
       )
     `).run(fineCutoffIso, fineCutoffIso);
 

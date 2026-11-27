@@ -23,7 +23,7 @@ function resolvePath(dict: Record<string, unknown>, key: string): string | null 
 export function translate(
   locale: Locale,
   key: string,
-  params?: Record<string, string | number | null | undefined>,
+  params?: Record<string, string | number | boolean | null | undefined>,
 ): string {
   const template =
     resolvePath(DICTIONARIES[locale], key) ??
@@ -72,7 +72,7 @@ export function translateHostError(
 interface I18nContextValue {
   locale: Locale;
   setLocale: (next: Locale) => void;
-  t: (key: string, params?: Record<string, string | number | null | undefined>) => string;
+  t: (key: string, params?: Record<string, string | number | boolean | null | undefined>) => string;
 }
 
 const I18nContext = createContext<I18nContextValue>({

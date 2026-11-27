@@ -175,7 +175,7 @@ class ProcessGpuProbeTests(unittest.TestCase):
         query.assert_not_called()
 
     def test_query_uses_fixed_compute_apps_command_and_two_second_cap(self):
-        with mock.patch.object(probe.shutil, "which", return_value="/usr/bin/nvidia-smi"), \
+        with mock.patch.object(probe, "_find_nvidia_smi", return_value="/usr/bin/nvidia-smi"), \
              mock.patch.object(probe, "_run_bounded_process_command", return_value=(b"", None)) as run:
             self.assertEqual(probe._query_process_gpu_csv(), (b"", None))
         self.assertEqual(run.call_args.args[0], "/usr/bin/nvidia-smi")
@@ -204,6 +204,7 @@ class ProcessGpuProbeTests(unittest.TestCase):
                  mock.patch.object(probe.os, "getuid", return_value=1000, create=True), \
                  mock.patch.object(probe.os, "stat", return_value=types.SimpleNamespace(st_uid=1000)), \
                  mock.patch.object(probe, "_proc_identity", return_value={"bootId": "boot-a", "pid": 101, "startTicks": "100"}), \
+                 mock.patch.object(probe, "_find_nvidia_smi", return_value="/mock/nvidia-smi"), \
                  mock.patch.object(probe, "_query_process_gpu_csv", return_value=(None, "NVIDIA_SMI_TIMEOUT")):
                 payload = probe._dispatch({
                     "op": "probe_task", "proc": {"root": str(proc_root)}, "task": {"sources": []},

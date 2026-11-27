@@ -1,5 +1,5 @@
 import type { HostTarget } from '../shared/contracts';
-import { validateHostTarget } from '../shared/validate';
+import { isSafeRemotePythonPath, validateHostTarget } from '../shared/validate';
 
 export interface CommandSpec {
   command: string;
@@ -21,7 +21,7 @@ export const SERVE_BOOTSTRAP_PY =
 const VERSION_CHECK_PY = 'import sys; sys.exit(0 if sys.version_info>=(3,7) else 1)';
 
 function assertSafePythonPath(pythonPath: string): void {
-  if (!pythonPath || pythonPath.length > 1024 || /[\u0000-\u001f\u007f'"`$;|&<>]/.test(pythonPath)) {
+  if (!isSafeRemotePythonPath(pythonPath)) {
     throw new Error('HOST_TARGET_INVALID');
   }
 }

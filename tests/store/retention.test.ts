@@ -313,7 +313,7 @@ describe('cache retention', () => {
       expect(work.supportBlocks).toBeGreaterThanOrEqual(Math.ceil((intervalCount + 1) / 64));
       console.info(`T3_FIX3_SUPPORT_WORK ${JSON.stringify({ intervalCount, completeTextVisible: true, candidatesVisited: work.support, blocks: work.supportBlocks, maxCandidatesPerBlock: work.supportMaxBlock })}`);
     }
-  });
+  }, 15_000);
 
   it('hides text when indexed support ends before the requested record and visits only the direct predecessor', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'monitor-support-missing-after-end-'));

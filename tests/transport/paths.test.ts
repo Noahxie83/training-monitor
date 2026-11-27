@@ -32,6 +32,19 @@ describe('registered path boundaries', () => {
     expect(catalog.listCandidates('log').map(item => item.registrationId)).toEqual(['inside']);
   });
 
+  test('validates each ProxyJump hop and rejects unsafe remote Python paths', async () => {
+    const { commandSpecFor } = await import('../../src/transport/commands');
+    const proxyJump = 'alice@bastion:2222,[2001:db8::1]:22';
+    expect(commandSpecFor({ kind: 'ssh', alias: 'target', proxyJump }).args).toContain(proxyJump);
+    for (const value of ['bastion,-bad', 'bastion,host;next', 'bastion,', 'bastion,host:99999']) {
+      expect(() => commandSpecFor({ kind: 'ssh', alias: 'target', proxyJump: value })).toThrow('HOST_TARGET_INVALID');
+    }
+    for (const pythonPath of ['-python', 'venv\\bin\\python']) {
+      expect(() => commandSpecFor({ kind: 'ssh', alias: 'target', pythonPath })).toThrow('HOST_TARGET_INVALID');
+      expect(() => commandSpecFor({ kind: 'wsl', distribution: 'Ubuntu', pythonPath })).toThrow('HOST_TARGET_INVALID');
+    }
+  });
+
   test('keeps command arguments parameterized and independent of registered path text', async () => {
     const { commandSpecFor, safeArgsFor } = await import('../../src/transport/commands');
     const sshArgs = safeArgsFor({

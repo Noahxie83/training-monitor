@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 """Fail-closed launcher and opt-in job controller for registered ML training tasks."""
+import ast
 import base64
 import csv
 import datetime
@@ -303,6 +304,9 @@ def _validate_request(request):
     modules = launch.get("modules")
     if modules is not None:
         modules = _string_list(modules, nonempty=False)
+        if any(not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+/-]{0,255}", mod)
+               or any(part in {"", ".", ".."} for part in mod.split("/")) for mod in modules):
+            raise _LaunchError("INVALID_MODULE")
     user_env = _validate_env(launch.get("env"))
 
     gpu_devices = request.get("gpuDevices")
@@ -929,7 +933,7 @@ def _acquire_shared_gpu_locks(state_directory, request):
                 os.ftruncate(fd, 0)
                 _write_all(fd, encoded)
                 os.fsync(fd)
-                _atomic_write_json(_sharing_meta_path(slot_path), state_directory, data)
+                _atomic_write_json(_sharing_meta_path(slot_path), os.path.dirname(slot_path), data)
                 request["_sharingSlotPath"] = slot_path
                 handles.append((fd, locks))
                 return handles
@@ -1100,6 +1104,52 @@ def _process_key(probe, pid, boot):
     return {"hostBootId": boot, "pid": pid, "startTicks": start_ticks}
 
 
+def _load_module_environment(modules, process_env):
+    executable = shutil.which("modulecmd", path=process_env.get("PATH"))
+    if executable is None:
+        raise _LaunchError("MODULECMD_UNAVAILABLE")
+    for module in modules:
+        try:
+            result = subprocess.run(
+                [executable, "python", "load", module], env=process_env, check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10,
+            )
+            if len(result.stdout) > 1024 * 1024:
+                raise ValueError("Module output is too large")
+            statements = ast.parse(result.stdout).body
+            for statement in statements:
+                if isinstance(statement, ast.Import) and all(alias.name == "os" and alias.asname is None for alias in statement.names):
+                    continue
+                if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                    target = statement.targets[0]
+                    if isinstance(target, ast.Name) and target.id == "_mlstatus":
+                        if ast.literal_eval(statement.value) is not True:
+                            raise ValueError("Module load failed")
+                        continue
+                    value = ast.literal_eval(statement.value)
+                    if not isinstance(value, str) or "\0" in value:
+                        raise ValueError("Invalid environment value")
+                elif isinstance(statement, ast.Delete) and len(statement.targets) == 1:
+                    target = statement.targets[0]
+                    value = None
+                else:
+                    raise ValueError("Unsupported module output")
+                if (not isinstance(target, ast.Subscript) or not isinstance(target.value, ast.Attribute)
+                        or not isinstance(target.value.value, ast.Name) or target.value.value.id != "os"
+                        or target.value.attr != "environ"):
+                    raise ValueError("Unsupported environment statement")
+                # Python 3.7 and 3.8 wrap a subscript literal in ast.Index.
+                key = ast.literal_eval(target.slice.value if isinstance(target.slice, ast.Index) else target.slice)
+                if not isinstance(key, str) or not _ENV_KEY_RE.fullmatch(key):
+                    raise ValueError("Invalid environment key")
+                if value is None:
+                    process_env.pop(key, None)
+                else:
+                    process_env[key] = value
+        except (OSError, subprocess.SubprocessError, SyntaxError, ValueError) as exc:
+            raise _LaunchError("MODULE_LOAD_FAILED") from exc
+
+
 def _build_launch_argv_and_env(request, script):
     launch = request["launch"]
     mode = launch.get("mode") or "python_script"
@@ -1141,7 +1191,7 @@ def _build_launch_argv_and_env(request, script):
         process_env["PATH"] = ":".join(extra_path_entries + ([existing_path] if existing_path else []))
 
     if launch.get("modules"):
-        process_env["TM_REQUESTED_MODULES"] = ",".join(launch["modules"])
+        _load_module_environment(launch["modules"], process_env)
 
     for k, v in (launch.get("env") or {}).items():
         if k != "CUDA_VISIBLE_DEVICES":
@@ -1218,7 +1268,7 @@ def _write_supervisor_script(state_directory):
     return script_path
 
 
-def _update_sharing_slot_pid(slot_path, state_directory, pid):
+def _update_sharing_slot_pid(slot_path, pid):
     try:
         with open(slot_path, "r+", encoding="utf-8") as stream:
             data = json.load(stream)
@@ -1229,7 +1279,7 @@ def _update_sharing_slot_pid(slot_path, state_directory, pid):
             stream.truncate()
             stream.flush()
             os.fsync(stream.fileno())
-        _atomic_write_json(_sharing_meta_path(slot_path), state_directory, data)
+        _atomic_write_json(_sharing_meta_path(slot_path), os.path.dirname(slot_path), data)
     except OSError:
         pass
 
@@ -1310,7 +1360,7 @@ def _spawn_process(request, script, cwd, log_fd, boot, gpu_lock_fds, state_direc
         raise _LaunchError("PROCESS_SPAWN_FAILED")
     process_key = _process_key(_probe(), pid, boot)
     if request.get("_sharingSlotPath") and state_directory:
-        _update_sharing_slot_pid(request["_sharingSlotPath"], state_directory, pid)
+        _update_sharing_slot_pid(request["_sharingSlotPath"], pid)
     return _payload("started", pid=pid, process_key=process_key, started_at=_started_at())
 
 

@@ -119,11 +119,20 @@ export function decodeChunk(cursor: CursorState, taskId: string, input: Uint8Arr
   let truncated = state.displayTruncated;
   let prefixIncomplete = state.prefixIncomplete;
   let recordStart = BigInt(state.recordStartOffset);
+  let frameStart = BigInt(state.frameStartOffset ?? state.recordStartOffset);
   let pendingCR = state.pendingCR;
   const events: LogEvent[] = [];
   let recordInvalidUtf8 = state.recordInvalidUtf8 ?? false;
   const newByteStart = chunkStart;
   const baseOffset = chunkStart - BigInt(previousCarry.length);
+
+  const emitFrame = (kind: 'redraw' | 'line', end: bigint, complete: boolean) => {
+    const event = makeEvent(cursor, taskId, kind, recordStart.toString(), end.toString(), preview,
+      ingestedAt, complete, prefixIncomplete, truncated, recordInvalidUtf8 ? 'invalid_utf8' : null);
+    if (frameStart !== recordStart) event.frameStartOffset = frameStart.toString();
+    events.push(event);
+    if (complete) frameStart = end;
+  };
 
   const appendText = (slice: Uint8Array) => {
     const decoded = decodedPrefix(slice);
@@ -157,7 +166,7 @@ export function decodeChunk(cursor: CursorState, taskId: string, input: Uint8Arr
     if (bytes[0] === 0x0a) {
       flushSegment(0);
       flushCarryAtBoundary();
-      events.push(makeEvent(cursor, taskId, 'line', recordStart.toString(), (newByteStart + 1n).toString(), preview, ingestedAt, true, prefixIncomplete, truncated, recordInvalidUtf8 ? 'invalid_utf8' : null));
+      emitFrame('line', (newByteStart + 1n), true);
       recordInvalidUtf8 = false;
       preview = '';
       truncated = false;
@@ -169,7 +178,7 @@ export function decodeChunk(cursor: CursorState, taskId: string, input: Uint8Arr
       flushSegment(0);
       flushCarryAtBoundary();
       const crOffset = newByteStart - 1n;
-      events.push(makeEvent(cursor, taskId, 'redraw', recordStart.toString(), (crOffset + 1n).toString(), preview, ingestedAt, true, prefixIncomplete, truncated, recordInvalidUtf8 ? 'invalid_utf8' : null));
+      emitFrame('redraw', (crOffset + 1n), true);
       recordInvalidUtf8 = false;
       preview = '';
       truncated = false;
@@ -184,7 +193,7 @@ export function decodeChunk(cursor: CursorState, taskId: string, input: Uint8Arr
       flushSegment(i);
       flushCarryAtBoundary();
       const end = baseOffset + BigInt(i + 1);
-      events.push(makeEvent(cursor, taskId, 'line', recordStart.toString(), end.toString(), preview, ingestedAt, true, prefixIncomplete, truncated, recordInvalidUtf8 ? 'invalid_utf8' : null));
+      emitFrame('line', end, true);
       recordInvalidUtf8 = false;
       preview = '';
       truncated = false;
@@ -198,7 +207,7 @@ export function decodeChunk(cursor: CursorState, taskId: string, input: Uint8Arr
         if (bytes[i + 1] === 0x0a) {
           flushCarryAtBoundary();
           const end = baseOffset + BigInt(i + 2);
-          events.push(makeEvent(cursor, taskId, 'line', recordStart.toString(), end.toString(), preview, ingestedAt, true, prefixIncomplete, truncated, recordInvalidUtf8 ? 'invalid_utf8' : null));
+          emitFrame('line', end, true);
           recordInvalidUtf8 = false;
           preview = '';
           truncated = false;
@@ -209,7 +218,7 @@ export function decodeChunk(cursor: CursorState, taskId: string, input: Uint8Arr
         } else {
           flushCarryAtBoundary();
           const end = baseOffset + BigInt(i + 1);
-          events.push(makeEvent(cursor, taskId, 'redraw', recordStart.toString(), end.toString(), preview, ingestedAt, true, prefixIncomplete, truncated, recordInvalidUtf8 ? 'invalid_utf8' : null));
+          emitFrame('redraw', end, true);
           recordInvalidUtf8 = false;
           preview = '';
           truncated = false;
@@ -227,10 +236,11 @@ export function decodeChunk(cursor: CursorState, taskId: string, input: Uint8Arr
   flushSegment(bytes.length);
   const readEnd = chunkStart + BigInt(input.length);
   if (input.length > 0 && recordStart < readEnd) {
-    events.push(makeEvent(cursor, taskId, pendingCR ? 'redraw' : 'line', recordStart.toString(), readEnd.toString(), preview, ingestedAt, false, prefixIncomplete, truncated, recordInvalidUtf8 ? 'invalid_utf8' : null));
+    emitFrame(pendingCR ? 'redraw' : 'line', readEnd, false);
   }
   state = {
     recordStartOffset: recordStart.toString(),
+    ...(frameStart !== recordStart ? { frameStartOffset: frameStart.toString() } : {}),
     pendingCR,
     utf8CarryBase64: state.utf8CarryBase64,
     boundedPreview: preview,

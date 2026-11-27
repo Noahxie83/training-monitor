@@ -206,6 +206,33 @@ describe('Phase 2 SQLite v2 store, FTS5, time-series, and worker resilience', ()
     await engine.close();
   });
 
+  it('keeps a sample per true five-minute boundary when retaining old metrics', async () => {
+    const engine = new StoreEngine(':memory:', () => Date.parse(NOW));
+    try {
+      await engine.saveMetricSamples(['00:04:10', '00:05:10', '00:09:10', '00:10:10'].map((time, step) => ({
+        taskId: 'task', runId: 'run', observedAt: `2026-10-19T${time}.000Z`, step, metricName: 'loss', value: step,
+      })));
+      await engine.retain('2026-10-21T00:00:00.000Z');
+      const result = await engine.getMetricSeries({ taskId: 'task', rangeMs: 3 * 86_400_000 }, '2026-10-21T00:00:00.000Z');
+      expect(result.series.loss?.map((point) => point.value)).toEqual([0, 2, 3]);
+    } finally {
+      await engine.close();
+    }
+  });
+
+  it('waits for an in-flight worker restart during concurrent close calls', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'monitor-close-restart-'));
+    dirs.push(directory);
+    const store = await openStore({ directory, now: () => Date.parse(NOW) });
+    await store.forceTerminateWorkerForTest!();
+    const pending = expect(store.getSnapshot()).rejects.toThrow('STORE_CLOSED');
+    const first = store.close();
+    const second = store.close();
+    expect(first).toBe(second);
+    await Promise.all([first, second, pending]);
+    expect(store.crashCount?.()).toBe(1);
+  });
+
   it('automatically restarts the SQLite store worker after unexpected termination', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'monitor-restart-'));
     dirs.push(dir);

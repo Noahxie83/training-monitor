@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "description": "Desktop monitoring for local, WSL, and remote machine learning training jobs.",
   "productName": "Training Monitor",
-  "homepage": "https://github.com/Noahxie83/training-monitor",
+  "homepage": "https://example.com/training-monitor",
   "author": {
     "name": "Training Monitor contributors",
-    "email": "Noahxie83@users.noreply.github.com"
+    "email": "maintainers@example.com"
   },
   "private": true,
   "type": "module",

@@ -6,7 +6,7 @@ import { parseGenericRecord } from '../parsers/generic';
 import { parseRegisteredRecord } from '../parsers/registered';
 import { taskParser, type ParserKind } from '../shared/task-profile';
 import { areProcessKeysEqual } from "./identity";
-import { isValidDecimalBytes, parseIsoMs, isTimestampValid } from "./bindings";
+import { isValidDecimalBytes, parseIsoMs, isTimestampValid, sameBindingProcess } from "./bindings";
 import type { ActiveWriterWindow } from "./bindings";
 import type { BindingState } from "./bindings";
 import type { TaskObservation } from "../transport/types";
@@ -72,7 +72,7 @@ export interface RateObservation {
   fileIdentity: { dev: string; inode: string };
   eofBytes: string;
   observedAt: string;
-  writerProcessKey: ProcessKey;
+  writerProcessKey: ProcessKey | null;
   writerEofBytes: string;
 }
 
@@ -90,7 +90,7 @@ export interface ProgressEvidence {
   observedAt: string;
   freshness: Freshness;
   algorithm: ParserKind;
-  currentRun: { runId: string; mainProcessKey: ProcessKey } | null;
+  currentRun: { runId: string; mainProcessKey: ProcessKey | null } | null;
   bindings: RunBinding[];
   taskRegistration?: TaskRegistration;
   sourceObservations?: BaselineSourceObservation[];
@@ -140,7 +140,8 @@ export function deriveProgress(input: ProgressEvidence): Progress {
   }
   if (canonical.taskId !== input.taskId || canonical.registeredTask.taskId !== input.taskId || canonical.registeredTask.hostId !== input.hostId ||
       !canonical.registeredTask.enabled || !input.currentRun || canonical.activeRunId !== input.currentRun.runId ||
-      !canonical.activeMainKey || !areProcessKeysEqual(canonical.activeMainKey, input.currentRun.mainProcessKey)) {
+      !sameBindingProcess(canonical.activeMainKey, input.currentRun.mainProcessKey) ||
+      (canonical.activeMainKey === null && canonical.registeredTask.attributionMode !== "log_only")) {
     return createEmptyProgress(input.observedAt, input.freshness, input.configuredTarget ?? null);
   }
 
@@ -151,12 +152,12 @@ export function deriveProgress(input: ProgressEvidence): Progress {
 
   {
     const baselineRead = input.bindingState.baselineRead;
-    const validatedBaselineRead = baselineRead
+    const validatedBaselineRead = baselineRead && input.currentRun.mainProcessKey
       ? validateStructuredBaselineRead(baselineRead, {
           task: input.bindingState.registeredTask,
           taskId: input.taskId,
           hostId: input.hostId,
-          currentRun: input.currentRun,
+          currentRun: { ...input.currentRun, mainProcessKey: input.currentRun.mainProcessKey },
           observedAt: input.observedAt,
         })
       : null;
@@ -286,7 +287,8 @@ export function deriveProgress(input: ProgressEvidence): Progress {
     if (!b || typeof b !== "object") return false;
     if (b.runId !== runId) return false;
     if (revokedSet.has(b.bindingId)) return false;
-    if (!currentRun?.mainProcessKey || !areProcessKeysEqual(b.mainProcessKey, currentRun.mainProcessKey)) return false;
+    if (!sameBindingProcess(b.mainProcessKey, currentRun.mainProcessKey)) return false;
+    if (b.mainProcessKey === null && b.evidenceKind !== "log_only") return false;
     if (!isValidDecimalBytes(b.fromOffset) || !isValidDecimalBytes(b.throughOffset)) return false;
     if (BigInt(b.fromOffset) >= BigInt(b.throughOffset)) return false;
     return true;
@@ -304,7 +306,10 @@ export function deriveProgress(input: ProgressEvidence): Progress {
     if (b.sourceId !== e.sourceId) continue;
     if (b.generation !== e.generation) continue;
     if (!isValidDecimalBytes(e.startOffset) || !isValidDecimalBytes(e.endOffset)) continue;
-    const start = BigInt(e.startOffset);
+    const frameStart = e.frameStartOffset ?? e.startOffset;
+    if (!isValidDecimalBytes(frameStart)) continue;
+    const start = BigInt(frameStart);
+    if (start < BigInt(e.startOffset)) continue;
     const end = BigInt(e.endOffset);
     if (start >= end) continue;
     if ((e.kind !== "line" && e.kind !== "redraw") || e.recordComplete !== true || e.prefixIncomplete === true || !e.text || e.text.includes("\r")) continue;
@@ -316,46 +321,31 @@ export function deriveProgress(input: ProgressEvidence): Progress {
     filteredEvents.push(e);
   }
 
+  if (filteredEvents.length === 0) return createEmptyProgress(observedAt, freshness, configuredTarget);
+
+  filteredEvents.sort((a, b) => {
+    if (a.sourceId !== b.sourceId || a.generation !== b.generation) {
+      const time = (parseIsoMs(a.ingestedAt) ?? 0) - (parseIsoMs(b.ingestedAt) ?? 0);
+      if (time !== 0) return time;
+      return a.sourceId.localeCompare(b.sourceId) || a.generation.localeCompare(b.generation);
+    }
+    const aEnd = BigInt(a.endOffset!);
+    const bEnd = BigInt(b.endOffset!);
+    return aEnd < bEnd ? -1 : aEnd > bEnd ? 1 : 0;
+  });
+
   const currentEvents = filteredEvents.filter((event) => {
     const binding = validBindingsMap.get(event.bindingId!);
     return !!binding && (input.currentWindows ?? []).some((window) =>
       window.isOpen && window.runId === event.runId &&
-      window.taskId === input.taskId &&
-      window.sourceId === event.sourceId &&
-      window.generation === event.generation &&
-      window.observerEpoch === binding.observerEpoch
+      window.taskId === input.taskId && window.sourceId === event.sourceId &&
+      window.generation === event.generation && window.observerEpoch === binding.observerEpoch
     );
   });
-  if (filteredEvents.length === 0) return createEmptyProgress(observedAt, freshness, configuredTarget);
-
-  // Refuse to mix incomparable distinct sources, while supporting same-source log rotation generations.
-  const distinctSources = new Set(filteredEvents.map((event) => event.sourceId));
-  if (distinctSources.size !== 1) return createEmptyProgress(observedAt, freshness, configuredTarget);
-
-  const distinctGenerations = new Set(filteredEvents.map((event) => event.generation));
-  const singleGeneration = distinctGenerations.size === 1;
-
-  // Deterministically sort events: within one generation by byte offset; across rotations by ingestedAt then offset.
-  filteredEvents.sort((a, b) => {
-    if (!singleGeneration && a.generation !== b.generation) {
-      const ta = parseIsoMs(a.ingestedAt) ?? 0;
-      const tb = parseIsoMs(b.ingestedAt) ?? 0;
-      if (ta !== tb) return ta - tb;
-      return a.generation.localeCompare(b.generation);
-    }
-    const aStart = BigInt(a.startOffset!);
-    const bStart = BigInt(b.startOffset!);
-    if (aStart < bStart) return -1;
-    if (aStart > bStart) return 1;
-    const aEnd = BigInt(a.endOffset!);
-    const bEnd = BigInt(b.endOffset!);
-    if (aEnd < bEnd) return -1;
-    if (aEnd > bEnd) return 1;
-    return 0;
-  });
-
-  const latestEvent = filteredEvents[filteredEvents.length - 1]!;
-  const currentLatestEvent = currentEvents[currentEvents.length - 1] ?? null;
+  const numericEvents = filteredEvents.filter((event) => numericProgressOf(registration!, event.text!, event.sourceId));
+  const latestEvent = numericEvents.filter((event) => currentEvents.includes(event)).at(-1) ??
+    numericEvents.at(-1) ?? currentEvents.at(-1) ?? filteredEvents.at(-1)!;
+  const currentLatestEvent = currentEvents.includes(latestEvent) ? latestEvent : null;
   const progressFreshness = currentLatestEvent ? freshness : "stale";
   const rawText = latestEvent.text || "";
 
@@ -441,7 +431,7 @@ export function deriveProgress(input: ProgressEvidence): Progress {
             task: input.bindingState?.registeredTask,
             taskId: input.taskId,
             hostId: input.hostId,
-            currentRun,
+            currentRun: currentRun.mainProcessKey ? { ...currentRun, mainProcessKey: currentRun.mainProcessKey } : null,
             observedAt,
           })
         : null;
@@ -522,7 +512,7 @@ export function deriveProgress(input: ProgressEvidence): Progress {
     const windowTtlMs = rateWindowSeconds * 1000;
     const validSamples = rateSamples.filter((s) => {
       if (!s || typeof s !== "object" || typeof s.completedCount !== "number" || !Number.isFinite(s.completedCount)) return false;
-      if (s.runId !== runId) return false;
+      if (s.runId !== runId || s.sourceId !== latestEvent.sourceId) return false;
       if (!s.bindingId || typeof s.bindingId !== "string" || !validBindingsMap.has(s.bindingId)) return false;
       if (!s.sourceId || typeof s.sourceId !== "string" || !s.generation || typeof s.generation !== "string") return false;
       if (!isValidDecimalBytes(s.startOffset) || !isValidDecimalBytes(s.endOffset)) return false;
@@ -533,14 +523,15 @@ export function deriveProgress(input: ProgressEvidence): Progress {
       if (sStart >= sEnd) return false;
       const bFrom = BigInt(b.fromOffset);
       const bThrough = BigInt(b.throughOffset);
-      if (sStart < bFrom || sEnd > bThrough) return false;
+      if (sEnd > bThrough) return false;
       if (!isTimestampValid(s.observedAt, obsTime, windowTtlMs)) return false;
       const event = filteredEvents.find((e) => e.eventId === s.eventId && e.bindingId === s.bindingId && e.sourceId === s.sourceId && e.generation === s.generation && e.startOffset === s.startOffset && e.endOffset === s.endOffset);
       if (!event || !event.recordComplete || (event.kind !== "line" && event.kind !== "redraw") || event.prefixIncomplete || !event.text || event.text.includes("\r") || event.ingestedAt !== s.observedAt) return false;
-      const win = input.windows?.find((w) => !!w && w.windowId === s.windowId && w.runId === runId && w.taskId === input.taskId && w.sourceId === s.sourceId && w.generation === s.generation && w.activeBindingId === s.bindingId && areProcessKeysEqual(w.mainProcessKey, currentRun.mainProcessKey));
+      if (BigInt(event.frameStartOffset ?? s.startOffset) < bFrom) return false;
+      const win = input.windows?.find((w) => !!w && w.windowId === s.windowId && w.runId === runId && w.taskId === input.taskId && w.sourceId === s.sourceId && w.generation === s.generation && w.activeBindingId === s.bindingId && sameBindingProcess(w.mainProcessKey, currentRun.mainProcessKey));
       if (!win) return false;
       // For legacy flow, enforce strict open-window identity check on the newest sample
-      const measurement = (input.rateObservations ?? []).find((m) => !!m && !!m.fileIdentity && typeof m.fileIdentity.dev === "string" && typeof m.fileIdentity.inode === "string" && m.eventId === event.eventId && m.sourceId === event.sourceId && m.generation === event.generation && m.observedAt === event.ingestedAt && m.fileIdentity.dev === win.fileIdentity?.dev && m.fileIdentity.inode === win.fileIdentity?.inode && isValidDecimalBytes(event.endOffset) && isValidDecimalBytes(m.eofBytes) && isValidDecimalBytes(m.writerEofBytes) && BigInt(event.endOffset) <= BigInt(m.eofBytes) && m.eofBytes === m.writerEofBytes && areProcessKeysEqual(m.writerProcessKey, currentRun.mainProcessKey));
+      const measurement = (input.rateObservations ?? []).find((m) => !!m && !!m.fileIdentity && typeof m.fileIdentity.dev === "string" && typeof m.fileIdentity.inode === "string" && m.eventId === event.eventId && m.sourceId === event.sourceId && m.generation === event.generation && m.observedAt === event.ingestedAt && m.fileIdentity.dev === win.fileIdentity?.dev && m.fileIdentity.inode === win.fileIdentity?.inode && isValidDecimalBytes(event.endOffset) && isValidDecimalBytes(m.eofBytes) && isValidDecimalBytes(m.writerEofBytes) && BigInt(event.endOffset) <= BigInt(m.eofBytes) && m.eofBytes === m.writerEofBytes && sameBindingProcess(m.writerProcessKey, currentRun.mainProcessKey));
       if (!measurement) return false;
       const numeric = numericProgressOf(registration!, event.text, event.sourceId);
       if (!numeric || numeric.value !== s.completedCount) return false;
@@ -581,14 +572,14 @@ export function deriveProgress(input: ProgressEvidence): Progress {
           s.sourceId === last.sourceId && s.generation !== last.generation
         );
 
-        const latestMeasurement = input.rateObservations?.find((m) => m.eventId === last.eventId);
+        const latestMeasurement = input.rateObservations?.find((m) => m.eventId === last.eventId && m.observedAt === last.observedAt);
 
         if (sameWindowCandidates.length > 0 && latestMeasurement && isValidDecimalBytes(latestMeasurement.eofBytes)) {
           // Use the oldest sample within sliding window if >2 samples, or previous sample if 2 samples.
           const candidatePool = sameWindowCandidates.filter((prev) => {
             const t1 = parseIsoMs(prev.observedAt)!;
             const dt = (lastTime - t1) / 1000;
-            const prevMeasurement = input.rateObservations?.find((m) => m.eventId === prev.eventId);
+            const prevMeasurement = input.rateObservations?.find((m) => m.eventId === prev.eventId && m.observedAt === prev.observedAt);
             const eofProg = !!prevMeasurement && isValidDecimalBytes(prevMeasurement.eofBytes) &&
               BigInt(latestMeasurement.eofBytes) > BigInt(prevMeasurement.eofBytes);
             const offsetProg = BigInt(last.startOffset!) >= BigInt(prev.startOffset!) &&

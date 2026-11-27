@@ -247,9 +247,30 @@ class GpuProbeTests(unittest.TestCase):
         self.assertIsNone(result["errorCode"])
         self.assertEqual(len(result["csv"]), 16 * 1024)
 
+    def test_windows_boot_identity_uses_uint64_and_stays_stable(self):
+        get_tick_count = mock.Mock(return_value=3_100_000_000)
+        windll = types.SimpleNamespace(kernel32=types.SimpleNamespace(GetTickCount64=get_tick_count))
+        with mock.patch.object(probe, "_WINDOWS_BOOT_ID", None), \
+             mock.patch.object(probe.os, "name", "nt"), \
+             mock.patch.object(probe.sys, "platform", "win32"), \
+             mock.patch.object(probe.ctypes, "windll", windll, create=True), \
+             mock.patch.object(probe.time, "time", side_effect=[1_700_000_000, 1_700_000_120]):
+            first = probe._read_host_boot_id()
+            self.assertEqual(first, probe._read_host_boot_id())
+        self.assertEqual(first, "win32-boot-" + str((1_700_000_000 - 3_100_000) // 60))
+        self.assertIs(get_tick_count.restype, probe.ctypes.c_ulonglong)
+        get_tick_count.assert_called_once()
+
+    def test_explicit_proc_root_works_on_windows(self):
+        with mock.patch.object(probe.sys, "platform", "win32"), \
+             mock.patch("builtins.open", mock.mock_open(read_data="fixture-boot\n")) as opener:
+            self.assertEqual(probe._read_host_boot_id("fixture-proc"), "fixture-boot")
+        opener.assert_called_once_with(os.path.join("fixture-proc", "sys", "kernel", "random", "boot_id"), "r", encoding="ascii")
+
     def test_probe_host_cpu_only_node_keeps_host_connected_and_reports_none(self):
         fake_boot_id = "boot-id-cpu-only"
-        with mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
              mock.patch.object(probe, "_find_nvidia_smi", return_value=None):
             response = probe._dispatch({"op": "probe_host"})
 
@@ -269,7 +290,9 @@ class GpuProbeTests(unittest.TestCase):
             "csv": "0, GPU-uuid-0, 20, 4096, 16384\n",
             "errorCode": None,
         }
-        with mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+             mock.patch.object(probe, "_find_nvidia_smi", return_value="/mock/nvidia-smi"), \
              mock.patch.object(probe, "_query_linux_gpu", return_value=mock_gpu_result):
             response = probe._dispatch({"op": "probe_host"})
 
@@ -289,7 +312,9 @@ class GpuProbeTests(unittest.TestCase):
             "csv": None,
             "errorCode": "NVIDIA_SMI_TIMEOUT",
         }
-        with mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+             mock.patch.object(probe, "_find_nvidia_smi", return_value="/mock/nvidia-smi"), \
              mock.patch.object(probe, "_query_linux_gpu", return_value=timeout_gpu_result):
             response = probe._dispatch({"op": "probe_host"})
 
@@ -309,7 +334,9 @@ class GpuProbeTests(unittest.TestCase):
             "csv": None,
             "errorCode": "NVIDIA_SMI_UNAVAILABLE",
         }
-        with mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+             mock.patch.object(probe, "_find_nvidia_smi", return_value="/mock/nvidia-smi"), \
              mock.patch.object(probe, "_query_linux_gpu", return_value=missing_gpu_result):
             response = probe._dispatch({"op": "probe_host"})
 
@@ -329,7 +356,9 @@ class GpuProbeTests(unittest.TestCase):
             "csv": None,
             "errorCode": "NVIDIA_SMI_FAILED",
         }
-        with mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+             mock.patch.object(probe, "_find_nvidia_smi", return_value="/mock/nvidia-smi"), \
              mock.patch.object(probe, "_query_linux_gpu", return_value=failed_gpu_result):
             response = probe._dispatch({"op": "probe_host"})
 
@@ -343,7 +372,8 @@ class GpuProbeTests(unittest.TestCase):
 
     def test_probe_host_skips_gpu_when_include_gpu_is_false(self):
         fake_boot_id = "boot-id-skip-test"
-        with mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
              mock.patch.object(probe, "_query_linux_gpu") as mock_gpu_query:
             response = probe._dispatch({"op": "probe_host", "includeGpu": False})
 
@@ -363,7 +393,9 @@ class GpuProbeTests(unittest.TestCase):
     def test_probe_host_queries_gpu_when_include_gpu_is_true(self):
         fake_boot_id = "boot-id-explicit-true-test"
         mock_gpu_result = {"status": "ok", "observedAt": 1000, "csv": "0, GPU, 0, 0, 0\n", "errorCode": None}
-        with mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+             mock.patch.object(probe, "_find_nvidia_smi", return_value="/mock/nvidia-smi"), \
              mock.patch.object(probe, "_query_linux_gpu", return_value=mock_gpu_result) as mock_gpu_query:
             response = probe._dispatch({"op": "probe_host", "includeGpu": True})
 
@@ -373,7 +405,9 @@ class GpuProbeTests(unittest.TestCase):
     def test_probe_host_queries_gpu_when_include_gpu_omitted(self):
         fake_boot_id = "boot-id-default-true-test"
         mock_gpu_result = {"status": "ok", "observedAt": 2000, "csv": "0, GPU, 0, 0, 0\n", "errorCode": None}
-        with mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
+             mock.patch.object(probe, "_find_nvidia_smi", return_value="/mock/nvidia-smi"), \
              mock.patch.object(probe, "_query_linux_gpu", return_value=mock_gpu_result) as mock_gpu_query:
             response = probe._dispatch({"op": "probe_host"})
 
@@ -381,7 +415,8 @@ class GpuProbeTests(unittest.TestCase):
         self.assertEqual(response["gpu"], mock_gpu_result)
 
     def test_probe_host_failure_does_not_call_gpu_query(self):
-        with mock.patch("builtins.open", side_effect=OSError("Cannot read /proc/sys/kernel/random/boot_id")), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch("builtins.open", side_effect=OSError("Cannot read /proc/sys/kernel/random/boot_id")), \
              mock.patch.object(probe, "_query_linux_gpu") as mock_gpu_query:
             response = probe._dispatch({"op": "probe_host"})
 
@@ -405,7 +440,8 @@ class GpuProbeTests(unittest.TestCase):
         fake_boot_id = "boot-id-main-test"
         stdout_buffer = io.BytesIO()
 
-        with mock.patch.object(probe, "REQUEST_B64", req_b64), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch.object(probe, "REQUEST_B64", req_b64), \
              mock.patch("builtins.open", mock.mock_open(read_data=fake_boot_id + "\n")), \
              mock.patch.object(probe.sys, "stdout", types.SimpleNamespace(buffer=stdout_buffer)):
             exit_code = probe.main()
@@ -430,7 +466,8 @@ class GpuProbeTests(unittest.TestCase):
         stdin_buf = io.BytesIO(stdin_bytes)
         stdout_buf = io.BytesIO()
 
-        with mock.patch("builtins.open", mock.mock_open(read_data="serve-boot-id\n")), \
+        with mock.patch.object(probe.sys, "platform", "linux"), \
+             mock.patch("builtins.open", mock.mock_open(read_data="serve-boot-id\n")), \
              mock.patch.object(probe.sys, "stdin", types.SimpleNamespace(buffer=stdin_buf)), \
              mock.patch.object(probe.sys, "stdout", types.SimpleNamespace(buffer=stdout_buf)), \
              mock.patch.object(probe.sys, "argv", ["readonly_probe.py", "--serve"]):
@@ -456,8 +493,9 @@ class GpuProbeTests(unittest.TestCase):
         device_map = {"GPU-1": "GPU 0"}
         pairs = {(42, "GPU 0"): 1024}
         with mock.patch.object(probe.time, "time_ns", return_value=now_us * 1000), \
-             mock.patch.object(probe.time, "clock_gettime_ns", return_value=uptime_us * 1000), \
-             mock.patch.object(probe.os, "sysconf", return_value=100), \
+             mock.patch.object(probe.time, "clock_gettime_ns", return_value=uptime_us * 1000, create=True), \
+             mock.patch.object(probe.os, "sysconf", return_value=100, create=True), \
+             mock.patch.object(probe.time, "CLOCK_BOOTTIME", 7, create=True), \
              mock.patch.object(probe, "_nvml_process_samples", return_value=[(42, "GPU 0", now_us + 1_500_000, 77)]):
             util = probe._process_gpu_utilization(candidates, device_map, pairs)
         self.assertEqual(util, {(42, "GPU 0"): 77})

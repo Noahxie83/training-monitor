@@ -15,6 +15,8 @@ export interface PendingRemoteCancel {
 
 export interface HostUnreachableReconcileError extends Error {
   code: 'HOST_UNREACHABLE_RECONCILE';
+  errorCode: 'HOST_UNREACHABLE_RECONCILE';
+  errorParams: { taskCount: number };
   affectedTasks: PendingRemoteCancel[];
 }
 
@@ -38,9 +40,11 @@ function taskById(registry: Registry, taskId: string | undefined): TaskRegistrat
 
 function unreachableReconcileError(affectedTasks: PendingRemoteCancel[]): HostUnreachableReconcileError {
   const err = new Error(
-    'HOST_UNREACHABLE_RECONCILE: 无法确认服务器取消等待，原规则仍可能运行，请重新连接后再修改；也可使用 forceLocal 强制本地保存并在宿主重连后自动补发取消。',
+    'HOST_UNREACHABLE_RECONCILE: 无法确认服务器取消等待，原规则仍可能运行，请重新连接后再修改。',
   ) as HostUnreachableReconcileError;
   err.code = 'HOST_UNREACHABLE_RECONCILE';
+  err.errorCode = err.code;
+  err.errorParams = { taskCount: affectedTasks.length };
   err.affectedTasks = affectedTasks;
   return err;
 }

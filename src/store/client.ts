@@ -1,3 +1,4 @@
+import type { PendingRemoteCancel } from '../launch/reconcile';
 import { Worker } from 'node:worker_threads';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -97,6 +98,9 @@ class StoreClientImpl implements InternalClient {
     this.worker.postMessage({ id, operation } satisfies WorkerRequest);
     return await response as T;
   }
+  enqueueRemoteCancel(item: PendingRemoteCancel): Promise<void> { return this.call({ method: 'enqueueRemoteCancel', args: [item] }); }
+  getPendingRemoteCancels(hostId: string): Promise<PendingRemoteCancel[]> { return this.call({ method: 'getPendingRemoteCancels', args: [hostId] }); }
+  deleteRemoteCancel(item: PendingRemoteCancel): Promise<void> { return this.call({ method: 'deleteRemoteCancel', args: [item] }); }
   getCursor(sourceId: string): Promise<CursorState | null> { return this.call({ method: 'getCursor', args: [sourceId] }); }
   registerSource(sourceId: string, observation: SourceObservation, taskId: string): Promise<CursorState> { return this.call({ method: 'registerSource', args: [sourceId, observation, taskId] }); }
   saveObservation(observation: PersistedObservation): Promise<void> { return this.call({ method: 'saveObservation', args: [observation] }); }
@@ -152,6 +156,7 @@ class RestartableStoreClient implements InternalClient {
   private restarting: Promise<StoreClientImpl> | null = null;
   private restarts = 0;
   private closed = false;
+  private closing: Promise<void> | null = null;
   private readonly maxRestarts: number;
   runtime: ReadyMessage['runtime'];
 
@@ -189,17 +194,22 @@ class RestartableStoreClient implements InternalClient {
 
   private async runWithRestart<T>(fn: (client: StoreClientImpl) => Promise<T>): Promise<T> {
     const client = await this.ensureLive();
+    if (this.closed) throw new Error('STORE_CLOSED');
     try {
       return await fn(client);
     } catch (error) {
       if (!this.closed && client.isFailed() && this.restarts < this.maxRestarts) {
         const fresh = await this.ensureLive();
+        if (this.closed) throw new Error('STORE_CLOSED');
         return await fn(fresh);
       }
       throw error;
     }
   }
 
+  enqueueRemoteCancel(item: PendingRemoteCancel): Promise<void> { return this.runWithRestart((c) => c.enqueueRemoteCancel(item)); }
+  getPendingRemoteCancels(hostId: string): Promise<PendingRemoteCancel[]> { return this.runWithRestart((c) => c.getPendingRemoteCancels(hostId)); }
+  deleteRemoteCancel(item: PendingRemoteCancel): Promise<void> { return this.runWithRestart((c) => c.deleteRemoteCancel(item)); }
   getCursor(sourceId: string): Promise<CursorState | null> { return this.runWithRestart((c) => c.getCursor(sourceId)); }
   registerSource(sourceId: string, observation: SourceObservation, taskId: string): Promise<CursorState> { return this.runWithRestart((c) => c.registerSource(sourceId, observation, taskId)); }
   saveObservation(observation: PersistedObservation): Promise<void> { return this.runWithRestart((c) => c.saveObservation(observation)); }
@@ -221,10 +231,14 @@ class RestartableStoreClient implements InternalClient {
   cancelRequest(requestId: string): Promise<void> { return this.runWithRestart((c) => c.cancelRequest(requestId)); }
   retain(now: string): Promise<{ pausedForDisk: boolean }> { return this.runWithRestart((c) => c.retain(now)); }
   diagnostics(): Promise<StoreDiagnostics> { return this.runWithRestart((c) => c.diagnostics()); }
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
     this.closed = true;
-    await this.current.close().catch(() => undefined);
+    this.closing = (async () => {
+      await this.restarting?.catch(() => undefined);
+      await this.current.close().catch(() => undefined);
+    })();
+    return this.closing;
   }
 }
 

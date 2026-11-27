@@ -69,6 +69,33 @@ def _init_fake_proc_root(proc_root: Path, boot_id: str = "boot-phase2"):
 
 
 class Phase2ProbeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires Linux /proc fixtures and POSIX filesystem semantics")
+    def test_missing_secondary_log_preserves_process_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "train.log"
+            log.write_bytes(b"step=1")
+            script = root / "train.py"
+            script.touch()
+            proc = root / "proc"
+            proc.mkdir()
+            boot_file = proc / "sys/kernel/random/boot_id"
+            boot_file.parent.mkdir(parents=True)
+            boot_file.write_text("boot\n", encoding="ascii")
+            payload = probe._probe_task_impl({
+                "proc": {"root": str(proc)}, "task": {
+                    "hostAllowedRoots": [directory], "allowedDirectories": [directory],
+                    "entryPaths": [str(script)], "sources": [
+                        {"sourceId": "primary", "kind": "log", "path": str(log)},
+                        {"sourceId": "secondary", "kind": "log", "path": str(root / "pending.log")},
+                    ],
+                },
+            })
+            self.assertTrue(payload["scanComplete"], payload)
+            self.assertIsNone(payload["errorCode"])
+            self.assertEqual(payload["sources"][1]["errorCode"], "SOURCE_MISSING")
+
+    @unittest.skipUnless(os.name == "posix", "requires Linux /proc fixtures and POSIX filesystem semantics")
     def test_ddp_multiprocess_tree_aggregation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -117,6 +144,7 @@ class Phase2ProbeTests(unittest.TestCase):
                 self.assertEqual(p["pgid"], 100)
                 self.assertIn("log", p["writerSourceIds"])
 
+    @unittest.skipUnless(os.name == "posix", "requires Linux /proc fixtures and POSIX filesystem semantics")
     def test_over_200_open_fds_does_not_fail_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -155,6 +183,7 @@ class Phase2ProbeTests(unittest.TestCase):
             self.assertFalse(res["processes"][0].get("fdScanTruncated", False))
             self.assertIn("log", res["processes"][0]["writerSourceIds"])
 
+    @unittest.skipUnless(os.name == "posix", "requires Linux /proc fixtures and POSIX filesystem semantics")
     def test_growing_log_during_scan_does_not_trigger_eof_race(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -206,6 +235,7 @@ class Phase2ProbeTests(unittest.TestCase):
             self.assertTrue(proc_obs["writerEvidenceComplete"])
             self.assertIn("log", proc_obs["writerSourceIds"])
 
+    @unittest.skipUnless(os.name == "posix", "requires Linux /proc fixtures and POSIX filesystem semantics")
     def test_python_module_torchrun_and_tee_pipeline_matching(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -246,6 +276,7 @@ class Phase2ProbeTests(unittest.TestCase):
             self.assertIn("log", p["writerSourceIds"])
             self.assertEqual(p["roleEvidence"], "exact_entry_and_direct_writer_fd")
 
+    @unittest.skipUnless(os.name == "posix", "requires Linux /proc fixtures and POSIX filesystem semantics")
     def test_symlink_latest_log_inside_root_accepted_and_out_of_root_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -298,6 +329,7 @@ class Phase2ProbeTests(unittest.TestCase):
             self.assertEqual(latest["stepSource"], "metadata")
             self.assertGreaterEqual(int(latest["sizeBytes"]), 3072)
 
+    @unittest.skipUnless(os.name == "posix", "requires Linux /proc fixtures and POSIX filesystem semantics")
     def test_discover_processes_rpc(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -334,6 +366,7 @@ class Phase2ProbeTests(unittest.TestCase):
             self.assertIn(str(log_file), item["openLogPaths"])
             self.assertEqual(item["suggestedEntry"], "train_llm.py")
 
+    @unittest.skipUnless(os.name == "posix", "requires Linux /proc fixtures and POSIX filesystem semantics")
     def test_host_system_health_and_rich_gpu_telemetry(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

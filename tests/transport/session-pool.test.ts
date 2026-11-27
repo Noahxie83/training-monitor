@@ -122,6 +122,30 @@ describe('HostSessionPool reuse, auto-reconnect, stderr classification, and loca
     }
   });
 
+  it('queues concurrent local requests on one startup and walks asynchronous Python fallbacks', async () => {
+    const pool = new HostSessionPool();
+    const spawn = vi.fn((command: string) => {
+      const child = new FakeChild();
+      if (command === 'python') queueMicrotask(() => {
+        child.emit('error', Object.assign(new Error('spawn python ENOENT'), { code: 'ENOENT' }));
+      });
+      else if (command === 'py') queueMicrotask(() => { child.emit('close', 9009); });
+      else attachPersistentResponder(child, (req) => ({ id: req.requestId }));
+      return child;
+    });
+    const signal = new AbortController().signal;
+    const requests = ['one', 'two', 'three'].map((requestId) =>
+      pool.call('local', { kind: 'local' }, 'print(1)', { requestId, sourceId: null },
+        signal, spawn as never, { platform: 'win32' }));
+    try {
+      expect(await Promise.all(requests)).toEqual([{ id: 'one' }, { id: 'two' }, { id: 'three' }]);
+      expect(spawn.mock.calls.map(([command]) => command)).toEqual(['python', 'py', 'python3']);
+      expect(pool.activeCount()).toBe(1);
+    } finally {
+      await pool.closeAll();
+    }
+  });
+
   it.each([
     ['Host key verification failed.\n', 255, 'SSH_HOST_KEY_UNKNOWN'],
     ['Permission denied (publickey,keyboard-interactive).\n', 255, 'SSH_AUTH_FAILED'],

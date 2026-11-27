@@ -358,13 +358,13 @@ describe('bounded child execution and WSL behavior', () => {
     try {
       const first = await transport.probeHost(new AbortController().signal);
       expect(first).toMatchObject({ connection: 'connected', hostBootId: 'boot' });
-      // Spawned: wsl --list + wsl --exec (persistent) + nvidia-smi.exe = 3
+      // WSL startup plus the separate device and compute-app GPU queries.
       const spawnsAfterFirst = spawn.mock.calls.length;
-      expect(spawnsAfterFirst).toBe(3);
+      expect(spawnsAfterFirst).toBe(4);
       // Second probe reuses persistent session without re-running wsl --list or wsl --exec!
       await transport.probeHost(new AbortController().signal);
-      // Only nvidia-smi.exe runs again (1 additional spawn)
-      expect(spawn.mock.calls.length).toBe(spawnsAfterFirst + 1);
+      // Only the two GPU queries run again.
+      expect(spawn.mock.calls.length).toBe(spawnsAfterFirst + 2);
     } finally {
       await transport.close?.();
     }
@@ -381,7 +381,9 @@ describe('bounded child execution and WSL behavior', () => {
       if (command === 'wsl.exe' && args.includes('--list')) {
         queueMicrotask(() => { child.stdout.end('Ubuntu-24.04\n'); child.stderr.end(); child.emit('close', 0, null); });
       } else if (command.toLowerCase().endsWith('nvidia-smi.exe')) {
-        queueMicrotask(() => { child.stdout.end('0, GPU-a, 0, 512, 8192\n'); child.stderr.end(); child.emit('close', 0, null); });
+        queueMicrotask(() => { child.stdout.end(args[0]!.startsWith('--query-compute-apps')
+          ? '88, GPU-a, 256, python.exe\n'
+          : '0, GPU-a, 0, 512, 8192, "NVIDIA Test", 55, 60, 120, 35, bus-1, Default, 0\n'); child.stderr.end(); child.emit('close', 0, null); });
       } else {
         attachServeHandler(child, (req) => {
           requests.push(req);
@@ -397,7 +399,11 @@ describe('bounded child execution and WSL behavior', () => {
       expect(observation.gpu?.metrics).toHaveLength(3);
       expect(observation.gpu?.metrics[0]).toMatchObject({ deviceId: 'GPU 0', name: 'gpu_utilization', value: 0 });
       expect(requests[0]).toMatchObject({ op: 'probe_host', includeGpu: false });
-      expect(calls).toHaveLength(3);
+      expect(calls).toHaveLength(4);
+      expect(observation.gpu?.devices?.[0]).toMatchObject({
+        name: 'NVIDIA Test', temperatureC: 55, powerDrawW: 60, fanSpeedPct: 35,
+        activeProcesses: [{ pid: 88, command: 'python.exe', memoryMiB: 256 }],
+      });
       expect(calls[2]!.command.toLowerCase()).toContain('nvidia-smi.exe');
       expect(calls[2]!.args).toContain('--format=csv,noheader,nounits');
     } finally {

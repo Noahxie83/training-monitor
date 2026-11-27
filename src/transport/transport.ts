@@ -18,7 +18,7 @@ import type { ReadReply, SourceObservation } from '../logs/types';
 import type { RotationCatalogLoad } from '../registry/rotation-catalog';
 import { commandSpecFor, stoppedWslListArgs } from './commands';
 import { parseWslListOutput } from './discovery';
-import { gpuDeviceMap, isRegisteredGpuProcess, projectGpuCsv, projectProcessGpu } from './gpu';
+import { gpuDeviceMap, isRegisteredGpuProcess, parseGpuNumeric, projectGpuCsv, projectProcessGpu } from './gpu';
 import {
   decodeFrames,
   encodeFrame,
@@ -49,6 +49,7 @@ export interface ChildLimits { timeoutMs?: number; stdoutLimitBytes?: number; st
 const STDERR_DIAGNOSTIC_LIMIT_BYTES = 4 * 1024;
 const SIGKILL_ESCALATION_MS = 1_500;
 const EPIPE_CLOSE_GRACE_MS = 20;
+const INITIAL_SSH_TIMEOUT_MS = 10_000;
 
 type FailureScope = 'host' | 'task' | 'request' | 'source';
 type FailurePhase =
@@ -125,6 +126,7 @@ export function classifyTransportFailure(
 
   if (
     diagnostic.includes('TM_ERR:REMOTE_PYTHON_UNAVAILABLE') ||
+    (targetKind === 'local' && (exitCode === 9009 || exitCode === 126 || exitCode === 127)) ||
     ((exitCode === 126 || exitCode === 127) && (lower.includes('python') || diagnostic.includes('TM_ERR:')))
   ) {
     return { code: 'REMOTE_PYTHON_UNAVAILABLE', errorScope: 'host', phase: 'python_start', diagnostic };
@@ -194,6 +196,7 @@ export function terminateProcessTree(child: any, options: { detached?: boolean; 
           const killer = nodeSpawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
             shell: false, stdio: 'ignore', windowsHide: true,
           });
+          killer.once('error', () => { try { child.kill(); } catch { /* exited */ } });
           killer.unref?.();
         } catch {
           try { child.kill(); } catch { /* ignore */ }
@@ -386,6 +389,11 @@ export function resolveWindowsNvidiaSmiPaths(env: NodeJS.ProcessEnv = process.en
   ];
 }
 
+function nvidiaCsvColumns(line: string): string[] {
+  return [...line.matchAll(/(?:^|,)\s*(?:"((?:[^"]|"")*)"|([^,]*))/g)]
+    .map(([, quoted, plain]) => quoted?.replace(/""/g, '"') ?? plain?.trim() ?? '');
+}
+
 async function windowsGpuObservation(
   signal: AbortSignal,
   spawnChild: SpawnLike,
@@ -395,18 +403,53 @@ async function windowsGpuObservation(
   const isRealSpawn = spawnChild === (nodeSpawn as unknown);
   const existing = isRealSpawn ? candidates.filter((c) => c === 'nvidia-smi.exe' || existsSync(c)) : [candidates[0]!];
   const ordered = existing.length > 0 ? existing : candidates;
-  const args = ['--query-gpu=index,uuid,utilization.gpu,memory.used,memory.total', '--format=csv,noheader,nounits'];
+  const baseFields = 'index,uuid,utilization.gpu,memory.used,memory.total';
+  const detailFields = baseFields + ',name,temperature.gpu,power.draw,power.limit,fan.speed,pci.bus_id,compute_mode,ecc.errors.uncorrected.aggregate.total';
+  const format = '--format=csv,noheader,nounits';
+  const limits = { timeoutMs: 2_000, stdoutLimitBytes: 32 * 1024, stderrLimitBytes: 4 * 1024 };
+  const query = (executable: string, args: string[]) => runBoundedChild(
+    executable, [...args, format], Buffer.alloc(0), signal, spawnChild, limits,
+  );
 
   let sawUnavailable = false;
   for (const executable of ordered) {
     try {
-      const result = await runBoundedChild(executable, args, Buffer.alloc(0), signal, spawnChild, {
-        timeoutMs: 2_000, stdoutLimitBytes: 16 * 1024, stderrLimitBytes: 4 * 1024,
-      });
+      let result = await query(executable, ['--query-gpu=' + detailFields]);
+      if (result.exitCode !== 0) result = await query(executable, ['--query-gpu=' + baseFields]);
       if (result.exitCode !== 0) return unavailableGpu('NVIDIA_SMI_FAILED', 'unavailable');
       const csv = result.stdout.toString('utf8');
-      onDevices?.(gpuDeviceMap(csv));
-      return projectGpuCsv(csv, new Date().toISOString());
+      const deviceMap = gpuDeviceMap(csv);
+      onDevices?.(deviceMap);
+      const processes = new Map<string, { pid: number; command: string; memoryMiB: number }[]>();
+      if (deviceMap.length > 0) {
+        // Windows process identities cannot be correlated to Linux /proc. Keep these at device scope.
+        try {
+          const apps = await query(executable, ['--query-compute-apps=pid,gpu_uuid,used_gpu_memory,process_name']);
+          if (apps.exitCode === 0) {
+            for (const line of apps.stdout.toString('utf8').split(/\r?\n/).slice(0, 512)) {
+              const [pidText, uuid, memory, ...name] = nvidiaCsvColumns(line);
+              const pid = Number(pidText);
+              if (!Number.isSafeInteger(pid) || pid <= 0 || !uuid || !deviceMap.some((device) => device.uuid === uuid)) continue;
+              const rows = processes.get(uuid) ?? [];
+              if (rows.length < 64) rows.push({ pid, command: name.join(', '), memoryMiB: parseGpuNumeric(memory ?? '') ?? 0 });
+              processes.set(uuid, rows);
+            }
+          }
+        } catch { /* Device telemetry remains available on drivers without compute-app support. */ }
+      }
+      const devices = deviceMap.map(({ index, uuid }) => {
+        const line = csv.split(/\r?\n/).find((row) => Number(row.split(',')[0]) === index && row.split(',')[1]?.trim() === uuid);
+        const cols = line ? nvidiaCsvColumns(line) : [];
+        return {
+          index, uuid, name: cols[5], utilizationPct: parseGpuNumeric(cols[2] ?? '', 100),
+          memoryUsedMiB: parseGpuNumeric(cols[3] ?? ''), memoryTotalMiB: parseGpuNumeric(cols[4] ?? ''),
+          temperatureC: parseGpuNumeric(cols[6] ?? ''), powerDrawW: parseGpuNumeric(cols[7] ?? ''),
+          powerLimitW: parseGpuNumeric(cols[8] ?? ''), fanSpeedPct: parseGpuNumeric(cols[9] ?? '', 100),
+          pciBusId: cols[10], computeMode: cols[11], eccErrors: parseGpuNumeric(cols[12] ?? ''),
+          activeProcesses: processes.get(uuid) ?? [],
+        };
+      });
+      return projectGpuCsv(csv, new Date().toISOString(), devices);
     } catch (error) {
       if (error instanceof Error && error.message === 'PROBE_TIMEOUT') {
         return unavailableGpu('NVIDIA_SMI_TIMEOUT', 'unavailable');
@@ -491,6 +534,9 @@ class PersistentHostSession {
   private stderrChunks: Buffer[] = [];
   private stderrBytes = 0;
   private alive = false;
+  private attemptIndex = 0;
+  private responded = false;
+  private dead = false;
   private closed = false;
   private lastExitError: Error | null = null;
   private readonly detached: boolean;
@@ -508,7 +554,6 @@ class PersistentHostSession {
     private readonly target: HostTarget,
     private readonly probeSource: string,
     private readonly spawnChild: SpawnLike,
-    private readonly onDead: () => void,
     private readonly platform: NodeJS.Platform = process.platform,
   ) {
     this.detached = spawnChild === (nodeSpawn as unknown) && platform !== 'win32';
@@ -518,7 +563,11 @@ class PersistentHostSession {
     return this.alive && !this.closed;
   }
 
-  async start(signal: AbortSignal, requestId: string): Promise<void> {
+  isUsable(): boolean {
+    return !this.dead && !this.closed;
+  }
+
+  private async start(signal: AbortSignal, requestId: string): Promise<void> {
     if (this.alive) return;
     if (signal.aborted) throw coded('PROBE_CANCELLED', 'request', 'connect', requestId, null);
 
@@ -526,31 +575,18 @@ class PersistentHostSession {
       await checkWslDistributionRunning(this.target.distribution, requestId, signal, this.spawnChild);
     }
 
-    const spec = commandSpecFor(this.target, { serve: true, platform: this.platform });
-    const attempts = [{ command: spec.command, args: spec.args }, ...(spec.fallbackCommands ?? [])];
+
     const spawnOpts = this.detached
       ? { shell: false as const, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true as const, detached: true }
       : { shell: false as const, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true as const };
 
-    let spawned: any = null;
-    let lastError: unknown = null;
-    for (const attempt of attempts) {
-      try {
-        spawned = this.spawnChild(attempt.command, attempt.args, spawnOpts);
-        break;
-      } catch (err) {
-        lastError = err;
-      }
-    }
-    if (!spawned) {
-      throw coded(
-        this.target.kind === 'local' ? 'REMOTE_PYTHON_UNAVAILABLE' : 'TRANSPORT_UNAVAILABLE',
-        'host',
-        this.target.kind === 'local' ? 'python_start' : 'connect',
-        requestId,
-        null,
-        lastError instanceof Error ? lastError.message : undefined,
-      );
+    if (this.closed || signal.aborted) throw coded(this.closed ? 'SESSION_CLOSED' : 'PROBE_CANCELLED');
+    const attempt = this.commandAttempts()[this.attemptIndex]!;
+    let spawned: ReturnType<SpawnLike>;
+    try {
+      spawned = this.spawnChild(attempt.command, attempt.args, spawnOpts);
+    } catch {
+      throw this.spawnError();
     }
 
     this.child = spawned;
@@ -561,7 +597,7 @@ class PersistentHostSession {
     this.decoder.reset();
 
     spawned.stdout.on('data', (chunk: Buffer | Uint8Array) => {
-      if (!this.alive) return;
+      if (this.child !== spawned || !this.alive) return;
       try {
         const frames = this.decoder.push(chunk);
         for (const frame of frames) {
@@ -574,6 +610,7 @@ class PersistentHostSession {
     });
 
     spawned.stderr.on('data', (chunk: Buffer | Uint8Array) => {
+      if (this.child !== spawned) return;
       const data = Buffer.from(chunk);
       if (this.stderrBytes < STDERR_DIAGNOSTIC_LIMIT_BYTES) {
         const take = Math.min(data.length, STDERR_DIAGNOSTIC_LIMIT_BYTES - this.stderrBytes);
@@ -583,11 +620,7 @@ class PersistentHostSession {
     });
 
     spawned.once('error', () => {
-      this.failSession(coded(
-        this.target.kind === 'local' ? 'REMOTE_PYTHON_UNAVAILABLE' : 'TRANSPORT_UNAVAILABLE',
-        'host',
-        this.target.kind === 'local' ? 'python_start' : 'connect',
-      ));
+      if (this.child === spawned) this.failSession(this.spawnError());
     });
 
     // Do not immediately overwrite close/stderr classification on EPIPE; let close arrive.
@@ -596,6 +629,7 @@ class PersistentHostSession {
     });
 
     spawned.once('close', (code: number | null) => {
+      if (this.child !== spawned) return;
       const stderrBuf = Buffer.concat(this.stderrChunks);
       if (this.closed) {
         this.cleanupAfterExit(coded('SESSION_CLOSED', 'host', 'connect'));
@@ -615,7 +649,19 @@ class PersistentHostSession {
     }
   }
 
+  private commandAttempts() {
+    const { command, args, fallbackCommands } = commandSpecFor(this.target, { serve: true, platform: this.platform });
+    return [{ command, args }, ...(fallbackCommands ?? [])];
+  }
+
+  private spawnError(): Error {
+    return this.target.kind === 'local'
+      ? coded('REMOTE_PYTHON_UNAVAILABLE', 'host', 'python_start')
+      : coded('TRANSPORT_UNAVAILABLE', 'host', 'connect');
+  }
+
   private handleFrame(frame: Buffer): void {
+    this.responded = true;
     let parsed: unknown;
     try {
       parsed = JSON.parse(frame.toString('utf8'));
@@ -660,7 +706,6 @@ class PersistentHostSession {
   }
 
   private cleanupAfterExit(error: Error): void {
-    const wasAlive = this.alive;
     this.alive = false;
     this.child = null;
     this.lastExitError = error;
@@ -676,7 +721,7 @@ class PersistentHostSession {
       ));
     }
     this.pending.clear();
-    if (wasAlive) this.onDead();
+    if (this.responded || error.message !== 'REMOTE_PYTHON_UNAVAILABLE') this.dead = true;
   }
 
   private failSession(error: Error): void {
@@ -686,7 +731,23 @@ class PersistentHostSession {
   }
 
   request(payload: Record<string, unknown>, signal: AbortSignal, timeoutMs = 8_000): Promise<unknown> {
-    const run = this.tail.catch(() => undefined).then(() => this.sendOnce(payload, signal, timeoutMs));
+    const run = this.tail.then(async () => {
+      const attempts = this.commandAttempts();
+      while (true) {
+        if (!this.isUsable()) throw this.lastExitError ?? coded('SESSION_CLOSED');
+        try {
+          return await this.sendOnce(payload, signal, timeoutMs);
+        } catch (error) {
+          if (signal.aborted || this.closed || this.responded || this.target.kind !== 'local' ||
+              !(error instanceof Error) || error.message !== 'REMOTE_PYTHON_UNAVAILABLE' ||
+              this.attemptIndex + 1 >= attempts.length) {
+            if (!this.alive && !signal.aborted) this.dead = true;
+            throw error;
+          }
+          this.attemptIndex++;
+        }
+      }
+    });
     this.tail = run.then(() => undefined, () => undefined);
     return run;
   }
@@ -695,9 +756,11 @@ class PersistentHostSession {
     const requestId = String(request.requestId ?? randomUUID());
     const sourceId = (request.sourceId as string | null) ?? null;
     if (signal.aborted) throw coded('PROBE_CANCELLED', 'request', 'probe', requestId, sourceId);
-    if (!this.alive) {
+    const connecting = !this.alive;
+    if (connecting) {
       await this.start(signal, requestId);
     }
+    if (signal.aborted) throw coded('PROBE_CANCELLED', 'request', 'probe', requestId, sourceId);
     if (!this.alive || !this.child) {
       if (this.lastExitError) {
         throw coded(
@@ -727,7 +790,7 @@ class PersistentHostSession {
         signal.removeEventListener('abort', abortListener);
         reject(coded('PROBE_TIMEOUT', 'host', 'probe', requestId, sourceId));
         this.failSession(coded('PROBE_TIMEOUT', 'host', 'probe', requestId, sourceId));
-      }, timeoutMs);
+      }, connecting && this.target.kind === 'ssh' && timeoutMs === 8_000 ? INITIAL_SSH_TIMEOUT_MS : timeoutMs);
       timer.unref?.();
       signal.addEventListener('abort', abortListener, { once: true });
       this.pending.set(requestId, { sourceId, resolve, reject, timer, abortListener, signal });
@@ -787,26 +850,13 @@ export class HostSessionPool {
     options: { timeoutMs?: number; platform?: NodeJS.Platform } = {},
   ): Promise<unknown> {
     const targetKey = this.sessionKey(hostId, target);
-    const existing = this.sessions.get(hostId);
-    if (existing && existing.targetKey !== targetKey) {
-      this.sessions.delete(hostId);
-      await existing.session.close();
-    }
     let entry = this.sessions.get(hostId);
-    if (!entry || !entry.session.isAlive()) {
-      const session = new PersistentHostSession(
-        target,
-        probeSource,
-        spawnChild,
-        () => {
-          if (this.sessions.get(hostId)?.session === session) {
-            this.sessions.delete(hostId);
-          }
-        },
-        options.platform,
-      );
+    if (!entry || entry.targetKey !== targetKey || !entry.session.isUsable()) {
+      const previous = entry;
+      const session = new PersistentHostSession(target, probeSource, spawnChild, options.platform);
       entry = { targetKey, session };
       this.sessions.set(hostId, entry);
+      void previous?.session.close();
     }
     return entry.session.request(request, signal, options.timeoutMs ?? 8_000);
   }
@@ -845,18 +895,33 @@ async function invokeOneShotScript(
   signal: AbortSignal,
   spawnChild: SpawnLike,
   limits: ChildLimits = {},
+  platform = process.platform,
 ): Promise<unknown> {
   const target = context.host.target;
   if (target.kind === 'wsl') {
     await checkWslDistributionRunning(target.distribution, String(request.requestId ?? '') || null, signal, spawnChild);
   }
-  const spec = commandSpecFor(target, { serve: false });
-  const input = encodeOneShotScript(script, request);
-  const child = await runBoundedChild(spec.command, spec.args, input, signal, spawnChild, limits);
-  if (child.exitCode !== 0 && child.stdout.length === 0) {
+  const spec = commandSpecFor(target, { serve: false, platform });
+  const scriptBytes = encodeOneShotScript(script, request);
+  const input = target.kind === 'local'
+    ? Buffer.concat([Buffer.from('import sys\nif sys.version_info < (3, 7): sys.exit(126)\n'), scriptBytes])
+    : scriptBytes;
+  const attempts = [{ command: spec.command, args: spec.args }, ...(spec.fallbackCommands ?? [])];
+  let child: BoundedChildResult | undefined;
+  for (const [index, attempt] of attempts.entries()) {
+    try {
+      child = await runBoundedChild(attempt.command, attempt.args, input, signal, spawnChild, limits);
+    } catch (error) {
+      if (target.kind !== 'local' || !(error instanceof Error) || error.message !== 'TRANSPORT_UNAVAILABLE') throw error;
+      if (index === attempts.length - 1) throw coded('REMOTE_PYTHON_UNAVAILABLE', 'host', 'python_start');
+      continue;
+    }
+    if (child.exitCode === 0 || child.stdout.length > 0) break;
     const classified = classifyTransportFailure(target.kind, child.exitCode, child.stderr);
+    if (classified.code === 'REMOTE_PYTHON_UNAVAILABLE' && index + 1 < attempts.length) continue;
     throw coded(classified.code, classified.errorScope, classified.phase, String(request.requestId), (request.sourceId as string | null) ?? null, classified.diagnostic);
   }
+  if (!child) throw coded('REMOTE_PYTHON_UNAVAILABLE', 'host', 'python_start');
   const frames = decodeFrames(child.stdout);
   if (frames.length !== 1) throw coded('PROTOCOL_FRAME_COUNT_INVALID');
   let parsed: unknown;
@@ -951,7 +1016,8 @@ export function projectTaskObservation(task: TaskRegistration, payload: unknown,
   const rawCp = data.checkpointScan && typeof data.checkpointScan === 'object' ? data.checkpointScan as Record<string, unknown> : null;
   let checkpointScan: TaskObservation['checkpointScan'] = null;
   if (rawCp) {
-    const rawLatest = rawCp.latest && typeof rawCp.latest === 'object' ? rawCp.latest as Record<string, unknown> : null;
+    const latest = rawCp.checkpoint ?? rawCp.latest;
+    const rawLatest = latest && typeof latest === 'object' ? latest as Record<string, unknown> : null;
     const latestId = rawLatest?.fileIdentity && typeof rawLatest.fileIdentity === 'object'
       ? rawLatest.fileIdentity as Record<string, unknown>
       : null;
@@ -1318,7 +1384,7 @@ export function createTransport(context: TransportHostContext, options: CreateTr
       gpuHostBootId = null;
       lastAcceleratorAvailability = undefined;
       try {
-        const { host } = await currentContext();
+        const { registry, host } = await currentContext();
         if (!host.enabled) {
           return { hostId: host.hostId, freshness: 'unobserved', observedAt: null, phase: null, connection: 'unobserved', scanComplete: false, hostBootId: null, errorCode: 'HOST_DISABLED' };
         }
@@ -1330,8 +1396,9 @@ export function createTransport(context: TransportHostContext, options: CreateTr
           op: 'probe_host',
           includeGpu: !useWindowsNvidia,
           includeGpuDetails: !useWindowsNvidia,
-          includeSystem: true,
-          diskPaths: host.allowedRoots,
+          includeSystemHealth: true,
+          diskPaths: [...new Set(registry.tasks.filter((task) => task.hostId === host.hostId && task.enabled)
+            .flatMap((task) => pathScopes(host, task).taskAllowedDirectories))],
         }, signal);
         const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
         return await projectHostData(host, data, signal);
@@ -1386,8 +1453,8 @@ export function createTransport(context: TransportHostContext, options: CreateTr
           includeGpu: !useWindowsNvidia,
           includeGpuDetails: !useWindowsNvidia,
           includeProcessGpu: !useWindowsNvidia,
-          includeSystem: true,
-          diskPaths: host.allowedRoots,
+          includeSystemHealth: true,
+          diskPaths: [...new Set(eligibleTasks.flatMap(({ task }) => pathScopes(host, task).taskAllowedDirectories))],
           proc: { root: '/proc' },
           tasks: eligibleTasks.map((item) => item.requestTask),
         }, signal);
@@ -1499,29 +1566,22 @@ export function createTransport(context: TransportHostContext, options: CreateTr
       if (!options.launcherSource) {
         return { ok: false, action, taskId: task.taskId, pidsSignaled: [], errorCode: 'LAUNCHER_UNAVAILABLE', message: 'Launcher source is unavailable.' };
       }
-      if (action === 'restart') {
-        if (processKeys.length > 0) {
-          await invokeOneShotScript({ ...context, host, registry }, options.launcherSource, {
-            version: PROTOCOL_VERSION,
-            requestId: randomUUID(),
-            sourceId: null,
-            op: 'signal_task',
-            action: 'stop',
-            processKeys,
-          }, signal, spawnChild, { timeoutMs: 10_000 });
-        }
-        return { ok: true, action: 'restart', taskId: task.taskId, pidsSignaled: processKeys.map((k) => k.pid), errorCode: null, message: 'Stop signal sent for restart.' };
+      if (action === 'restart' && processKeys.length === 0) {
+        return { ok: true, action, taskId: task.taskId, pidsSignaled: [], errorCode: null, message: 'No known process to stop.' };
       }
       const data = await invokeOneShotScript({ ...context, host, registry }, options.launcherSource, {
         version: PROTOCOL_VERSION,
         requestId: randomUUID(),
         sourceId: null,
         op: 'signal_task',
-        action,
+        action: action === 'restart' ? 'stop' : action,
         processKeys,
-      }, signal, spawnChild, { timeoutMs: 10_000 }) as Record<string, unknown>;
+      }, signal, spawnChild, { timeoutMs: 10_000 }, platform) as Record<string, unknown>;
+      if (typeof data?.ok !== 'boolean' || !Array.isArray(data.pidsSignaled) ||
+          (data.ok && (data.pidsSignaled.length === 0 || data.errorCode !== null)) ||
+          data.pidsSignaled.some((pid) => !processKeys.some((key) => key.pid === pid))) throw coded('PROTOCOL_INVALID');
       return {
-        ok: data?.ok === true,
+        ok: data.ok,
         action,
         taskId: task.taskId,
         pidsSignaled: Array.isArray(data?.pidsSignaled) ? data.pidsSignaled.filter((n): n is number => typeof n === 'number') : [],
@@ -1529,14 +1589,25 @@ export function createTransport(context: TransportHostContext, options: CreateTr
         message: data?.ok === true ? `Signal ${action} sent.` : (typeof data?.errorCode === 'string' ? data.errorCode : 'SIGNAL_FAILED'),
       };
     },
-    async launchTask(task, armId, configHash, signal) {
+    async launchTask(task, armId, configHash, signal, launchOptions) {
       const { registry, host } = await currentContext();
       const registered = registry.tasks.find(item => item.taskId === task.taskId);
-      if (!host.enabled || !registered?.enabled || registered.hostId !== host.hostId || fingerprint(task, host) !== fingerprint(registered, host) || !registered.autoStart?.enabled || registered.autoStart.armId !== armId) throw coded('REGISTRY_CHANGED');
+      if (!host.enabled || !registered?.enabled || registered.hostId !== host.hostId || fingerprint(task, host) !== fingerprint(registered, host) || !registered.autoStart?.enabled ||
+          (launchOptions?.restart ? host.allowJobControl !== true || !/^[a-f0-9-]{36}$/.test(armId) ||
+            registered.autoStart.armId === armId : registered.autoStart.armId !== armId)) throw coded('REGISTRY_CHANGED');
       const config = registered.autoStart;
       const scopes = pathScopes(host, registered);
-      if (!scopes.taskAllowedDirectories.length || !options.launcherSource || !gpuHostBootId || !/^[a-f0-9]{64}$/.test(configHash)) throw coded('LAUNCH_SERVICE_UNAVAILABLE');
-      const gpuDevices = config.gpuDeviceIds.map(deviceId => {
+      if (!scopes.taskAllowedDirectories.length || !options.launcherSource || !/^[a-f0-9]{64}$/.test(configHash)) throw coded('LAUNCH_SERVICE_UNAVAILABLE');
+      if (!gpuHostBootId && launchOptions?.restart) await this.probeHost(signal);
+      if (!gpuHostBootId) throw coded('LAUNCH_SERVICE_UNAVAILABLE');
+      const requiredGpuCount = config.requiredGpuCount ?? 1;
+      const deviceIds = config.gpuDeviceIds.length > 0 ? config.gpuDeviceIds : devices
+        .slice().sort((a, b) => a.index - b.index)
+        .map((device) => `GPU ${device.index}`)
+        .filter((id) => !config.gpuExcludeIds?.includes(id))
+        .slice(0, requiredGpuCount);
+      if (deviceIds.length < requiredGpuCount) throw coded('GPU_IDENTITY_UNAVAILABLE');
+      const gpuDevices = deviceIds.map(deviceId => {
         const device = devices.find(item => `GPU ${item.index}` === deviceId);
         if (!device) throw coded('GPU_IDENTITY_UNAVAILABLE');
         return { deviceId, uuid: device.uuid };
@@ -1551,6 +1622,10 @@ export function createTransport(context: TransportHostContext, options: CreateTr
         taskId: task.taskId,
         configHash,
         ...scopes,
+        ...(host.stateDir ? { stateDir: host.stateDir } : {}),
+        cudaVisibleDevicesMode: config.cudaVisibleDevicesMode ?? 'index',
+        useSupervisor: true,
+        useLocalLocks: true,
         entryPaths: registered.entryPaths,
         sources: registered.sources,
         launch: config.launch,
@@ -1560,7 +1635,7 @@ export function createTransport(context: TransportHostContext, options: CreateTr
         ...(config.minFreeMemoryMiB ? { minFreeMemoryMiB: config.minFreeMemoryMiB } : {}),
         ...(config.minFreeDiskMiB ? { minFreeDiskMiB: config.minFreeDiskMiB } : {}),
         ...(config.gpuSharing ? { gpuSharing: config.gpuSharing } : {}),
-      }, signal, spawnChild, { timeoutMs: 15_000 }) as Record<string, unknown>;
+      }, signal, spawnChild, { timeoutMs: 15_000 }, platform) as Record<string, unknown>;
       if (!data || !['started', 'busy', 'already_running', 'failed'].includes(String(data.status)) ||
           !(data.pid === null || (Number.isSafeInteger(data.pid) && Number(data.pid) > 0)) || !(data.startedAt === null || iso(data.startedAt)) ||
           !(data.errorCode === null || (typeof data.errorCode === 'string' && /^[A-Z0-9_]{1,128}$/.test(data.errorCode))) ||

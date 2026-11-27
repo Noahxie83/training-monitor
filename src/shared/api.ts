@@ -78,6 +78,7 @@ export interface ExportLogsQuery {
 }
 
 export interface ExportLogsResult {
+  cancelled?: boolean;
   exportedCount: number;
   path: string | null;
 }
@@ -145,6 +146,7 @@ export interface CopyCommandRequest {
 /** Native window and host-environment actions are separate from the portable monitor data API. */
 export interface DesktopApi {
   openGpuWindow(hostId?: string): Promise<void>;
+  clearAlerts?(): Promise<void>;
   setActiveTask?(taskId: string | null): Promise<void>;
   copyDiagnosticText?(text: string): Promise<void>;
   onGpuHostSelected(listener: (hostId: string) => void): () => void;

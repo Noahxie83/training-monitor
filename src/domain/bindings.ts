@@ -22,10 +22,11 @@ export interface ActiveWriterWindow {
   fromOffset: Bytes;
   throughOffset: Bytes;
   isOpen: boolean;
-  mainProcessKey: ProcessKey;
+  mainProcessKey: ProcessKey | null;
   runId: string;
   fileIdentity: { dev: string; inode: string } | null;
   algorithm?: ParserKind;
+  evidenceKind?: RunBinding["evidenceKind"];
   activeBindingId?: string | null;
 }
 
@@ -51,7 +52,7 @@ export interface BindingState {
 export interface BindingPoll {
   taskId: string;
   runId: string;
-  mainProcessKey: ProcessKey;
+  mainProcessKey: ProcessKey | null;
   windowId: string;
   openingId: string;
   sourceId: string;
@@ -122,7 +123,7 @@ export interface BindingObservation {
   observerEpoch: string;
   observedAt: string;
   taskObservation: TaskObservation;
-  sourceInfo: Record<string, { generation: string; eofBytes: Bytes; fileIdentity: { dev: string; inode: string } | null }>;
+  sourceInfo: Record<string, { generation: string; eofBytes: Bytes; fileIdentity: { dev: string; inode: string } | null; committedOffset?: Bytes }>;
   outputSamples: Record<string, TrainerOutputObservation>;
 }
 
@@ -134,6 +135,8 @@ export interface TrainerOutputObservation {
   endOffset: Bytes;
   /** Raw LF, CRLF, or CR bytes decoded out of the displayed record text. */
   terminatorBytes?: 0 | 1 | 2;
+  frameStartOffset?: Bytes;
+  rawAnsi?: string | null;
   observedAt: string;
   text: string;
 }
@@ -430,6 +433,10 @@ function retainBaselineRead(
   };
 }
 
+export function sameBindingProcess(a: ProcessKey | null, b: ProcessKey | null): boolean {
+  return (a === null && b === null) || areProcessKeysEqual(a, b);
+}
+
 export function resolveTaskPolicy(
   input: BindingObservation,
   state: BindingState
@@ -485,7 +492,7 @@ export function findSubstantiveTrainerProcess(
   if (!taskObservation || taskObservation.taskId !== task.taskId || taskObservation.hostId !== task.hostId) return null;
   if (obsTime === null) return null;
   if (!isTimestampValid(taskObservation.observedAt, obsTime)) return null;
-  if (taskObservation.freshness !== "fresh" || taskObservation.scanComplete !== true) return null;
+  if (taskObservation.freshness !== "fresh" || taskObservation.scanComplete !== true || taskObservation.processScanError !== null) return null;
   if (taskObservation.errorCode !== null && taskObservation.errorScope !== "source") return null;
   if (!Array.isArray(task.entryPaths) || task.entryPaths.length === 0) return null;
   const parser = taskParser(task);
@@ -542,8 +549,10 @@ export function findSubstantiveTrainerProcess(
         if (typeof text !== "string" || text.length === 0 || text.length > 65536) return false;
         const terminatorBytes = sample.terminatorBytes ?? 0;
         if (!Number.isInteger(terminatorBytes) || terminatorBytes < 0 || terminatorBytes > 2) return false;
-        if (BigInt(new TextEncoder().encode(text).length) + BigInt(terminatorBytes) !==
-            BigInt(sample.endOffset) - BigInt(sample.startOffset)) return false;
+        const frameStart = parseSafeBigInt(sample.frameStartOffset ?? sample.startOffset);
+        if (frameStart === null || frameStart < BigInt(sample.startOffset) ||
+            BigInt(new TextEncoder().encode(sample.rawAnsi ?? text).length) + BigInt(terminatorBytes) !==
+              BigInt(sample.endOffset) - frameStart) return false;
         if (!parseRegisteredRecord(task, text, sid).isTrainingOutput) return false;
       }
 
@@ -575,8 +584,12 @@ export function findLiveAttributedProcess(
   if (!isRuntimeTaskPolicy(task)) return empty;
   if (!taskObservation || taskObservation.taskId !== task.taskId || taskObservation.hostId !== task.hostId) return empty;
   if (obsTime === null || !isTimestampValid(taskObservation.observedAt, obsTime)) return empty;
-  if (taskObservation.freshness !== "fresh" || taskObservation.scanComplete !== true) return empty;
-  if (taskObservation.errorCode !== null && taskObservation.errorScope !== "source") return empty;
+  const logOnly: AttributedProcessMatch = task.attributionMode === "log_only" && options?.logOnlyActive
+    ? { ...empty, attributionConfidence: "log_only" }
+    : empty;
+  if (taskObservation.freshness !== "fresh") return empty;
+  if (taskObservation.scanComplete !== true || taskObservation.processScanError !== null ||
+      (taskObservation.errorCode !== null && taskObservation.errorScope !== "source")) return logOnly;
 
   const procs = taskObservation.processes || [];
   const collectTree = (primary: TaskProcessObservation): TaskProcessObservation[] => {
@@ -633,17 +646,7 @@ export function findLiveAttributedProcess(
     }
   }
 
-  // Tier 3: Log-only mode (explicitly opted in when /proc cannot reach container/Slurm job)
-  if (task.attributionMode === "log_only" && options?.logOnlyActive) {
-    return {
-      primary: null,
-      treeMembers: [],
-      attributionConfidence: "log_only",
-      substantive: false,
-    };
-  }
-
-  return empty;
+  return logOnly;
 }
 
 export function updateBindings(state: BindingState, input: BindingObservation): BindingState {
@@ -680,14 +683,14 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
   const obsTime = parseIsoMs(observedAt);
   const taskTimeValid = isTimestampValid(taskObservation.observedAt, obsTime);
 
+  const canBindLogOnly = task.attributionMode === "log_only" && taskObservation.freshness === "fresh";
   // Preconditions on input
   if (
     !observerEpoch ||
     observerEpoch.trim() === "" ||
     !taskTimeValid ||
-    taskObservation.freshness !== "fresh" ||
-    taskObservation.scanComplete !== true ||
-    (taskObservation.errorCode !== null && taskObservation.errorScope !== "source")
+    (!canBindLogOnly && (taskObservation.freshness !== "fresh" || taskObservation.scanComplete !== true ||
+      (taskObservation.errorCode !== null && taskObservation.errorScope !== "source")))
   ) {
     for (const w of nextWindows) {
       w.isOpen = false;
@@ -757,11 +760,19 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     }
   }
 
-  // Find confirmed substantive trainer process (or primary root of a single DDP tree)
-  const trainerProc = findSubstantiveTrainerProcess(task, taskObservation, obsTime, input.outputSamples, sourceInfo);
+  const match = findLiveAttributedProcess(task, taskObservation, obsTime, input.outputSamples, sourceInfo,
+    { logOnlyActive: canBindLogOnly });
+  const trainerProc = match.primary;
+  const continuingDirectWriter = match.attributionConfidence === "confirmed_process" &&
+    retainedWindows.some((window) => window.isOpen && window.observerEpoch === observerEpoch &&
+      (window.evidenceKind ?? "observed_direct_writer") === "observed_direct_writer" &&
+      areProcessKeysEqual(window.mainProcessKey, trainerProc?.key));
+  const evidenceKind = match.substantive || continuingDirectWriter ? "observed_direct_writer" :
+    match.attributionConfidence === "inferred_tree" ? "inferred_tree" :
+    match.attributionConfidence === "log_only" ? "log_only" : null;
+  const mainKey = trainerProc?.key ?? null;
 
-  // Multiple unrelated trees or zero trainer candidates cannot confirm an active writer window
-  if (!trainerProc) {
+  if (!evidenceKind) {
     for (const w of nextWindows) {
       w.isOpen = false;
     }
@@ -785,7 +796,21 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     };
   }
 
-  const currentRunId = makeRunId(hostId, taskId, trainerProc.key);
+  const currentRunId = mainKey
+    ? makeRunId(hostId, taskId, mainKey)
+    : state.activeMainKey === null && state.observerEpoch === observerEpoch && state.activeRunId
+      ? state.activeRunId
+      : ["log", hostId, taskId, observerEpoch, observedAt].join(":");
+  const canUseSource = (src: TaskObservation["sources"][number]): boolean => {
+    if (evidenceKind === "observed_direct_writer") {
+      return Boolean(trainerProc?.directWriterSourceIds?.includes(src.sourceId)) &&
+        witnessMatchesSource(trainerProc?.writerSourceEvidence?.[src.sourceId], src);
+    }
+    const writers = writersPerSource.get(src.sourceId) ?? [];
+    return evidenceKind === "log_only" || writers.every((writer) =>
+      sameBindingProcess(writer.key, mainKey) ||
+      match.treeMembers.some((member) => areProcessKeysEqual(writer.key, member.key)));
+  };
   const instanceChanged = state.activeRunId !== null && state.activeRunId !== currentRunId;
   const epochChanged = state.observerEpoch !== null && state.observerEpoch !== observerEpoch;
   const taskChanged = state.taskId !== null && state.taskId !== taskId;
@@ -797,10 +822,9 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     }
   }
 
-  const sameRun = state.activeRunId === currentRunId && state.activeMainKey !== null &&
-    areProcessKeysEqual(state.activeMainKey, trainerProc.key);
-  const retainedBaselineRead = sameRun
-    ? retainBaselineRead(state.baselineRead, task, trainerProc.key, observedAt)
+  const sameRun = state.activeRunId === currentRunId && sameBindingProcess(state.activeMainKey, mainKey);
+  const retainedBaselineRead = sameRun && mainKey
+    ? retainBaselineRead(state.baselineRead, task, mainKey, observedAt)
     : null;
   if (!sameRun) {
     nextBindings.splice(0, nextBindings.length);
@@ -832,13 +856,7 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
       continue;
     }
 
-    if (!trainerProc.directWriterSourceIds?.includes(w.sourceId)) {
-      w.isOpen = false;
-      continue;
-    }
-
-    const witness = trainerProc.writerSourceEvidence?.[w.sourceId];
-    if (!witnessMatchesSource(witness, src)) {
+    if ((w.evidenceKind ?? "observed_direct_writer") !== evidenceKind || !canUseSource(src)) {
       w.isOpen = false;
       continue;
     }
@@ -878,12 +896,12 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
       const updatedBinding: RunBinding = {
         bindingId,
         runId: currentRunId,
-        mainProcessKey: trainerProc.key,
+        mainProcessKey: mainKey,
         sourceId: w.sourceId,
         generation: w.generation,
         fromOffset: w.fromOffset,
         throughOffset: w.throughOffset,
-        evidenceKind: "observed_direct_writer",
+        evidenceKind,
         observerEpoch,
         observedAt,
       };
@@ -903,6 +921,7 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
       continue;
     }
     const gen = info.generation;
+    if (evidenceKind !== "observed_direct_writer" && !info.fileIdentity) continue;
     if (!isValidDecimalBytes(src.eofBytes)) {
       continue;
     }
@@ -932,10 +951,6 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
       continue;
     }
 
-    if (!trainerProc.directWriterSourceIds?.includes(sourceId)) {
-      continue;
-    }
-
     const regSource = task.sources.find((s) => s.sourceId === sourceId);
     if (!regSource || regSource.kind !== "log") {
       continue;
@@ -953,10 +968,11 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
       continue;
     }
 
-    const witness = trainerProc.writerSourceEvidence?.[sourceId];
-    if (!witnessMatchesSource(witness, src)) {
-      continue;
-    }
+    if (!canUseSource(src) || (evidenceKind === "observed_direct_writer" && !match.substantive)) continue;
+    const committed = parseSafeBigInt(info.committedOffset);
+    const fromOffset = evidenceKind !== "observed_direct_writer" && committed !== null && committed <= BigInt(src.eofBytes)
+      ? committed.toString()
+      : src.eofBytes;
 
     nextOpeningSeq += 1;
     const openingId = ["open", currentRunId, sourceId, observerEpoch, nextOpeningSeq].join(":");
@@ -968,10 +984,11 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
       sourceId,
       generation: gen,
       observerEpoch,
-      fromOffset: src.eofBytes,
+      fromOffset,
+      evidenceKind,
       throughOffset: src.eofBytes,
       isOpen: true,
-      mainProcessKey: trainerProc.key,
+      mainProcessKey: mainKey,
       runId: currentRunId,
       fileIdentity: { dev: src.fileIdentity.dev, inode: src.fileIdentity.inode },
       algorithm: taskParser(task),
@@ -998,12 +1015,11 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
   for (const window of nextWindows) {
     if (!window.isOpen || window.runId !== currentRunId || window.observerEpoch !== observerEpoch) continue;
     const source = taskObservation.sources.find((candidate) => candidate.sourceId === window.sourceId);
-    const writer = trainerProc.writerSourceEvidence?.[window.sourceId];
-    if (!source || !writer || !witnessMatchesSource(writer, source) ||
+    if (!source || !canUseSource(source) ||
         !source.fileIdentity ||
         !isValidDecimalBytes(source.eofBytes) || !isTimestampValid(source.observedAt, obsTime)) continue;
     polls.push({
-      taskId, runId: currentRunId, mainProcessKey: trainerProc.key, windowId: window.windowId,
+      taskId, runId: currentRunId, mainProcessKey: mainKey, windowId: window.windowId,
       openingId: window.openingId, sourceId: window.sourceId, generation: window.generation,
       observerEpoch, fileIdentity: { dev: source.fileIdentity.dev, inode: source.fileIdentity.inode },
       eofBytes: source.eofBytes, observedAt, sourceObservedAt: source.observedAt ?? undefined,
@@ -1015,7 +1031,7 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
     registeredTask: task,
     algorithm: taskParser(task),
     activeRunId: currentRunId,
-    activeMainKey: trainerProc.key,
+    activeMainKey: mainKey,
     observerEpoch,
     openingSeq: nextOpeningSeq,
     windows: nextWindows,
@@ -1029,7 +1045,7 @@ export function updateBindings(state: BindingState, input: BindingObservation): 
 }
 
 export function bindCompleteRecord(event: LogEvent, state: BindingState): LogEvent {
-  if (event.recordComplete !== true || event.prefixIncomplete === true) {
+  if (event.recordComplete !== true || event.prefixIncomplete === true || event.reason === "invalid_utf8") {
     return { ...event, runId: null, bindingId: null };
   }
 
@@ -1037,13 +1053,13 @@ export function bindCompleteRecord(event: LogEvent, state: BindingState): LogEve
     return { ...event, runId: null, bindingId: null };
   }
 
-  const evStart = parseSafeBigInt(event.startOffset);
+  const evStart = parseSafeBigInt(event.frameStartOffset ?? event.startOffset);
   const evEnd = parseSafeBigInt(event.endOffset);
-  if (evStart === null || evEnd === null || evStart >= evEnd) {
+  if (evStart === null || evEnd === null || evStart < BigInt(event.startOffset) || evStart >= evEnd) {
     return { ...event, runId: null, bindingId: null };
   }
 
-  if (!state.activeRunId || !state.activeMainKey || !state.observerEpoch) {
+  if (!state.activeRunId || !state.observerEpoch) {
     return { ...event, runId: null, bindingId: null };
   }
 
@@ -1101,7 +1117,8 @@ export function bindCompleteRecord(event: LogEvent, state: BindingState): LogEve
     if (activeWin.activeBindingId && b.bindingId !== activeWin.activeBindingId) return false;
     if (revokedBindingIds.includes(b.bindingId)) return false;
     if (b.sourceId !== event.sourceId || b.generation !== event.generation) return false;
-    if (b.runId !== state.activeRunId || !areProcessKeysEqual(b.mainProcessKey, state.activeMainKey)) return false;
+    if (b.runId !== state.activeRunId || !sameBindingProcess(b.mainProcessKey, state.activeMainKey)) return false;
+    if (state.activeMainKey === null && (registeredTask.attributionMode !== "log_only" || b.evidenceKind !== "log_only")) return false;
     if (b.observerEpoch !== state.observerEpoch) return false;
     if (b.fromOffset !== activeWin.fromOffset) return false;
     const bFrom = parseSafeBigInt(b.fromOffset);
@@ -1138,7 +1155,7 @@ export function ingestCompleteRecord(event: LogEvent, state: BindingState): { st
   );
   const poll = matchingPolls[matchingPolls.length - 1];
   if (!poll) return { state, event: { ...affiliated, runId: null, bindingId: null } };
-  const next = [...records.filter((record) => record !== null && typeof record === "object" && record.eventId !== affiliated.eventId), affiliated].slice(-512);
+  const next = [...records.filter((record) => record !== null && typeof record === "object" && (record.eventId !== affiliated.eventId || record.endOffset !== affiliated.endOffset)), affiliated].slice(-512);
   return { state: { ...state, completeRecords: next }, event: affiliated };
 }
 

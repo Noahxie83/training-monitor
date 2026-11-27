@@ -61,16 +61,23 @@ export function buildHelperCommand(
   sessionName?: string | null,
 ): string {
   const sshArgs = sshTargetArgs(host).map((arg) => (/^[A-Za-z0-9_@.:/-]+$/.test(arg) ? arg : posixQuote(arg)));
-  const sshPrefix = host.target.kind === 'ssh' ? `ssh ${sshArgs.join(' ')}` : host.target.kind === 'wsl' ? `wsl -d ${host.target.distribution}` : '';
+  const sshPrefix = host.target.kind === 'ssh' ? `ssh ${sshArgs.join(' ')}` : host.target.kind === 'wsl' ? `wsl -d ${posixQuote(host.target.distribution)}` : '';
 
   if (kind === 'ssh') {
     return host.target.kind === 'ssh' ? `ssh -t ${sshArgs.join(' ')}` : sshPrefix || 'bash';
   }
   if (kind === 'tmux_attach') {
     const targetSession = sessionName || 'main';
-    const remoteCmd = `tmux attach -t ${posixQuote(targetSession)}`;
+    const managed = /^tm-wait-[a-f0-9]{40}$/.test(targetSession);
+    const attach = 'd=/tmp/training-monitor-$(id -u); ' +
+      'case "$XDG_RUNTIME_DIR" in /*) if [ "${#XDG_RUNTIME_DIR}" -lt 70 ] && ' +
+      '[ -S "$XDG_RUNTIME_DIR/training-monitor/tmux.sock" ]; then d="$XDG_RUNTIME_DIR/training-monitor"; fi;; esac; ' +
+      'exec tmux -S "$d/tmux.sock" attach -t "$1"';
+    const remoteCmd = managed
+      ? `sh -c ${posixQuote(attach)} _ ${posixQuote(targetSession)}`
+      : `tmux attach -t ${posixQuote(targetSession)}`;
     if (host.target.kind === 'ssh') return `ssh -t ${sshArgs.join(' ')} ${posixQuote(remoteCmd)}`;
-    if (host.target.kind === 'wsl') return `wsl -d ${host.target.distribution} -- ${remoteCmd}`;
+    if (host.target.kind === 'wsl') return `wsl -d ${posixQuote(host.target.distribution)} -- ${remoteCmd}`;
     return remoteCmd;
   }
   // tail_log
@@ -78,16 +85,16 @@ export function buildHelperCommand(
   const logPath = source?.path ?? '/var/log/train.log';
   const tailCmd = `tail -n 100 -f ${posixQuote(logPath)}`;
   if (host.target.kind === 'ssh') return `ssh ${sshArgs.join(' ')} ${posixQuote(tailCmd)}`;
-  if (host.target.kind === 'wsl') return `wsl -d ${host.target.distribution} -- ${tailCmd}`;
+  if (host.target.kind === 'wsl') return `wsl -d ${posixQuote(host.target.distribution)} -- ${tailCmd}`;
   return tailCmd;
 }
 
 /** Open a local OS terminal running read-only SSH / WSL / local shell without shell injection. */
-export function openLocalSshTerminal(
+export async function openLocalSshTerminal(
   host: HostRegistration,
   remoteCommand?: string,
   options: { platform?: NodeJS.Platform; spawn?: typeof nodeSpawn } = {},
-): { ok: boolean; command: string; error: string | null } {
+): Promise<{ ok: boolean; command: string; error: string | null }> {
   const platform = options.platform ?? process.platform;
   const spawnFn = options.spawn ?? nodeSpawn;
 
@@ -105,40 +112,43 @@ export function openLocalSshTerminal(
   }
   const command = argv.map((arg) => (/^[A-Za-z0-9_@.:/-]+$/.test(arg) ? arg : posixQuote(arg))).join(' ');
 
-  try {
-    if (platform === 'win32') {
-      const child = spawnFn('wt.exe', argv, { shell: false, detached: true, stdio: 'ignore' });
-      child.unref?.();
-      return { ok: true, command, error: null };
+  let terminals: [string, string[]][];
+  if (platform === 'win32') {
+    const quotePowerShell = (value: string) => "'" + value.replace(/'/g, "''") + "'";
+    const encoded = Buffer.from('& ' + argv.map(quotePowerShell).join(' '), 'utf16le').toString('base64');
+    terminals = [
+      ['wt.exe', argv],
+      ['powershell.exe', ['-NoProfile', '-NoExit', '-EncodedCommand', encoded]],
+    ];
+    if (argv.every((arg) => /^[A-Za-z0-9_@.:/\\ ,-]+$/.test(arg))) {
+      terminals.push(['cmd.exe', ['/d', '/k', ...argv]]);
     }
-    if (platform === 'darwin') {
-      const cmdLine = argv.map(posixQuote).join(' ');
-      const child = spawnFn('osascript', ['-e', `tell application "Terminal" to do script ${JSON.stringify(cmdLine)}`], {
-        shell: false,
-        detached: true,
-        stdio: 'ignore',
-      });
-      child.unref?.();
-      return { ok: true, command, error: null };
-    }
-    // Linux: try standard terminal emulators cleanly with shell: false
-    const terminals: [string, string[]][] = [
+  } else if (platform === 'darwin') {
+    const cmdLine = argv.map(posixQuote).join(' ');
+    terminals = [['osascript', ['-e', `tell application "Terminal" to do script ${JSON.stringify(cmdLine)}`]]];
+  } else {
+    terminals = [
       ['x-terminal-emulator', ['-e', ...argv]],
       ['gnome-terminal', ['--', ...argv]],
       ['konsole', ['-e', ...argv]],
       ['xterm', ['-e', ...argv]],
     ];
-    for (const [bin, args] of terminals) {
-      try {
-        const child = spawnFn(bin, args, { shell: false, detached: true, stdio: 'ignore' });
-        child.unref?.();
-        return { ok: true, command, error: null };
-      } catch {
-        continue;
-      }
-    }
-    return { ok: false, command, error: 'NO_TERMINAL_EMULATOR' };
-  } catch (error) {
-    return { ok: false, command, error: error instanceof Error ? error.message : 'TERMINAL_SPAWN_FAILED' };
   }
+
+  for (const [bin, args] of terminals) {
+    try {
+      const child = spawnFn(bin, args, { shell: false, detached: true, stdio: 'ignore' });
+      const started = await new Promise<boolean>((resolve) => {
+        child.once('error', () => resolve(false));
+        child.once('spawn', () => resolve(true));
+      });
+      if (started) {
+        child.unref();
+        return { ok: true, command, error: null };
+      }
+    } catch {
+      continue;
+    }
+  }
+  return { ok: false, command, error: 'NO_TERMINAL_EMULATOR' };
 }

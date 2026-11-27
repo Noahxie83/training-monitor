@@ -100,21 +100,30 @@ type WindowLoadObserver = (loading: Promise<void>) => void;
 function initialGeometry(kind: Surface, saved?: WindowBounds): BrowserWindowConstructorOptions {
   const gpu = kind === 'gpu';
   const primary = screen.getPrimaryDisplay().workArea;
-  const display = saved && screen.getAllDisplays().find(({ workArea }) =>
-    saved.x >= workArea.x && saved.y >= workArea.y &&
-    saved.x + saved.width <= workArea.x + workArea.width &&
-    saved.y + saved.height <= workArea.y + workArea.height,
-  );
+  let display: Electron.Display | undefined;
+  let largestOverlap = 4_999;
+  if (saved) {
+    for (const candidate of screen.getAllDisplays()) {
+      const area = candidate.workArea;
+      const overlapWidth = Math.max(0, Math.min(saved.x + saved.width, area.x + area.width) - Math.max(saved.x, area.x));
+      const overlapHeight = Math.max(0, Math.min(saved.y + saved.height, area.y + area.height) - Math.max(saved.y, area.y));
+      const overlap = overlapWidth * overlapHeight;
+      if (overlap > largestOverlap) {
+        largestOverlap = overlap;
+        display = candidate;
+      }
+    }
+  }
   const workArea = display ? display.workArea : primary;
   const minWidth = Math.min(gpu ? 640 : 960, workArea.width);
   const minHeight = Math.min(gpu ? 480 : 600, workArea.height);
   const width = Math.min(workArea.width, Math.max(minWidth, saved?.width ?? (gpu ? 980 : 1280)));
   const height = Math.min(workArea.height, Math.max(minHeight, saved?.height ?? (gpu ? 720 : 800)));
   const x = display && saved
-    ? Math.min(saved.x, workArea.x + workArea.width - width)
+    ? Math.max(workArea.x, Math.min(saved.x, workArea.x + workArea.width - width))
     : workArea.x + Math.floor((workArea.width - width) / 2);
   const y = display && saved
-    ? Math.min(saved.y, workArea.y + workArea.height - height)
+    ? Math.max(workArea.y, Math.min(saved.y, workArea.y + workArea.height - height))
     : workArea.y + Math.floor((workArea.height - height) / 2);
   return { x, y, width, height, minWidth, minHeight };
 }

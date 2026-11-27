@@ -92,6 +92,14 @@ function ensureBaseTables(db: DatabaseSync): void {
       PRIMARY KEY(source_id, content_epoch)
     );
     CREATE INDEX IF NOT EXISTS content_changes_range ON content_changes(source_id, event_seq, content_epoch);
+    CREATE TABLE IF NOT EXISTS pending_remote_cancels (
+      host_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      arm_id TEXT NOT NULL,
+      config_hash TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY (host_id, task_id, arm_id, config_hash)
+    );
     CREATE TABLE IF NOT EXISTS observation_snapshot (
       task_id TEXT PRIMARY KEY,
       snapshot_json TEXT NOT NULL

@@ -227,6 +227,8 @@ export interface LogEvent {
   ingestedAt: string;
   text: string | null;
   rawAnsi?: string | null;
+  /** Start of the displayed frame inside a logical CR-redrawn record. */
+  frameStartOffset?: Bytes;
   reason: string | null;
   displayTruncated: boolean;
   recordComplete: boolean | null;
@@ -248,6 +250,7 @@ export interface CursorState {
   anchors: { startOffset: Bytes; endOffset: Bytes; sha256: string }[];
   parserState: {
     recordStartOffset: Bytes;
+    frameStartOffset?: Bytes;
     pendingCR: boolean;
     utf8CarryBase64: string;
     boundedPreview: string;
@@ -260,7 +263,7 @@ export interface CursorState {
 export interface RunBinding {
   bindingId: string;
   runId: string;
-  mainProcessKey: ProcessKey;
+  mainProcessKey: ProcessKey | null;
   sourceId: string;
   generation: string;
   fromOffset: Bytes;

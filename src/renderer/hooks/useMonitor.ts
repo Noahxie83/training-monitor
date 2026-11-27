@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { projectRegistrySnapshot } from '../../shared/registry-snapshot';
 import type { MonitorSnapshot, MonitorUpdate } from '../../shared/api';
 import type { AlertEvent, Preferences, Registry } from '../../shared/contracts';
-import type { Locale } from '../i18n';
+import { translate, type Locale } from '../i18n';
 
 const MAX_RECENT_ALERTS = 50;
 
@@ -334,11 +334,18 @@ export function useMonitor() {
       setAnnouncement('登记配置已成功保存');
       return saved;
     } catch (err: any) {
-      const msg = err?.message || '保存登记配置失败，可能存在版本冲突或格式错误';
-      setRegistryError(msg);
+      const message = err?.message || '保存登记配置失败，可能存在版本冲突或格式错误';
+      const reconcile = /HOST_UNREACHABLE_RECONCILE:(\d+)/.exec(message);
+      if (reconcile) {
+        const localized = translate(preferences.locale ?? 'zh-CN', 'errors.HOST_UNREACHABLE_RECONCILE',
+          { taskCount: Number(reconcile[1]) });
+        setRegistryError(localized);
+        throw new Error(localized);
+      }
+      setRegistryError(message);
       throw err;
     }
-  }, []);
+  }, [preferences.locale]);
 
   const reloadRegistry = useCallback(async () => {
     setRegistryError(null);
@@ -369,11 +376,14 @@ export function useMonitor() {
     }
   }, []);
 
-  const markAlertsRead = useCallback(() => setUnreadAlertCount(0), []);
+  const markAlertsRead = useCallback(() => {
+    setUnreadAlertCount(0);
+    void window.desktop?.clearAlerts?.().catch(() => undefined);
+  }, []);
   const clearAlerts = useCallback(() => {
     setAlerts([]);
-    setUnreadAlertCount(0);
-  }, []);
+    markAlertsRead();
+  }, [markAlertsRead]);
 
   return {
     snapshot,

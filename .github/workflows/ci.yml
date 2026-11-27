@@ -32,7 +32,7 @@ jobs:
       - run: npm run test:unit
       - run: npm run test:python
       - run: npm run build
-      - run: xvfb-run -a npm run test:runtime
+      - run: xvfb-run -a -s '-screen 0 1920x1080x24' npm run test:runtime
       - name: Electron desktop and visual regression
         run: xvfb-run -a -s '-screen 0 1920x1080x24' sh -c 'openbox & npm run test:desktop'
       - run: npm run package:dir
@@ -41,7 +41,7 @@ jobs:
           cmp node_modules/electron/dist/chrome-sandbox release/linux-unpacked/chrome-sandbox
           sudo chown root:root release/linux-unpacked/chrome-sandbox
           sudo chmod 4755 release/linux-unpacked/chrome-sandbox
-      - run: xvfb-run -a npm run test:packaged
+      - run: xvfb-run -a -s '-screen 0 1920x1080x24' npm run test:packaged
 
   package-smoke:
     strategy:
@@ -56,7 +56,15 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Windows'
+        with:
+          python-version: '3.12'
       - run: npm ci
+      - run: npm run test:python
+        if: runner.os == 'Windows'
+      - run: npm run test:desktop
+        if: runner.os == 'Windows'
       - run: npm run test:runtime
       - run: npm run package:dir
         env:

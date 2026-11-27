@@ -1,10 +1,11 @@
+import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AlertEngine, buildWebhookPayload, dispatchWebhook } from '../../src/collector/alerts';
 import { createProductionApi } from '../../src/collector/service';
-import { appendJobControlAudit, buildHelperCommand } from '../../src/desktop/notifications';
+import { appendJobControlAudit, buildHelperCommand, openLocalSshTerminal } from '../../src/desktop/notifications';
 import { openStore } from '../../src/store/client';
 import type { AlertEvent, HostRegistration, JobControlAuditEntry, LogEvent, Registry, TaskSnapshot } from '../../src/shared/contracts';
 import type { Transport } from '../../src/transport/types';
@@ -36,7 +37,7 @@ function makeRunningSnap(step: number, gpuUtil: number, runId = 'run-1'): TaskSn
     resources: [{
       observedAt: '2026-11-26T00:00:00.000Z', freshness: 'fresh', source: 'nvidia-smi',
       name: 'gpu_utilization', unit: 'percent_device', value: gpuUtil,
-      scope: 'device', deviceId: 'GPU 0', processKey: null,
+      scope: 'process', deviceId: 'GPU 0', processKey: { hostBootId: 'b1', pid: 42, startTicks: '10' },
     }],
   };
 }
@@ -71,7 +72,7 @@ describe('Phase 2 AlertEngine, Webhooks, helper commands, and opt-in job control
     expect(received.filter((a) => a.kind === 'cuda_oom')).toHaveLength(1);
 
     // NaN loss
-    engine.inspectLogEvents('h1', 't1', [mkLog('e3', 'step=50 loss=nan lr=1e-4')]);
+    engine.inspectLogEvents('h1', 't1', [mkLog('e3', `{"loss": "NaN"}`)]);
     expect(received.filter((a) => a.kind === 'loss_nan_inf')).toHaveLength(1);
 
     // Stall detection: 15 minutes zero progress + GPU util < 2%
@@ -103,6 +104,45 @@ describe('Phase 2 AlertEngine, Webhooks, helper commands, and opt-in job control
     const webhookRes = await dispatchWebhook({ enabled: true, kind: 'slack', url: 'https://hooks.slack.com/t' }, sampleAlert, fetchMock);
     expect(webhookRes.ok).toBe(true);
     expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it('ignores host-wide utilization, CPU-only tasks and raw logs when checking for stalls', () => {
+    let nowMs = Date.parse('2026-11-26T00:00:00.000Z');
+    const engine = new AlertEngine({ clock: () => nowMs, getPreferences: () => ({ stallThresholdMinutes: 1 }) });
+    const cpu = makeRunningSnap(100, 0);
+    const raw = makeRunningSnap(100, 0);
+    raw.taskId = 'raw';
+    raw.progress.current = null;
+    raw.progress.lastStepIndex = null;
+    raw.progress.session.completedCount = null;
+    cpu.resources[0] = { ...cpu.resources[0]!, scope: 'device', deviceId: 'GPU 0', processKey: null };
+    engine.inspectTaskSnapshot(null, cpu);
+    engine.inspectTaskSnapshot(null, raw);
+    nowMs += 120_000;
+    expect(engine.inspectTaskSnapshot(cpu, cpu)).toEqual([]);
+    expect(engine.inspectTaskSnapshot(raw, raw)).toEqual([]);
+  });
+
+  it.each([
+    ['win32', ['wt.exe', 'powershell.exe', 'cmd.exe']],
+    ['linux', ['x-terminal-emulator', 'gnome-terminal', 'konsole', 'xterm']],
+  ] as const)('falls back after asynchronous %s terminal spawn errors', async (platform, terminalNames) => {
+    const spawn = vi.fn((name: string) => {
+      const child = Object.assign(new EventEmitter(), { unref: vi.fn() });
+      queueMicrotask(() => {
+        if (name === terminalNames.at(-1)) child.emit('spawn');
+        else child.emit('error', Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+      });
+      return child;
+    });
+    const host: HostRegistration = { hostId: 'h', label: 'Host', enabled: true, allowedRoots: ['/data'],
+      target: { kind: 'ssh', alias: 'test-host' } };
+    await expect(openLocalSshTerminal(host, undefined, { platform, spawn: spawn as never })).resolves
+      .toMatchObject({ ok: true, command: 'ssh -t test-host' });
+    expect(spawn.mock.calls.map(([name]) => name)).toEqual(terminalNames);
+    const attach = buildHelperCommand('tmux_attach', host, undefined, undefined, 'tm-wait-' + 'a'.repeat(40));
+    expect(attach).toContain('tmux -S');
+    expect(attach).toContain('/tmp/training-monitor-');
   });
 
   it('strictly denies remote controlTask when host.allowJobControl is false and audits allowed calls', async () => {

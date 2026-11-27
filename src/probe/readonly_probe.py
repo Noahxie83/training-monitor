@@ -257,7 +257,7 @@ def open_readonly(candidate, host_roots, task_directories=None, limit_bytes=MAX_
             return {"status": "permission_error", "errorCode": "NOT_A_REGULAR_FILE"}
         if after_resolve is not None:
             after_resolve(resolved)
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         # Open the resolved canonical target path (supporting symlinks like latest.log -> run.log
@@ -1050,6 +1050,8 @@ def scan_registered_processes(
         if isinstance(source, dict) and source.get("kind") == "log":
             src_path = source.get("resolvedPath") or source.get("path")
             if not isinstance(src_path, str):
+                continue
+            if source.get("observationErrorCode") == "SOURCE_MISSING":
                 continue
             expected = source_observations.get(src_path) if isinstance(source_observations, dict) else None
             if (
@@ -2243,7 +2245,7 @@ def _sample(path, host_roots, task_directories, expected_identity, start, length
         resolved = os.path.realpath(path)
         if hosts is None or not _path_in_scope(resolved, hosts, tasks):
             return False
-        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
         opened = os.fstat(fd)
         if _identity(opened) != expected_identity:
             return False
@@ -2328,7 +2330,7 @@ def _read_log(request):
     resolved_target = before.get("resolvedPath") or os.path.realpath(path)
     fd = None
     try:
-        fd = os.open(resolved_target, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(resolved_target, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
         opened = os.fstat(fd)
         if _identity(opened) != before["fileIdentity"]:
             return {"ok": False, "errorCode": "PATH_IDENTITY_CHANGED"}
@@ -2618,10 +2620,10 @@ class AcceleratorCollector:
     def is_available(self):
         return False
 
-    def collect_devices(self, include_free=False, include_details=False):
+    def collect_devices(self, include_free=False, include_details=False, proc_root="/proc"):
         raise NotImplementedError
 
-    def collect_process_usage(self, proc_root, boot_id, process_rows, gpu_devices):
+    def collect_process_usage(self, proc_root, boot_id, process_rows, gpu_devices, *, allow_cross_uid=False):
         return _process_gpu_payload("none", error_code=None)
 
 
@@ -2634,11 +2636,12 @@ class NvidiaCollector(AcceleratorCollector):
     def is_available(self):
         return bool(self._executable or _find_nvidia_smi())
 
-    def collect_devices(self, include_free=False, include_details=False):
-        return _query_linux_gpu(include_free=include_free, include_details=include_details)
+    def collect_devices(self, include_free=False, include_details=False, proc_root="/proc"):
+        return _query_linux_gpu(include_free=include_free, include_details=include_details,
+                                proc_root=proc_root, executable=self._executable)
 
-    def collect_process_usage(self, proc_root, boot_id, process_rows, gpu_devices):
-        return _sample_process_gpu(proc_root, boot_id, process_rows, gpu_devices)
+    def collect_process_usage(self, proc_root, boot_id, process_rows, gpu_devices, *, allow_cross_uid=False):
+        return _sample_process_gpu(proc_root, boot_id, process_rows, gpu_devices, allow_cross_uid=allow_cross_uid)
 
 
 class RocmCollector(AcceleratorCollector):
@@ -2647,7 +2650,7 @@ class RocmCollector(AcceleratorCollector):
     def is_available(self):
         return False
 
-    def collect_devices(self, include_free=False, include_details=False):
+    def collect_devices(self, include_free=False, include_details=False, proc_root="/proc"):
         return {"status": "none", "acceleratorAvailability": "none", "observedAt": None, "csv": None, "errorCode": None}
 
 
@@ -2657,7 +2660,7 @@ class AppleMpsCollector(AcceleratorCollector):
     def is_available(self):
         return False
 
-    def collect_devices(self, include_free=False, include_details=False):
+    def collect_devices(self, include_free=False, include_details=False, proc_root="/proc"):
         return {"status": "none", "acceleratorAvailability": "none", "observedAt": None, "csv": None, "errorCode": None}
 
 
@@ -2667,7 +2670,7 @@ class NoGpuFallbackCollector(AcceleratorCollector):
     def is_available(self):
         return True
 
-    def collect_devices(self, include_free=False, include_details=False):
+    def collect_devices(self, include_free=False, include_details=False, proc_root="/proc"):
         return {"status": "none", "acceleratorAvailability": "none", "observedAt": None, "csv": None, "errorCode": None}
 
 
@@ -2682,8 +2685,12 @@ def select_accelerator_collector():
     return NoGpuFallbackCollector()
 
 
+_WINDOWS_BOOT_ID = None
+
+
 def _read_host_boot_id(proc_root="/proc"):
-    if sys.platform.startswith("linux"):
+    global _WINDOWS_BOOT_ID
+    if sys.platform.startswith("linux") or proc_root != "/proc":
         with open(os.path.join(proc_root, "sys", "kernel", "random", "boot_id"), "r", encoding="ascii") as stream:
             boot_id = stream.read(128).strip()
         if not boot_id:
@@ -2699,9 +2706,12 @@ def _read_host_boot_id(proc_root="/proc"):
             pass
     if os.name == "nt":
         try:
-            uptime_ms = ctypes.windll.kernel32.GetTickCount64()
-            boot_sec = int(time.time() - uptime_ms / 1000.0)
-            return "win32-boot-" + str(boot_sec // 60)
+            if _WINDOWS_BOOT_ID is None:
+                tick_count = ctypes.windll.kernel32.GetTickCount64
+                tick_count.restype = ctypes.c_ulonglong
+                boot_sec = int(time.time() - tick_count() / 1000.0)
+                _WINDOWS_BOOT_ID = "win32-boot-" + str(boot_sec // 60)
+            return _WINDOWS_BOOT_ID
         except Exception:
             pass
     import socket
@@ -2714,14 +2724,9 @@ def _probe_task_impl(request, boot_id_override=None, gpu_devices_override=None):
     boot_id = boot_id_override
     if boot_id is None:
         try:
-            with open(os.path.join(proc_root, "sys", "kernel", "random", "boot_id"), "r", encoding="ascii") as stream:
-                boot_id = stream.read(128).strip()
+            boot_id = _read_host_boot_id(proc_root)
         except OSError:
-            if not sys.platform.startswith("linux"):
-                try:
-                    boot_id = _read_host_boot_id(proc_root)
-                except OSError:
-                    boot_id = None
+            boot_id = None
     task = request.get("task", {})
     host_roots = task.get("hostAllowedRoots", [])
     task_dirs = task.get("allowedDirectories", [])
@@ -2781,7 +2786,8 @@ def _probe_task_impl(request, boot_id_override=None, gpu_devices_override=None):
             continue
         row = source_rows_by_id.get(source.get("sourceId"))
         resolved_path = resolved_paths_by_id.get(source.get("sourceId")) or source.get("path")
-        scan_sources.append(dict(source, resolvedPath=resolved_path))
+        scan_sources.append(dict(source, resolvedPath=resolved_path,
+                                 observationErrorCode=row.get("errorCode") if row else None))
         if (
             source.get("kind") == "log"
             and isinstance(row, dict)
@@ -2869,7 +2875,7 @@ def _probe_task_impl(request, boot_id_override=None, gpu_devices_override=None):
     if request.get("includeProcessGpu") is True:
         try:
             gpu_devices = gpu_devices_override if gpu_devices_override is not None else request.get("gpuDevices")
-            payload["processGpu"] = _sample_process_gpu(
+            payload["processGpu"] = select_accelerator_collector().collect_process_usage(
                 proc_root,
                 boot_id,
                 process_rows,
@@ -2890,7 +2896,8 @@ def _probe_host_impl(request):
         availability = None
         include_details = request.get("includeGpuDetails", True) is not False
         if request.get("includeGpu") is not False:
-            gpu = _query_linux_gpu(include_details=include_details, proc_root=proc_root)
+            gpu = select_accelerator_collector().collect_devices(
+                include_details=include_details, proc_root=proc_root)
             if isinstance(gpu, dict):
                 if gpu.get("status") == "ok":
                     availability = "available"
@@ -2992,9 +2999,9 @@ def _dispatch(request):
     return {"errorCode": "REQUEST_OP_UNSUPPORTED", "errorScope": "request", "phase": "dispatch"}
 
 
-def _query_linux_gpu(include_free=False, include_details=False, proc_root="/proc"):
+def _query_linux_gpu(include_free=False, include_details=False, proc_root="/proc", executable=None):
     """Read GPU metrics in a single bounded nvidia-smi query with graceful CPU fallback."""
-    executable = _find_nvidia_smi()
+    executable = executable or _find_nvidia_smi()
     if not executable:
         return NoGpuFallbackCollector().collect_devices(include_free=include_free, include_details=include_details)
     if include_details:

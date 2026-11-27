@@ -113,6 +113,9 @@ async function defaultFreeBytes(databasePath: string): Promise<bigint> {
 }
 async function dispatch(engine: StoreEngine, operation: StoreOperation): Promise<unknown> {
   switch (operation.method) {
+    case 'enqueueRemoteCancel': return engine.enqueueRemoteCancel(...operation.args);
+    case 'getPendingRemoteCancels': return engine.getPendingRemoteCancels(...operation.args);
+    case 'deleteRemoteCancel': return engine.deleteRemoteCancel(...operation.args);
     case 'getCursor': return engine.getCursor(...operation.args);
     case 'registerSource': return engine.registerSource(...operation.args);
     case 'saveObservation': return engine.saveObservation(...operation.args);

@@ -26,30 +26,9 @@ interface Options {
 
 function formatServerWaitMessage(result: ServerWaitResult): string {
   if (result.state === 'cancelled') return '服务器等待已取消；点击重新等待可创建新规则';
-  switch (result.errorCode) {
-    case 'TASK_ALREADY_RUNNING': return '任务已在运行，服务器继续等待';
-    case 'TMUX_UNAVAILABLE': return '服务器没有可用的 tmux，且降级启动器不可用';
-    case 'SERVER_WAITER_LOST': return '服务器等待进程已退出，请检查后重新等待';
-    case 'ACTIVE_SERVER_WAIT_EXISTS': return '该任务还有其他服务器等待规则，请先取消';
-    case 'MAX_RETRIES_EXCEEDED':
-      return `已达到最大自动重试次数（${result.retryCount ?? result.maxRetries ?? 3}），已停止重启`;
-    case 'DISK_SPACE_LOW': {
-      const floor = result.errorParams?.minFreeDiskMiB;
-      return floor ? `输出磁盘可用空间不足 ${floor} MiB，等待恢复后启动` : '输出磁盘可用空间不足，等待恢复后启动';
-    }
-    case 'GPU_SHARING_WAITING': return '等待可用显存与共享 GPU 槽位';
-    case 'GPU_FREE_MEMORY_LOW': return '等待 GPU 可用显存达到设定门槛';
-    case 'GPU_UNAVAILABLE': return '无法获取 GPU 状态，正在重试';
-    case 'CONFIG_CHANGED': return '服务器等待规则配置已变更，请重新提交';
-    default: break;
-  }
-  if (result.state === 'failed') {
-    if (result.errorCode) return `服务器等待或启动失败（${result.errorCode}）${result.message ? `：${result.message}` : ''}`;
-    return result.message || '服务器等待或启动失败，请检查配置后重新等待';
-  }
-  if (result.state === 'blocked') {
-    return result.message || '服务器暂时无法确认 GPU 或任务状态，正在继续检查';
-  }
+  if (result.errorCode) return result.message || result.errorCode;
+  if (result.state === 'failed') return result.message || 'Server launch failed';
+  if (result.state === 'blocked') return result.message || 'Server prerequisites unavailable';
   if (result.state === 'started') {
     if (result.exitCode === 0) return '任务已完成（退出码 0），自动重试已结束';
     return '服务器已创建进程，请查看任务日志';
@@ -109,7 +88,7 @@ export class AutoStartController {
   }
 
   private unconfirmed(state: State, code: string, message: string): void {
-    Object.assign(state.status, { phase: 'blocked', remoteConfirmed: false, errorCode: code, message });
+    Object.assign(state.status, { phase: 'blocked', remoteConfirmed: false, errorCode: code, errorParams: undefined, message });
   }
 
   private project(state: State, result: ServerWaitResult): void {
@@ -122,7 +101,9 @@ export class AutoStartController {
       startedAt: result.startedAt,
       pid: result.pid,
       errorCode: result.state === 'cancelled' ? 'SERVER_WAIT_CANCELLED' : result.errorCode,
-      ...(result.errorParams ? { errorParams: result.errorParams } : { errorParams: undefined }),
+      errorParams: result.errorCode === 'MAX_RETRIES_EXCEEDED'
+        ? { ...result.errorParams, count: result.retryCount ?? result.maxRetries ?? 3 }
+        : result.errorParams ?? undefined,
       message: formatServerWaitMessage(result),
       remoteConfirmed: true,
       sessionName: result.sessionName,

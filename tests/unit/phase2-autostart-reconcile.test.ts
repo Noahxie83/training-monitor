@@ -1,3 +1,8 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { createProductionApi } from '../../src/collector/service';
+import { openStore } from '../../src/store/client';
 import { describe, expect, it, vi } from 'vitest';
 import { buildAutoStartPayload, createAutoStartDraft } from '../../src/renderer/components/AutoStartFields';
 import { AutoStartController, launchConfigHash } from '../../src/launch/controller';
@@ -123,7 +128,7 @@ describe('Phase 2 auto-start passthrough, controller error surfacing, and offlin
       caught = err;
     }
     expect(caught).toBeTruthy();
-    expect(caught.code).toBe('HOST_UNREACHABLE_RECONCILE');
+    expect(caught).toMatchObject({ code: 'HOST_UNREACHABLE_RECONCILE', errorCode: 'HOST_UNREACHABLE_RECONCILE', errorParams: { taskCount: 1 } });
     expect(caught.affectedTasks).toHaveLength(1);
 
     // 2. forceLocal=true succeeds and queues PendingRemoteCancel
@@ -158,4 +163,110 @@ describe('Phase 2 auto-start passthrough, controller error surfacing, and offlin
     expect(flushed.remaining).toHaveLength(0);
     expect(onlineTransport.cancelServerWait).toHaveBeenCalledTimes(1);
   });
+});
+
+it('keeps forced remote cancels in SQLite across monitor restarts and flushes after reconnect', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'monitor-reconcile-'));
+  const clock = () => Date.parse('2026-11-26T00:00:00Z');
+  const original = makeRegistry();
+  let registry = original;
+  const make = async (transport: Transport) => {
+    const store = await openStore({ directory, now: clock });
+    const api = createProductionApi({
+      store, clock, registryProvider: async () => registry,
+      registrySaver: async (next) => (registry = { ...next, revision: registry.revision + 1 }),
+      transportProvider: () => transport,
+    });
+    api.setCollectionPaused(true);
+    await api.start();
+    return { api, store };
+  };
+  try {
+    const pausedProbe = vi.fn();
+    const offline = await make({
+      cancelServerWait: vi.fn().mockRejectedValue(new Error('SSH_TIMEOUT')),
+      probeHost: pausedProbe,
+    } as unknown as Transport);
+    try {
+      const next = structuredClone(registry);
+      next.tasks = [];
+      await offline.api.saveRegistry(next, { forceLocal: true });
+      expect(pausedProbe).not.toHaveBeenCalled();
+      expect(await offline.store.getPendingRemoteCancels!('h-ssh')).toHaveLength(1);
+    } finally {
+      await offline.api.stop();
+    }
+    const cancel = vi.fn().mockResolvedValue({
+      armId: original.tasks[0]!.autoStart!.armId,
+      configHash: launchConfigHash(original.hosts[0]!, original.tasks[0]!),
+      state: 'cancelled',
+    });
+    const online = await make({
+      cancelServerWait: cancel,
+      probeHost: async () => ({ hostId: 'h-ssh', connection: 'connected', scanComplete: true,
+        observedAt: new Date(clock()).toISOString(), freshness: 'fresh', hostBootId: 'boot',
+        errorCode: null, phase: null }),
+    } as unknown as Transport);
+    try {
+      await online.api.requestRefresh({});
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(await online.store.getPendingRemoteCancels!('h-ssh')).toEqual([]);
+    } finally {
+      await online.api.stop();
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it('restarts only after a successful termination and a fresh process scan confirms exit', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'monitor-restart-'));
+  const clock = () => Date.parse('2026-11-26T00:00:00Z');
+  const registry = makeRegistry();
+  const host = registry.hosts[0]!;
+  host.allowJobControl = true;
+  const task = registry.tasks[0]!;
+  const at = new Date(clock()).toISOString();
+  const key = { hostBootId: 'boot', pid: 42, startTicks: '101' };
+  const old = { key, cwd: '/data/exp', scriptEntry: '/data/exp/train.py', role: 'unknown',
+    roleEvidence: 'exact_script_entry', evidenceComplete: true };
+  const observation = {
+    taskId: task.taskId, hostId: host.hostId, observedAt: at, freshness: 'fresh', scanComplete: true,
+    processScanError: null, errorCode: null, sources: [], processes: [old],
+  };
+  const probeTask = vi.fn().mockResolvedValueOnce(observation).mockResolvedValueOnce(observation)
+    .mockResolvedValue({ ...observation, processes: [] });
+  const signalTask = vi.fn().mockResolvedValueOnce({
+    ok: false, errorCode: 'SIGNAL_FAILED', taskId: task.taskId, action: 'restart', pidsSignaled: [],
+  }).mockResolvedValue({ ok: true, errorCode: null, taskId: task.taskId, action: 'restart', pidsSignaled: [42] });
+  const launchTask = vi.fn().mockResolvedValue({ status: 'started', pid: 84, errorCode: null });
+  const store = await openStore({ directory, now: clock });
+  const api = createProductionApi({
+    store, clock, registryProvider: async () => registry,
+    transportProvider: () => ({
+      probeHost: async () => ({ hostId: host.hostId, connection: 'connected', scanComplete: true,
+        observedAt: at, freshness: 'fresh', hostBootId: 'boot', errorCode: null, phase: null }),
+      probeTask, signalTask, launchTask,
+    } as unknown as Transport),
+  });
+  try {
+    api.setCollectionPaused(true);
+    await api.start();
+    await api.requestRefresh({});
+    const request = { taskId: task.taskId, action: 'restart' as const, confirmToken: 'restart-confirmed' };
+    expect(await api.controlTask!(request)).toMatchObject({ ok: false, errorCode: 'SIGNAL_FAILED' });
+    expect(launchTask).not.toHaveBeenCalled();
+    expect(probeTask).toHaveBeenCalledTimes(1);
+    expect(await api.controlTask!(request)).toMatchObject({ ok: true, pid: 84 });
+    expect(probeTask).toHaveBeenCalledTimes(3);
+    expect(signalTask.mock.calls[1]?.[2]).toEqual([key]);
+    const [, armId, hash, , options] = launchTask.mock.calls[0]!;
+    expect(armId).not.toBe(task.autoStart!.armId);
+    expect(armId).toMatch(/^[a-f0-9-]{36}$/);
+    expect(hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(options).toEqual({ restart: true });
+  } finally {
+    await api.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
