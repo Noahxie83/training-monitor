@@ -1,4 +1,5 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { CopyCommandKind } from '../../shared/api';
 import type {
   AutoStartConfig,
   HostRegistration,
@@ -66,24 +67,53 @@ export function TaskCockpit({
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
   const [terminalNote, setTerminalNote] = useState<string | null>(null);
+  const [terminalMenuOpen, setTerminalMenuOpen] = useState(false);
   const [rightTab, setRightTab] = useState<'gpu' | 'curves'>('gpu');
   const [hasChartData, setHasChartData] = useState(false);
-  const [userChoseTab, setUserChoseTab] = useState(false);
+  const userChoseTabRef = useRef(false);
+  const prevTaskIdRef = useRef<string | null>(task?.taskId ?? null);
+  const terminalMenuRef = useRef<HTMLDivElement>(null);
   const [jobControlAction, setJobControlAction] = useState<JobControlAction | null>(null);
+
+  // Reset user tab choice synchronously before child effects when switching tasks
+  if (prevTaskIdRef.current !== (task?.taskId ?? null)) {
+    prevTaskIdRef.current = task?.taskId ?? null;
+    userChoseTabRef.current = false;
+  }
+
+  useEffect(() => {
+    userChoseTabRef.current = false;
+    setHasChartData(false);
+    setRightTab('gpu');
+    setTerminalMenuOpen(false);
+  }, [task?.taskId]);
+
+  useEffect(() => {
+    if (!terminalMenuOpen) return;
+    const onMouseDown = (event: MouseEvent) => {
+      if (!terminalMenuRef.current?.contains(event.target as Node)) {
+        setTerminalMenuOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setTerminalMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [terminalMenuOpen]);
 
   const logBuffer = useLogBuffer(task?.taskId ?? null, sources);
 
-  const handleChartHasData = useCallback(
-    (hasData: boolean) => {
-      setHasChartData(hasData);
-      if (hasData && !userChoseTab) {
-        setRightTab('curves');
-      } else if (!hasData && !userChoseTab) {
-        setRightTab('gpu');
-      }
-    },
-    [userChoseTab],
-  );
+  const handleChartHasData = useCallback((hasData: boolean) => {
+    setHasChartData(hasData);
+    if (!userChoseTabRef.current) {
+      setRightTab(hasData ? 'curves' : 'gpu');
+    }
+  }, []);
 
   const handleCopyPath = async () => {
     if (!task) return;
@@ -98,6 +128,24 @@ export function TaskCockpit({
     }
   };
 
+  const handleCopyCommand = async (kind: CopyCommandKind) => {
+    if (!task || !host || !window.desktop?.copyCommand) return;
+    setTerminalMenuOpen(false);
+    setTerminalNote(null);
+    try {
+      await window.desktop.copyCommand({
+        kind,
+        hostId: host.hostId,
+        taskId: task.taskId,
+        ...(kind === 'tail_log' && logBuffer.activeSourceId ? { sourceId: logBuffer.activeSourceId } : {}),
+      });
+      setTerminalNote(t('app.copied'));
+      setTimeout(() => setTerminalNote(null), 2000);
+    } catch {
+      // Ignore command copy failure
+    }
+  };
+
   const handleOpenTerminal = async () => {
     if (!task || !host) return;
     setTerminalNote(null);
@@ -109,29 +157,13 @@ export function TaskCockpit({
           ...(sessionName ? { command: `tmux -L training-monitor-$(id -u) attach-session -t =${sessionName}` } : {}),
         });
         if (!res.ok && window.desktop?.copyCommand) {
-          await window.desktop.copyCommand({
-            kind: sessionName ? 'tmux_attach' : 'ssh',
-            hostId: host.hostId,
-            taskId: task.taskId,
-          });
-          setTerminalNote(t('app.copied'));
-          setTimeout(() => setTerminalNote(null), 2000);
+          await handleCopyCommand(sessionName ? 'tmux_attach' : 'ssh');
         }
       } catch {
         // Ignore terminal open errors gracefully
       }
     } else if (window.desktop?.copyCommand) {
-      try {
-        await window.desktop.copyCommand({
-          kind: sessionName ? 'tmux_attach' : 'ssh',
-          hostId: host.hostId,
-          taskId: task.taskId,
-        });
-        setTerminalNote(t('app.copied'));
-        setTimeout(() => setTerminalNote(null), 2000);
-      } catch {
-        // Ignore
-      }
+      await handleCopyCommand(sessionName ? 'tmux_attach' : 'ssh');
     }
   };
 
@@ -193,6 +225,7 @@ export function TaskCockpit({
   }
 
   const showAutoStart = Boolean(autoStartConfig && onConfigureAutoStart);
+  const hasTerminalActions = Boolean((window.desktop?.openSshTerminal || window.desktop?.copyCommand) && host);
 
   return (
     <main
@@ -205,7 +238,9 @@ export function TaskCockpit({
         <div className="cockpit-title-row">
           <div className="cockpit-ident">
             <div className="cockpit-title-line">
-              <h2 className="cockpit-task-title">{taskLabel || task.taskId}</h2>
+              <h2 className="cockpit-task-title" title={taskLabel || task.taskId}>
+                {taskLabel || task.taskId}
+              </h2>
               <span className={`task-badge ${badge.className}`}>
                 <span className={`lifecycle-dot ${badge.pulse ? 'is-pulsing' : ''}`} />
                 {badge.text}
@@ -216,7 +251,7 @@ export function TaskCockpit({
               </span>
             </div>
             <p className="cockpit-location">
-              <span>
+              <span className="cockpit-location-host">
                 {hostRegistration?.label || task.hostId} / {task.taskId}
               </span>
               {algorithmName && (
@@ -225,7 +260,7 @@ export function TaskCockpit({
                 </span>
               )}
               {taskRegistration?.allowedDirectories[0] && (
-                <span className="text-muted" title={taskRegistration.allowedDirectories[0]}>
+                <span className="cockpit-location-dir text-muted" title={taskRegistration.allowedDirectories[0]}>
                   {taskRegistration.allowedDirectories[0]}
                 </span>
               )}
@@ -243,16 +278,47 @@ export function TaskCockpit({
                 {terminalNote}
               </span>
             )}
-            {(window.desktop?.openSshTerminal || window.desktop?.copyCommand) && host && (
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                onClick={() => void handleOpenTerminal()}
-                title={t('cockpit.openTerminalTitle')}
-              >
-                <Icon name="terminal" size={13} />
-                <span>{t('cockpit.openTerminal')}</span>
-              </button>
+            {hasTerminalActions && (
+              <div className="cockpit-split-btn-wrap" ref={terminalMenuRef}>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm cockpit-split-main"
+                  onClick={() => void handleOpenTerminal()}
+                  title={t('cockpit.openTerminalTitle')}
+                >
+                  <Icon name="terminal" size={13} />
+                  <span>{t('cockpit.openTerminal')}</span>
+                </button>
+                {window.desktop?.copyCommand && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm cockpit-split-caret"
+                    aria-label={t('cockpit.terminalMenuAria')}
+                    title={t('cockpit.terminalMenuAria')}
+                    aria-haspopup="menu"
+                    aria-expanded={terminalMenuOpen}
+                    onClick={() => setTerminalMenuOpen((v) => !v)}
+                  >
+                    <Icon name="chevronDown" size={12} />
+                  </button>
+                )}
+                {terminalMenuOpen && window.desktop?.copyCommand && (
+                  <div className="popover-panel cockpit-cmd-menu" role="menu" aria-label={t('cockpit.terminalMenuAria')}>
+                    <button type="button" role="menuitem" onClick={() => void handleCopyCommand('ssh')}>
+                      <Icon name="terminal" size={12} />
+                      <span>{t('cockpit.copySsh')}</span>
+                    </button>
+                    <button type="button" role="menuitem" onClick={() => void handleCopyCommand('tmux_attach')}>
+                      <Icon name="layers" size={12} />
+                      <span>{t('cockpit.copyTmux')}</span>
+                    </button>
+                    <button type="button" role="menuitem" onClick={() => void handleCopyCommand('tail_log')}>
+                      <Icon name="file" size={12} />
+                      <span>{t('cockpit.copyTail')}</span>
+                    </button>
+                  </div>
+                )}
+              </div>
             )}
             {onConfigureAutoStart && (
               <button
@@ -263,7 +329,7 @@ export function TaskCockpit({
                 title={t('cockpit.autoStartBtnAria')}
               >
                 <Icon name="clock" size={13} />
-                <span>{t('cockpit.autoStartBtn')}</span>
+                <span className="btn-label">{t('cockpit.autoStartBtn')}</span>
               </button>
             )}
             {allowJobControl && (
@@ -275,6 +341,15 @@ export function TaskCockpit({
                 >
                   <Icon name="stop" size={12} />
                   <span>{t('cockpit.jobControlStop')}</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-danger btn-sm"
+                  onClick={() => setJobControlAction('kill')}
+                  title={t('cockpit.jobControlKillTitle')}
+                >
+                  <Icon name="kill" size={12} />
+                  <span>{t('cockpit.jobControlKill')}</span>
                 </button>
                 <button
                   type="button"
@@ -291,9 +366,10 @@ export function TaskCockpit({
               className={`btn btn-secondary btn-sm ${copied ? 'btn-copied' : ''}`}
               onClick={() => void handleCopyPath()}
               aria-label={copied ? t('app.copied') : t('cockpit.copyPath')}
+              title={copied ? t('app.copied') : t('cockpit.copyPath')}
             >
               <Icon name={copied ? 'check' : 'copy'} size={13} />
-              <span>{copied ? t('app.copied') : t('cockpit.copyPath')}</span>
+              <span className="btn-label">{copied ? t('app.copied') : t('cockpit.copyPath')}</span>
             </button>
             <button
               type="button"
@@ -303,7 +379,7 @@ export function TaskCockpit({
               title={t('cockpit.taskDetailsTitle')}
             >
               <Icon name="info" size={13} />
-              <span>{t('cockpit.taskDetails')}</span>
+              <span className="btn-label">{t('cockpit.taskDetails')}</span>
             </button>
           </div>
         </div>
@@ -323,6 +399,7 @@ export function TaskCockpit({
           status={task.autoStart ?? null}
           hostSnapshots={hostSnapshots}
           hostId={task.hostId}
+          taskId={task.taskId}
           onConfigure={onConfigureAutoStart}
           onRearm={() => onRearmAutoStart?.()}
           onDisable={() => onDisableAutoStart?.()}
@@ -338,16 +415,21 @@ export function TaskCockpit({
           <KpiMetricsGrid task={task} />
         </div>
 
-        <section className="telemetry-card cockpit-right-card" aria-label={t('cockpit.telemetryPanelAria')}>
+        <section
+          className={`telemetry-card cockpit-right-card ${hasChartData ? 'is-wide-split' : ''}`}
+          aria-label={t('cockpit.telemetryPanelAria')}
+        >
           <div className="section-heading right-tabs-bar">
-            <div className="segmented-control" role="tablist">
+            <div className="segmented-control" role="tablist" aria-label={t('cockpit.telemetryPanelAria')}>
               <button
+                id="cockpit-tab-curves"
                 type="button"
                 role="tab"
                 className={`segmented-btn ${rightTab === 'curves' ? 'is-active' : ''}`}
                 aria-selected={rightTab === 'curves'}
+                aria-controls="cockpit-panel-curves"
                 onClick={() => {
-                  setUserChoseTab(true);
+                  userChoseTabRef.current = true;
                   setRightTab('curves');
                 }}
               >
@@ -355,12 +437,14 @@ export function TaskCockpit({
                 <span>{t('cockpit.tabCurves')}</span>
               </button>
               <button
+                id="cockpit-tab-gpu"
                 type="button"
                 role="tab"
                 className={`segmented-btn ${rightTab === 'gpu' ? 'is-active' : ''}`}
                 aria-selected={rightTab === 'gpu'}
+                aria-controls="cockpit-panel-gpu"
                 onClick={() => {
-                  setUserChoseTab(true);
+                  userChoseTabRef.current = true;
                   setRightTab('gpu');
                 }}
               >
@@ -371,7 +455,12 @@ export function TaskCockpit({
           </div>
 
           <div className={`cockpit-right-split ${hasChartData ? 'is-wide-split' : ''}`}>
-            <div className={`right-pane ${rightTab !== 'curves' ? 'is-hidden-tab' : ''}`}>
+            <div
+              id="cockpit-panel-curves"
+              role="tabpanel"
+              aria-labelledby="cockpit-tab-curves"
+              className={`right-pane ${rightTab !== 'curves' ? 'is-hidden-tab' : ''}`}
+            >
               <TrainingChart
                 taskId={task.taskId}
                 refreshTick={task.progress.observedAt ?? task.statusObservedAt}
@@ -379,7 +468,12 @@ export function TaskCockpit({
               />
             </div>
 
-            <div className={`right-pane ${rightTab !== 'gpu' ? 'is-hidden-tab' : ''}`}>
+            <div
+              id="cockpit-panel-gpu"
+              role="tabpanel"
+              aria-labelledby="cockpit-tab-gpu"
+              className={`right-pane ${rightTab !== 'gpu' ? 'is-hidden-tab' : ''}`}
+            >
               <ResourceMetrics task={task} />
             </div>
           </div>

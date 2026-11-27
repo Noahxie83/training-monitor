@@ -81,7 +81,7 @@
 .btn-danger:hover:not(:disabled) {
   background-color: var(--status-danger);
   border-color: var(--status-danger);
-  color: #FFFFFF;
+  color: var(--danger-ink);
 }
 
 .btn-copied {

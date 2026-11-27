@@ -11,6 +11,7 @@ interface HeaderProps {
   lastSyncTime: string | null;
   onRefresh: () => void;
   onOpenSettings: () => void;
+  onOpenHostSettings?: () => void;
   onOpenGpu?: () => void;
   onOpenDiscovery?: () => void;
   announcement: string;
@@ -39,6 +40,7 @@ export function Header({
   lastSyncTime,
   onRefresh,
   onOpenSettings,
+  onOpenHostSettings,
   onOpenGpu,
   onOpenDiscovery,
   announcement,
@@ -214,7 +216,7 @@ export function Header({
                       className="btn btn-secondary btn-xs"
                       onClick={() => {
                         setDiagOpen(false);
-                        onOpenSettings();
+                        (onOpenHostSettings ?? onOpenSettings)();
                       }}
                     >
                       {t('header.hostEnableInSettings')}

@@ -56,13 +56,26 @@ async function setTheme(page: Page, theme: 'light' | 'dark') {
 }
 
 async function assertNoOverflow(page: Page, context: string) {
-  const res = await page.evaluate(() => ({
-    scrollWidth: document.documentElement.scrollWidth,
-    innerWidth: window.innerWidth,
-  }));
+  const res = await page.evaluate(() => {
+    const cockpit = document.querySelector('.cockpit-container');
+    let cockpitRightOverflow = 0;
+    if (cockpit) {
+      const cRect = cockpit.getBoundingClientRect();
+      for (const child of Array.from(cockpit.children)) {
+        const r = child.getBoundingClientRect();
+        cockpitRightOverflow = Math.max(cockpitRightOverflow, Math.round(r.right - cRect.right));
+      }
+    }
+    return {
+      scrollWidth: document.documentElement.scrollWidth,
+      innerWidth: window.innerWidth,
+      cockpitRightOverflow,
+    };
+  });
   expect(res.scrollWidth, `Horizontal overflow in ${context}: ${JSON.stringify(res)}`).toBeLessThanOrEqual(
     res.innerWidth + 1,
   );
+  expect(res.cockpitRightOverflow, `Cockpit child clipped horizontally in ${context}: ${JSON.stringify(res)}`).toBeLessThanOrEqual(1);
 }
 
 test('Phase 3 full multi-viewport dual-theme visual audit (1440x900, 1280x800, 960x650)', async () => {
@@ -272,6 +285,54 @@ test('Phase 3 full multi-viewport dual-theme visual audit (1440x900, 1280x800, 9
     await setTheme(gpuPage, 'light');
     await assertNoOverflow(gpuPage, 'gpu-window-maximized-light');
     await gpuPage.screenshot({ path: path.join(AUDIT_DIR, 'gpu-window-maximized-light.png') });
+
+    // 8. Phase 5b English-mode verification (zero residual CJK in main cockpit & GPU window + --danger-ink contrast)
+    await page.evaluate(async () => {
+      const cur = await window.monitor.getPreferences();
+      await window.monitor.savePreferences({ ...cur, theme: 'dark', locale: 'en-US' });
+    });
+    await expect(page.locator('.app-shell')).toHaveAttribute('data-theme', 'dark');
+    await expect(page.getByRole('button', { name: 'Kill' })).toBeVisible();
+    await setWindowSize(app, page, 1280, 800);
+    await page.waitForTimeout(120);
+    const cockpitEnText = await page.evaluate(() => {
+      const clone = document.body.cloneNode(true) as HTMLElement;
+      clone.querySelectorAll('.header-lang-btn').forEach((el) => el.remove());
+      return clone.textContent ?? '';
+    });
+    expect(cockpitEnText, 'Residual CJK found in en-US cockpit').not.toMatch(/[\u4e00-\u9fff]/);
+    await page.screenshot({ path: path.join(AUDIT_DIR, 'cockpit-1280x800-en-dark.png') });
+
+    // Verify --danger-ink on --status-danger contrast >= 4.5:1 in dark mode
+    const dangerTokens = await page.evaluate(() => {
+      const cs = getComputedStyle(document.querySelector('.app-shell')!);
+      const probe = document.createElement('span');
+      probe.style.color = cs.getPropertyValue('--danger-ink').trim();
+      probe.style.backgroundColor = cs.getPropertyValue('--status-danger').trim();
+      document.body.appendChild(probe);
+      const resolved = getComputedStyle(probe);
+      const result = { fg: resolved.color, bg: resolved.backgroundColor };
+      probe.remove();
+      return result;
+    });
+    const dFg = parseRgb(dangerTokens.fg);
+    const dBg = parseRgb(dangerTokens.bg);
+    expect(dFg && dBg ? contrastRatio(dFg, dBg) : 0, `Low --danger-ink contrast: ${JSON.stringify(dangerTokens)}`).toBeGreaterThanOrEqual(4.5);
+
+    await app.evaluate(({ BrowserWindow }) => {
+      const win = BrowserWindow.getAllWindows().find((w) => w.webContents.getURL().includes('view=gpu'))!;
+      win.unmaximize();
+      win.setContentSize(1080, 780);
+    });
+    await expect(gpuPage.getByText('Connected')).toBeVisible();
+    await gpuPage.waitForTimeout(120);
+    const gpuEnText = await gpuPage.evaluate(() => {
+      const clone = document.body.cloneNode(true) as HTMLElement;
+      clone.querySelectorAll('.header-lang-btn').forEach((el) => el.remove());
+      return clone.textContent ?? '';
+    });
+    expect(gpuEnText, 'Residual CJK found in en-US GPU window').not.toMatch(/[\u4e00-\u9fff]/);
+    await gpuPage.screenshot({ path: path.join(AUDIT_DIR, 'gpu-window-en-dark.png') });
 
     await gpuPage.close();
     expect(errors).toEqual([]);

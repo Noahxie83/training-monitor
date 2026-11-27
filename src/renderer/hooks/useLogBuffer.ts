@@ -8,6 +8,7 @@ import {
   PAGE_EVENT_LIMIT,
 } from '../../shared/budgets';
 import { isSafeRegexPattern } from '../../shared/validate';
+import { translate, useI18n, type Locale } from '../i18n';
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder('utf-8', { fatal: false });
@@ -69,6 +70,10 @@ function computeTotalBytes(events: LogEvent[]): number {
 export type UiLogLevelFilter = 'all' | 'error' | 'warn' | 'info';
 
 export function useLogBuffer(taskId: string | null, sources: LogSourceSnapshot[] = []) {
+  const { locale } = useI18n();
+  const localeRef = useRef<Locale>(locale);
+  localeRef.current = locale;
+
   const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
   const [events, publishEvents] = useState<LogEvent[]>([]);
   const [isScrollLocked, setIsScrollLocked] = useState<boolean>(false);
@@ -282,7 +287,7 @@ export function useLogBuffer(taskId: string | null, sources: LogSourceSnapshot[]
         if (currentEpochRef.current.epochId !== epochId || activePageRequestIdRef.current !== pageRequestId) return;
         const msg = err?.message || String(err);
         if (/cancelled|abort/i.test(msg)) return;
-        setInitialFetchError('读取初始日志失败: ' + msg);
+        setInitialFetchError(translate(localeRef.current, 'logs.initialFetchFailed', { reason: msg }));
       })
       .finally(() => {
         if (currentEpochRef.current.epochId === epochId && activePageRequestIdRef.current === pageRequestId) {
@@ -390,12 +395,13 @@ export function useLogBuffer(taskId: string | null, sources: LogSourceSnapshot[]
       setEvents(merged);
     } catch (err: any) {
       if (currentEpochRef.current.epochId !== pageEpochId || activeEarlierRequestIdRef.current !== requestId) return;
-      const msg = err?.message || '未知错误';
+      const loc = localeRef.current;
+      const msg = err?.message || translate(loc, 'app.unknownError');
       if (msg.includes('STALE_CONTINUATION')) {
         setNextBefore(null);
-        setPagingError('历史日志位置已过期，请从最新位置重新加载');
+        setPagingError(translate(loc, 'logs.staleCursorPaging'));
       } else {
-        setPagingError('加载历史日志失败: ' + msg);
+        setPagingError(translate(loc, 'logs.pagingFailed', { reason: msg }));
       }
     } finally {
       if (activeEarlierRequestIdRef.current === requestId) {
@@ -474,7 +480,7 @@ export function useLogBuffer(taskId: string | null, sources: LogSourceSnapshot[]
         if (currentEpochRef.current.epochId !== epochId || activePageRequestIdRef.current !== pageRequestId) return;
         const msg = err?.message || String(err);
         if (/cancelled|abort/i.test(msg)) return;
-        setInitialFetchError('读取初始日志失败: ' + msg);
+        setInitialFetchError(translate(localeRef.current, 'logs.initialFetchFailed', { reason: msg }));
       })
       .finally(() => {
         if (currentEpochRef.current.epochId === epochId && activePageRequestIdRef.current === pageRequestId) {
@@ -508,7 +514,7 @@ export function useLogBuffer(taskId: string | null, sources: LogSourceSnapshot[]
       }
 
       if (mode === 'regex' && !isSafeRegexPattern(query)) {
-        setSearchError('正则表达式语法无效或过于复杂');
+        setSearchError(translate(localeRef.current, 'logs.regexInvalidComplex'));
         setIsSearching(false);
         return;
       }
@@ -564,12 +570,13 @@ export function useLogBuffer(taskId: string | null, sources: LogSourceSnapshot[]
           activeSearchRequestIdRef.current === requestId &&
           currentEpochRef.current.epochId === searchEpochId
         ) {
-          const msg = err?.message || '未知错误';
+          const loc = localeRef.current;
+          const msg = err?.message || translate(loc, 'app.unknownError');
           if (msg.includes('STALE_CONTINUATION')) {
             setSearchContinuation(null);
-            setSearchError('搜索分页位置已过期，请重新开始搜索');
+            setSearchError(translate(loc, 'logs.staleCursorSearch'));
           } else {
-            setSearchError('日志搜索失败: ' + msg);
+            setSearchError(translate(loc, 'logs.searchFailed', { reason: msg }));
           }
         }
       } finally {
@@ -677,12 +684,13 @@ export function useLogBuffer(taskId: string | null, sources: LogSourceSnapshot[]
         activeSearchRequestIdRef.current === requestId &&
         currentEpochRef.current.epochId === searchEpochId
       ) {
-        const msg = err?.message || '未知错误';
+        const loc = localeRef.current;
+        const msg = err?.message || translate(loc, 'app.unknownError');
         if (msg.includes('STALE_CONTINUATION')) {
           setSearchContinuation(null);
-          setSearchError('搜索分页位置已过期，请重新开始搜索');
+          setSearchError(translate(loc, 'logs.staleCursorSearch'));
         } else {
-          setSearchError('加载更多搜索结果失败: ' + msg);
+          setSearchError(translate(loc, 'logs.loadMoreSearchFailed', { reason: msg }));
         }
       }
     } finally {

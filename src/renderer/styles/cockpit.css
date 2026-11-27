@@ -4,6 +4,7 @@
   min-width: 0;
   min-height: 0;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto auto minmax(280px, 1fr);
   gap: 12px;
   padding: 14px 20px 14px;
@@ -73,6 +74,18 @@
   min-width: 0;
 }
 
+.cockpit-location-host {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.cockpit-location-dir {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .cockpit-algorithm {
   font-family: var(--font-sans);
   padding: 1px 7px;
@@ -92,8 +105,67 @@
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 5px;
   flex-shrink: 0;
+}
+
+.cockpit-action-buttons .btn-sm {
+  padding: 0 7px;
+}
+
+.cockpit-split-btn-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.cockpit-split-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.cockpit-split-btn-wrap:not(:has(.cockpit-split-caret)) .cockpit-split-main {
+  border-top-right-radius: var(--radius-sm);
+  border-bottom-right-radius: var(--radius-sm);
+}
+
+.cockpit-split-caret {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 0;
+  padding: 0 5px;
+  min-width: 22px;
+}
+
+.cockpit-cmd-menu {
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 176px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cockpit-cmd-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: var(--text-meta);
+  text-align: left;
+  white-space: nowrap;
+  transition: background-color var(--transition-fast);
+}
+
+.cockpit-cmd-menu button:hover,
+.cockpit-cmd-menu button:focus-visible {
+  background-color: var(--bg-surface-hover);
 }
 
 .cockpit-warning-banner {
@@ -108,8 +180,14 @@
   font-size: var(--text-meta);
 }
 
+.warning-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 /* Compact 2-row AutoStart Status Strip */
 .auto-start-panel {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -157,6 +235,12 @@
   border: 1px solid var(--status-neutral-border);
   background-color: var(--status-neutral-bg);
   color: var(--status-neutral);
+}
+
+.auto-start-phase-off {
+  color: var(--status-neutral);
+  background-color: var(--status-neutral-bg);
+  border-color: var(--status-neutral-border);
 }
 
 .auto-start-phase-enabled,
@@ -401,6 +485,10 @@
   transition: width var(--transition-bar);
 }
 
+.progress-fill-global {
+  background-color: var(--accent-primary);
+}
+
 .progress-fill-session {
   background-color: var(--status-running);
 }
@@ -535,7 +623,7 @@
   .cockpit-telemetry-grid {
     grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.38fr);
   }
-  .cockpit-right-card .right-tabs-bar {
+  .cockpit-right-card.is-wide-split .right-tabs-bar {
     display: none;
   }
   .cockpit-right-split.is-wide-split {
@@ -667,6 +755,10 @@
   display: block;
 }
 
+.chart-line {
+  vector-effect: non-scaling-stroke;
+}
+
 .chart-x-axis {
   display: flex;
   align-items: center;
@@ -780,6 +872,12 @@
   margin-bottom: 6px;
 }
 
+.kpi-process-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
 .kpi-detail-row {
   display: flex;
   justify-content: space-between;
@@ -806,19 +904,130 @@
   flex-direction: column;
 }
 
-/* Adaptive breakpoint <= 1050px: stay 2 compact columns down to 780px so logs ALWAYS remain >= 200px tall at 960x650 */
+/* Adaptive breakpoint <= 1050px: compact single-row header & 2-row AutoStart so logs show >= 5 lines at 960x650 */
 @media (max-width: 1050px) {
   .cockpit-container {
     padding: 8px 12px;
-    gap: 7px;
+    gap: 6px;
+  }
+  .cockpit-header {
+    gap: 4px;
+  }
+  .cockpit-title-row {
+    align-items: center;
+    gap: 8px;
+    flex-wrap: nowrap;
+    min-width: 0;
+  }
+  .cockpit-ident {
+    gap: 2px;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .cockpit-title-line {
+    flex-wrap: nowrap;
+    gap: 6px;
+    overflow: hidden;
+  }
+  .cockpit-title-line .task-badge,
+  .cockpit-title-line .confidence-badge {
+    flex-shrink: 0;
+  }
+  .cockpit-task-title {
+    min-width: 0;
+    font-size: 16px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .cockpit-location {
+    flex-wrap: nowrap;
+    gap: 6px;
+    overflow: hidden;
+  }
+  .cockpit-location-host {
+    min-width: 0;
+    flex-shrink: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .cockpit-algorithm {
+    max-width: 120px;
+    flex-shrink: 1;
+  }
+  .cockpit-location-dir {
+    flex: 1 1 60px;
+    min-width: 0;
+  }
+  .cockpit-action-buttons {
+    flex-wrap: nowrap;
+    gap: 4px;
   }
   .cockpit-action-buttons .btn {
     height: 24px;
-    padding: 0 7px;
+    padding: 0 6px;
     font-size: 11.5px;
   }
+  .cockpit-action-buttons .cockpit-split-caret {
+    padding: 0 4px;
+    min-width: 20px;
+  }
+  .cockpit-action-buttons .btn-label {
+    display: none;
+  }
+  .auto-start-panel {
+    padding: 5px 10px;
+    gap: 4px;
+    overflow: hidden;
+  }
+  .auto-start-panel-head {
+    flex-wrap: nowrap;
+    gap: 6px;
+    min-width: 0;
+  }
+  .auto-start-panel-ident {
+    flex-wrap: nowrap;
+    gap: 5px;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .auto-start-summary-inline {
+    flex-wrap: nowrap;
+    gap: 4px;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .auto-start-summary-chip {
+    padding: 0 5px;
+    font-size: 10.5px;
+    flex-shrink: 0;
+  }
+  .auto-start-panel-actions {
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .auto-start-panel-actions .btn-xs {
+    height: 20px;
+    padding: 0 6px;
+    font-size: 11px;
+  }
+  .auto-start-row-bottom {
+    flex-wrap: nowrap;
+    gap: 8px;
+    min-width: 0;
+  }
+  .auto-start-countdown-wrap {
+    min-width: 0;
+    flex: 1;
+  }
+  .auto-start-session {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
   .cockpit-telemetry-grid {
-    grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr);
+    grid-template-columns: minmax(0, 1.06fr) minmax(0, 0.94fr);
     gap: 8px;
   }
   .execution-facts {
@@ -826,21 +1035,56 @@
     gap: 5px;
   }
   .kpi-cell {
-    padding: 5px 8px;
+    padding: 4px 8px;
+    gap: 1px;
   }
   .kpi-cell dd {
     font-size: 14px;
   }
   .telemetry-card {
-    padding: 9px 11px;
-    gap: 6px;
+    padding: 8px 10px;
+    gap: 5px;
   }
-  .cockpit-task-title {
-    font-size: 17px;
+  .checkpoint-row {
+    flex-wrap: nowrap;
+    padding-top: 4px;
+    gap: 5px;
+    overflow: hidden;
+  }
+  .checkpoint-file {
+    max-width: 34%;
+  }
+  .checkpoint-meta-chip {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chart-controls-bar {
+    flex-wrap: nowrap;
+    gap: 4px;
+    min-width: 0;
+  }
+  .chart-metric-chips {
+    flex-wrap: nowrap;
+    gap: 3px;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .chart-metric-chip {
+    height: 20px;
+    padding: 0 5px;
+    font-size: 10.5px;
+    flex-shrink: 0;
+  }
+  .chart-controls-bar > button {
+    flex-shrink: 0;
   }
 }
 
 @media (max-width: 780px) {
+  .cockpit-title-row {
+    flex-wrap: wrap;
+  }
   .cockpit-telemetry-grid {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -848,38 +1092,41 @@
 
 @media (max-height: 700px) {
   .cockpit-container {
-    grid-template-rows: auto auto minmax(240px, 1fr);
-    padding: 8px 12px;
+    grid-template-rows: auto auto minmax(210px, 1fr);
+    padding: 6px 12px;
     gap: 6px;
   }
   .cockpit-container.has-autostart {
-    grid-template-rows: auto auto auto minmax(240px, 1fr);
+    grid-template-rows: auto auto auto minmax(210px, 1fr);
   }
   .telemetry-card {
-    padding: 8px 11px;
+    padding: 7px 10px;
     gap: 5px;
   }
   .auto-start-panel {
-    padding: 6px 10px;
-    gap: 4px;
+    padding: 5px 10px;
+    gap: 3px;
   }
   .dual-progress-panel {
-    gap: 5px;
+    gap: 4px;
+  }
+  .progress-track-block {
+    gap: 3px;
   }
   .training-facts {
-    gap: 5px;
+    gap: 4px;
   }
   .checkpoint-row {
-    padding-top: 5px;
+    padding-top: 4px;
   }
   .task-gpu-list {
-    max-height: 112px;
+    max-height: 108px;
   }
   .training-chart-wrap {
-    min-height: 98px;
+    min-height: 86px;
   }
   .chart-svg-box,
   .chart-empty {
-    min-height: 86px;
+    min-height: 78px;
   }
 }

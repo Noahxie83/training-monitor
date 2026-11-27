@@ -173,10 +173,11 @@ function startDesktop(userData: string, isolated: boolean): void {
         preferencesSaver: savePreferences,
         onAlert: (alert) => {
           if (preferences.alerts?.desktopNotifications === false) return;
-          showDesktopAlert(alert, (taskId) => {
+          showDesktopAlert(alert, (taskId, hostId) => {
             const window = showMainWindow();
             if (!taskId || !window) return;
-            const deliver = () => { if (!window.isDestroyed()) window.webContents.send(CHANNELS.focusTask, taskId); };
+            const payload = hostId ? { taskId, hostId } : { taskId };
+            const deliver = () => { if (!window.isDestroyed()) window.webContents.send(CHANNELS.focusTask, payload); };
             if (window.webContents.isLoadingMainFrame()) window.webContents.once('did-finish-load', deliver);
             else deliver();
           });

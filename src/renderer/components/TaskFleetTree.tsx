@@ -254,9 +254,9 @@ export function TaskFleetTree({
           return (
             <div
               key={host.hostId}
-              className={`fleet-host-group ${activeHostId === host.hostId ? 'is-selected-host' : ''}`}
-              role="treeitem"
-              aria-expanded="true"
+              className="fleet-host-group"
+              role="group"
+              aria-label={displayName}
             >
               <div className="fleet-host-header">
                 <button
@@ -323,7 +323,7 @@ export function TaskFleetTree({
               {hostTasks.length === 0 ? (
                 <div className="fleet-empty-host">{t('sidebar.emptyHost')}</div>
               ) : (
-                <div className="fleet-tasks-list" role="group">
+                <div className="fleet-tasks-list">
                   {hostTasks.map((task) => {
                     taskGlobalIndex += 1;
                     const shortcutHint = taskGlobalIndex <= 9 ? `Ctrl+${taskGlobalIndex}` : null;

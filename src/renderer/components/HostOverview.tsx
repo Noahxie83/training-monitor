@@ -99,7 +99,7 @@ export function HostOverview({
       {!taskCount && (
         <section className="host-empty-onboarding" aria-label={t('hostOverview.emptyCardTitle')}>
           <div className="host-empty-onboarding-copy">
-            <h3 className="host-empty-tasks">{t('hostOverview.emptyCardTitle')}</h3>
+            <h3>{t('hostOverview.emptyCardTitle')}</h3>
             <p>{host ? t('hostOverview.emptyCardHint') : t('hostOverview.noHostDesc')}</p>
           </div>
           <div className="host-empty-onboarding-actions">

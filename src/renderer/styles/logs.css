@@ -111,12 +111,20 @@
   box-shadow: var(--card-shadow);
 }
 
+.log-level-btn.level-all.is-active {
+  color: var(--text-primary);
+}
+
 .log-level-btn.level-error.is-active {
   color: var(--status-danger);
 }
 
 .log-level-btn.level-warn.is-active {
   color: var(--status-warning);
+}
+
+.log-level-btn.level-info.is-active {
+  color: var(--status-info);
 }
 
 /* Search group with clear border, regex/case toggles, match counter & SVG nav */
@@ -303,6 +311,11 @@
   outline: none;
 }
 
+.log-virtual-inner {
+  width: 100%;
+  position: relative;
+}
+
 .log-event-row {
   display: flex;
   align-items: flex-start;
@@ -344,6 +357,11 @@
   min-width: 0;
   word-break: break-word;
   white-space: pre-wrap;
+}
+
+.wrap-lines .log-col-text {
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .nowrap-lines .log-col-text {
@@ -465,8 +483,18 @@
 }
 
 @media (max-width: 1100px) {
+  .log-toolbar {
+    gap: 6px;
+    padding: 5px 8px;
+  }
+  .log-toolbar-left {
+    gap: 5px;
+  }
   .log-toolbar-title {
     display: none;
+  }
+  .log-search-group {
+    min-width: 120px;
   }
   .log-toolbar-actions .btn-label {
     display: none;

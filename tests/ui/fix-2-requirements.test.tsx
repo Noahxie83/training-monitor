@@ -77,7 +77,7 @@ describe('T7 Fix 2 Requirements - Group A: Settings & Registry (I1, NB2)', () =>
     fireEvent.click(screen.getByRole('button', { name: /保存宿主配置/i }));
 
     await waitFor(() => {
-      expect(screen.getByText(/白名单根目录路径必须以 \/ 开头/i)).toBeDefined();
+      expect(screen.getByText(/允许监控的根目录路径必须以 \/ 开头/i)).toBeDefined();
     });
     expect(saveSpy).not.toHaveBeenCalled();
 

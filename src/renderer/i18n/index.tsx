@@ -46,7 +46,7 @@ export function translateHostError(
   if (code === 'WSL_NOT_RUNNING') {
     const distro = registration?.target.kind === 'wsl'
       ? registration.target.distribution
-      : (locale === 'en-US' ? 'the WSL distribution' : '目标发行版');
+      : translate(locale, 'errors.wslDistroFallback');
     return translate(locale, 'errors.WSL_NOT_RUNNING', { distro });
   }
   if (code === 'SSH_HOST_KEY_UNKNOWN') {
@@ -83,18 +83,21 @@ const I18nContext = createContext<I18nContextValue>({
 
 export function I18nProvider({
   locale,
+  documentTitle,
   onChangeLocale,
   children,
 }: {
   locale: Locale;
+  documentTitle?: string;
   onChangeLocale?: (next: Locale) => void;
   children: React.ReactNode;
 }) {
   useEffect(() => {
     if (typeof document !== 'undefined') {
       document.documentElement.lang = locale;
+      if (documentTitle) document.title = documentTitle;
     }
-  }, [locale]);
+  }, [locale, documentTitle]);
 
   const value = useMemo<I18nContextValue>(
     () => ({

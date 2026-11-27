@@ -41,7 +41,7 @@ function Metric({
               : `${metric.value}%`}
           {valueSuffix}
         </span>
-        {metric?.freshness === 'stale' && <span className="text-warning">（{t('app.stale')}）</span>}
+        {metric?.freshness === 'stale' && <span className="text-warning">{t('app.staleParen')}</span>}
       </span>
     </div>
   );
@@ -55,7 +55,7 @@ export function ResourceMetrics({ task }: { task: TaskSnapshot }) {
     {
       process: processes.main,
       label: t('resources.mainProcessLabel'),
-      rss: '本进程物理内存',
+      rss: t('resources.mainProcessRssLabel'),
       cpu: t('resources.cpuLabel'),
     },
     {
@@ -77,7 +77,7 @@ export function ResourceMetrics({ task }: { task: TaskSnapshot }) {
   return (
     <>
       <TaskGpuMetrics task={task} />
-      <details className="kpi-resource-section process-resource-section">
+      <details className="process-resource-section">
         <summary>
           <span>{t('resources.processSectionTitle')}</span>
           {hasAnyProcess ? (
@@ -115,7 +115,7 @@ export function ResourceMetrics({ task }: { task: TaskSnapshot }) {
                   (m) => m.scope === 'process' && sameProcess(m.processKey, process?.key ?? null),
                 );
                 return (
-                  <div key={label} className="kpi-process-group" aria-label={`${label}资源`}>
+                  <div key={label} className="kpi-process-group" aria-label={t('resources.processGroupAria', { label })}>
                     <Metric label={rss} metric={samples.find((m) => m.name === 'process_rss')} />
                     <Metric label={cpu} metric={samples.find((m) => m.name === 'cpu_utilization')} />
                   </div>
@@ -160,7 +160,7 @@ export function TaskGpuMetrics({ task }: { task: TaskSnapshot }) {
           : t('resources.emptyUnavailable');
 
   return (
-    <section className="kpi-resource-section task-gpu-section" aria-label={t('resources.taskGpuAria')}>
+    <section className="task-gpu-section" aria-label={t('resources.taskGpuAria')}>
       <div className="section-heading">
         <h3>
           {devices.length
@@ -179,7 +179,7 @@ export function TaskGpuMetrics({ task }: { task: TaskSnapshot }) {
                 samples.some((metric) => sameProcess(metric.processKey, key)),
             );
             return (
-              <div key={device} className="kpi-device-group task-gpu-device" aria-label={`${device}进程资源`}>
+              <div key={device} className="task-gpu-device" aria-label={t('resources.deviceProcessAria', { device })}>
                 <div className="gpu-device-heading">
                   <strong className="mono">{device}</strong>
                   <span className={`task-gpu-badge ${stale ? 'pill-warning' : 'pill-running'}`}>
@@ -270,7 +270,7 @@ export function GpuDeviceMetrics({
   };
 
   return (
-    <section className="kpi-resource-section gpu-resource-section">
+    <section className="gpu-resource-section">
       <div className="section-heading">
         <h3>
           {allCards.length
@@ -291,8 +291,8 @@ export function GpuDeviceMetrics({
             return (
               <article
                 key={card.deviceId}
-                className={`kpi-device-group gpu-device-card load-tier-${utilTier}`}
-                aria-label={`${card.deviceId}整卡资源`}
+                className={`gpu-device-card load-tier-${utilTier}`}
+                aria-label={t('resources.deviceWholeAria', { device: card.deviceId })}
               >
                 <div className="gpu-card-top">
                   <div className="gpu-card-ident">
@@ -408,7 +408,7 @@ export function GpuDeviceMetrics({
                   </div>
                 )}
 
-                {card.stale && <span className="gpu-stale">（{t('app.stale')}）</span>}
+                {card.stale && <span className="gpu-stale">{t('app.staleParen')}</span>}
               </article>
             );
           })}

@@ -76,15 +76,10 @@ function buildHighlightRegex(
   return { regex: new RegExp(escapeRegExp(trimmed), flags), invalid: false };
 }
 
-function renderHighlightedChunk(
-  text: string,
-  regex: RegExp | null,
-  isActiveRow: boolean,
-): React.ReactNode {
-  if (!regex || !text) return text;
+function findMatchRanges(text: string, regex: RegExp | null): { start: number; end: number }[] {
+  if (!regex || !text) return [];
   const localRe = new RegExp(regex.source, regex.flags);
-  const parts: React.ReactNode[] = [];
-  let lastIdx = 0;
+  const ranges: { start: number; end: number }[] = [];
   let match: RegExpExecArray | null;
   let guard = 0;
   while ((match = localRe.exec(text)) !== null && guard < 200) {
@@ -93,21 +88,45 @@ function renderHighlightedChunk(
       localRe.lastIndex += 1;
       continue;
     }
-    if (match.index > lastIdx) {
-      parts.push(text.slice(lastIdx, match.index));
+    ranges.push({ start: match.index, end: match.index + match[0].length });
+  }
+  return ranges;
+}
+
+function renderSlicedHighlights(
+  text: string,
+  segStart: number,
+  ranges: { start: number; end: number }[],
+  isActiveRow: boolean,
+): React.ReactNode {
+  if (!text || ranges.length === 0) return text;
+  const segEnd = segStart + text.length;
+  const parts: React.ReactNode[] = [];
+  let cursor = segStart;
+  let keyCounter = 0;
+
+  for (let i = 0; i < ranges.length; i += 1) {
+    const range = ranges[i]!;
+    if (range.end <= segStart) continue;
+    if (range.start >= segEnd) break;
+    const overlapStart = Math.max(range.start, segStart);
+    const overlapEnd = Math.min(range.end, segEnd);
+    if (overlapStart > cursor) {
+      parts.push(text.slice(cursor - segStart, overlapStart - segStart));
     }
+    keyCounter += 1;
     parts.push(
       <mark
-        key={`${match.index}-${guard}`}
-        className={`log-mark ${isActiveRow && guard === 1 ? 'log-mark-active' : ''}`}
+        key={`${overlapStart}-${keyCounter}`}
+        className={`log-mark ${isActiveRow && i === 0 ? 'log-mark-active' : ''}`}
       >
-        {match[0]}
+        {text.slice(overlapStart - segStart, overlapEnd - segStart)}
       </mark>,
     );
-    lastIdx = match.index + match[0].length;
+    cursor = overlapEnd;
   }
   if (parts.length === 0) return text;
-  if (lastIdx < text.length) parts.push(text.slice(lastIdx));
+  if (cursor < segEnd) parts.push(text.slice(cursor - segStart));
   return parts;
 }
 
@@ -120,10 +139,16 @@ function renderLogLineContent(
   if (!sourceText) return null;
   const hasAnsiEsc = sourceText.includes('\x1B');
   if (!hasAnsiEsc) {
-    return renderHighlightedChunk(sourceText, highlightRegex, isActiveMatchRow);
+    const ranges = findMatchRanges(sourceText, highlightRegex);
+    return renderSlicedHighlights(sourceText, 0, ranges, isActiveMatchRow);
   }
   const segments = parseAnsiSegments(sourceText);
+  const plainText = segments.map((seg) => seg.text).join('');
+  const ranges = findMatchRanges(plainText, highlightRegex);
+  let offset = 0;
   return segments.map((seg, idx) => {
+    const segStart = offset;
+    offset += seg.text.length;
     const style: React.CSSProperties = {};
     if (seg.fg) style.color = seg.fg;
     if (seg.bg) style.backgroundColor = seg.bg;
@@ -132,7 +157,7 @@ function renderLogLineContent(
     if (seg.italic) style.fontStyle = 'italic';
     if (seg.underline) style.textDecoration = 'underline';
     const hasStyle = Object.keys(style).length > 0;
-    const content = renderHighlightedChunk(seg.text, highlightRegex, isActiveMatchRow);
+    const content = renderSlicedHighlights(seg.text, segStart, ranges, isActiveMatchRow);
     return hasStyle ? (
       <span key={idx} style={style}>
         {content}
@@ -191,7 +216,23 @@ export function LogConsole({
   const [localLevel, setLocalLevel] = useState<UiLogLevelFilter>(controlledLevelFilter ?? 'all');
   const [clearedEventIds, setClearedEventIds] = useState<Set<string> | null>(null);
   const [activeMatchCursor, setActiveMatchCursor] = useState<number>(0);
-  const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [exportNotice, setExportNotice] = useState<{ text: string; title?: string; isError?: boolean } | null>(null);
+  const exportNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (exportNoticeTimerRef.current) clearTimeout(exportNoticeTimerRef.current);
+    };
+  }, []);
+
+  const showExportNotice = (notice: { text: string; title?: string; isError?: boolean }) => {
+    if (exportNoticeTimerRef.current) clearTimeout(exportNoticeTimerRef.current);
+    setExportNotice(notice);
+    exportNoticeTimerRef.current = setTimeout(() => {
+      setExportNotice(null);
+      exportNoticeTimerRef.current = null;
+    }, 3500);
+  };
 
   const effectiveMode = onSearchModeChange ? searchMode : localMode;
   const effectiveCase = onSearchCaseSensitiveChange ? searchCaseSensitive : localCase;
@@ -451,9 +492,12 @@ export function LogConsole({
           ...(effectiveCase ? { caseSensitive: true } : {}),
           ...(effectiveLevel !== 'all' ? { level: effectiveLevel } : {}),
         });
-        if (res.cancelled) return;
-        setExportNotice(t('logs.exportSuccess', { count: res.exportedCount }));
-        setTimeout(() => setExportNotice(null), 2500);
+        if (res.cancelled || !res.path) return;
+        const fileName = res.path.split(/[/\\]/).filter(Boolean).pop() || res.path;
+        showExportNotice({
+          text: t('logs.exportSuccessWithPath', { count: res.exportedCount, file: fileName }),
+          title: res.path,
+        });
         return;
       }
       // Browser / fallback export
@@ -465,11 +509,9 @@ export function LogConsole({
       a.download = `${activeSourceId || 'training'}.log`;
       a.click();
       URL.revokeObjectURL(url);
-      setExportNotice(t('logs.exportSuccess', { count: visibleEvents.length }));
-      setTimeout(() => setExportNotice(null), 2500);
+      showExportNotice({ text: t('logs.exportSuccess', { count: visibleEvents.length }) });
     } catch {
-      setExportNotice(t('logs.exportFailed'));
-      setTimeout(() => setExportNotice(null), 2500);
+      showExportNotice({ text: t('logs.exportFailed'), isError: true });
     }
   };
 
@@ -662,16 +704,18 @@ export function LogConsole({
           </h3>
 
           {sources.length > 1 && (
-            <div className="log-source-tabs" role="tablist">
+            <div className="log-source-tabs" role="tablist" aria-label={t('logs.sourceTabsAria')}>
               {sources.map((s) => {
                 const display = friendlySourceName(s.sourceId, s.resolvedPath, sourcePathById?.[s.sourceId]);
                 const tooltip = s.resolvedPath || sourcePathById?.[s.sourceId] || s.sourceId;
                 return (
                   <button
                     key={s.sourceId}
+                    id={`log-source-tab-${s.sourceId}`}
                     type="button"
                     role="tab"
                     aria-selected={s.sourceId === activeSourceId}
+                    aria-controls="log-source-tabpanel"
                     className={`source-tab-btn ${s.sourceId === activeSourceId ? 'is-active' : ''}`}
                     title={`${display} (${tooltip})`}
                     onClick={() => onSelectSource(s.sourceId)}
@@ -683,7 +727,7 @@ export function LogConsole({
             </div>
           )}
 
-          <div className="log-level-filters" role="group" aria-label="Log level filter">
+          <div className="log-level-filters" role="group" aria-label={t('logs.levelFilterAria')}>
             {(
               [
                 ['all', t('logs.levelAll')],
@@ -980,7 +1024,12 @@ export function LogConsole({
       )}
 
       {/* Terminal Stream Viewport */}
-      <div className="log-viewport-wrapper">
+      <div
+        id="log-source-tabpanel"
+        className="log-viewport-wrapper"
+        role={sources.length > 1 ? 'tabpanel' : undefined}
+        aria-labelledby={sources.length > 1 && activeSourceId ? `log-source-tab-${activeSourceId}` : undefined}
+      >
         {isScrollLocked && unreadCount > 0 && (
           <div className="log-unread-floating-banner">
             <span>{t('logs.unreadJump', { count: unreadCount })}</span>
@@ -1172,7 +1221,15 @@ export function LogConsole({
       <div className="log-console-footer">
         <span className="footer-item">{sourceStateBadge}</span>
         <div className="footer-right">
-          {exportNotice && <span className="text-success">{exportNotice}</span>}
+          {exportNotice && (
+            <span
+              className={exportNotice.isError ? 'text-danger' : 'text-success'}
+              role="status"
+              title={exportNotice.title}
+            >
+              {exportNotice.text}
+            </span>
+          )}
           <span className="footer-item tabular-num">
             {t('logs.linesCount', { count: totalBufferedCount.toLocaleString('en-US') })}
           </span>

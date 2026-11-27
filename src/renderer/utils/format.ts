@@ -24,7 +24,7 @@ export function formatTimeOnly(iso: string | null): string {
   }
 }
 
-export function formatBytes(bytes: number | string | null, unknownLabel = '未知'): string {
+export function formatBytes(bytes: number | string | null, unknownLabel = '—'): string {
   if (bytes === null || bytes === undefined) return unknownLabel;
   const n = typeof bytes === 'string' ? Number(bytes) : bytes;
   if (!Number.isFinite(n)) return unknownLabel;
@@ -41,12 +41,12 @@ export function formatMiBAsGiB(mib: number | null | undefined, unknownLabel = '�
   return `${(mib / 1024).toFixed(1)} GiB`;
 }
 
-export function formatNumber(num: number | null, unknownLabel = '未知'): string {
+export function formatNumber(num: number | null, unknownLabel = '—'): string {
   if (num === null || num === undefined || !Number.isFinite(num)) return unknownLabel;
   return num.toLocaleString('en-US');
 }
 
-export function formatPercent(fraction: number | null, unknownLabel = '未知'): string {
+export function formatPercent(fraction: number | null, unknownLabel = '—'): string {
   if (fraction === null || fraction === undefined || !Number.isFinite(fraction)) return unknownLabel;
   return `${(fraction * 100).toFixed(2)}%`;
 }
@@ -56,7 +56,7 @@ export function formatRate(ips: number | null | undefined): string {
   return ips.toFixed(2);
 }
 
-/** Humanized ETA formatter: avoids "0 小时 12 分" or "120 小时 5 分". */
+/** Humanized ETA formatter: avoids verbose zero-hour or multi-hundred-hour strings. */
 export function formatEta(seconds: number | null | undefined, _locale: Locale = 'zh-CN'): string {
   if (seconds === null || seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return '—';
   const total = Math.round(seconds);

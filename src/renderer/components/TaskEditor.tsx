@@ -4,6 +4,7 @@ import type {
   DiscoveredProcess,
   HostSnapshot,
   Registry,
+  SaveRegistryOptions,
   TaskRegistration,
   TaskSourcePathMode,
 } from '../../shared/contracts';
@@ -11,10 +12,12 @@ import { validateAutoStartConfig } from '../../shared/auto-start';
 import { taskAlgorithmName, taskLogFormat } from '../../shared/task-profile';
 import { isValidAbsolutePath } from '../../shared/validate';
 import { useFocusTrap } from '../hooks/useFocusTrap';
+import { parseHostUnreachableReconcileError } from '../hooks/useMonitor';
 import { slugifyTaskId } from '../utils/format';
 import { useI18n } from '../i18n';
 import { Icon } from './Icon';
-import { parseAndValidateTaskForm, type TaskFormInputs } from './task-form';
+import { ForceLocalReconcileModal } from './ForceLocalReconcileModal';
+import { getWorkDirAllowedRootsWarning, parseAndValidateTaskForm, type TaskFormInputs } from './task-form';
 import {
   AutoStartFields,
   autoStartScopeKey,
@@ -36,7 +39,7 @@ interface TaskEditorProps {
   hostSnapshots?: HostSnapshot[];
   focusAutoStart?: boolean;
   onClose: () => void;
-  onSave: (registry: Registry) => Promise<Registry>;
+  onSave: (registry: Registry, options?: SaveRegistryOptions) => Promise<Registry>;
   onSaved: (taskId: string, hostId: string) => void;
   onReload: () => Promise<Registry>;
   onOpenSettings: () => void;
@@ -57,7 +60,7 @@ export function TaskEditor({
   onOpenSettings,
   onRequestDiscoverProcesses,
 }: TaskEditorProps) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const [taskIdTouched, setTaskIdTouched] = useState(Boolean(task));
   const [fields, setFields] = useState<TaskFormInputs>(() => {
     const primaryLog = task?.sources.find((s) => s.kind === 'log');
@@ -71,6 +74,7 @@ export function TaskEditor({
         logFormat: 'generic',
         logPathMode: 'exact',
         attributionMode: 'auto',
+        allowCrossUidScan: false,
         progressRegex: '',
         lossRegex: '',
         allowedDirsStr: initialProcess.cwd ?? '',
@@ -89,6 +93,7 @@ export function TaskEditor({
       logFormat: task ? (taskLogFormat(task).replace(/^legacy_/, '') as TaskFormInputs['logFormat']) : 'generic',
       logPathMode: primaryLog?.pathMode ?? 'exact',
       attributionMode: task?.attributionMode ?? 'auto',
+      allowCrossUidScan: Boolean(task?.allowCrossUidScan),
       progressRegex: task?.customPatterns?.progressRegex ?? '',
       lossRegex: task?.customPatterns?.metricRegexes?.loss ?? '',
       allowedDirsStr: task?.allowedDirectories.join('; ') ?? '',
@@ -114,9 +119,15 @@ export function TaskEditor({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
+  const [pendingForceLocal, setPendingForceLocal] = useState<{
+    registry: Registry;
+    taskId: string;
+    hostId: string;
+    taskCount: number;
+  } | null>(null);
   const autoStartRef = useRef<HTMLElement>(null);
-  const container = useFocusTrap(true, () => {
-    if (!saving) onClose();
+  const container = useFocusTrap(!pendingForceLocal, () => {
+    if (!saving && !pendingForceLocal) onClose();
   });
 
   const change = (key: keyof TaskFormInputs, value: string) => {
@@ -135,13 +146,15 @@ export function TaskEditor({
   const allowWin = selectedHost?.target.kind === 'local';
 
   // Inline field-level validation feedback
+  const typedWorkDirs = fields.allowedDirsStr
+    .split(/[;,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
   const inlineWorkDirInvalid =
-    fields.allowedDirsStr.trim().length > 0 &&
-    fields.allowedDirsStr
-      .split(/[;,]/)
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .some((d) => !isValidAbsolutePath(d, allowWin));
+    typedWorkDirs.length > 0 && typedWorkDirs.some((d) => !isValidAbsolutePath(d, allowWin));
+  const inlineWorkDirRootsWarning = inlineWorkDirInvalid
+    ? null
+    : getWorkDirAllowedRootsWarning(typedWorkDirs, selectedHost, locale);
 
   const inlineLogInvalid =
     fields.logPath.trim().length > 0 && !isValidAbsolutePath(fields.logPath.trim(), allowWin);
@@ -220,7 +233,7 @@ export function TaskEditor({
         return { config: undefined, error: null };
       }
     }
-    const { payload, error: payloadErr } = buildAutoStartPayload(resolvedDraft, taskContext);
+    const { payload, error: payloadErr } = buildAutoStartPayload(resolvedDraft, taskContext, locale);
     if (!payload) return { config: undefined, error: payloadErr };
     const priorScope = priorTask ? autoStartScopeKey(priorTask) : null;
     const nextScope = autoStartScopeKey(parsedTask);
@@ -254,24 +267,24 @@ export function TaskEditor({
     try {
       return { config: validateAutoStartConfig(candidate, parsedTask), error: null };
     } catch {
-      return { config: undefined, error: '自动启动配置无效，请检查解释器、目录和日志来源' };
+      return { config: undefined, error: t('taskEditor.validation.autoStartInvalid') };
     }
   }
 
   async function save(event: React.FormEvent) {
     event.preventDefault();
     if (saving) return;
-    const parsed = parseAndValidateTaskForm(fields, registry.hosts, registry.tasks, task?.taskId);
+    const parsed = parseAndValidateTaskForm(fields, registry.hosts, registry.tasks, task?.taskId, locale);
     if (!parsed.task) {
       setError(parsed.error);
       return;
     }
     if (task && !registry.tasks.some((item) => item.taskId === task.taskId)) {
-      setError('该任务已被移除，请关闭后重新添加。');
+      setError(t('taskEditor.validation.taskRemoved'));
       return;
     }
     if (autoStartDraft.enabled && selectedHost?.target.kind !== 'ssh') {
-      setError('仅远程 SSH 服务器支持托管等待');
+      setError(t('taskEditor.validation.autoStartSshOnly'));
       return;
     }
     const autoStart = resolveAutoStartForTask(parsed.task, task?.autoStart, task, autoStartDraft);
@@ -282,20 +295,51 @@ export function TaskEditor({
     const nextTask: TaskRegistration = { ...parsed.task, enabled };
     if (autoStart.config) nextTask.autoStart = autoStart.config;
     else delete nextTask.autoStart;
+    const nextRegistry: Registry = {
+      ...registry,
+      tasks: task
+        ? registry.tasks.map((item) => (item.taskId === task.taskId ? nextTask : item))
+        : [...registry.tasks, nextTask],
+    };
     setSaving(true);
     setError(null);
     setConflict(false);
     try {
-      await onSave({
-        ...registry,
-        tasks: task
-          ? registry.tasks.map((item) => (item.taskId === task.taskId ? nextTask : item))
-          : [...registry.tasks, nextTask],
-      });
+      await onSave(nextRegistry);
       onSaved(nextTask.taskId, nextTask.hostId);
     } catch (reason) {
+      const reconcile = parseHostUnreachableReconcileError(reason);
+      if (reconcile) {
+        setPendingForceLocal({
+          registry: nextRegistry,
+          taskId: nextTask.taskId,
+          hostId: nextTask.hostId,
+          taskCount: reconcile.taskCount,
+        });
+        return;
+      }
       const message = reason instanceof Error ? reason.message : String(reason);
-      setConflict(/revision|conflict|409|冲突/i.test(message));
+      setConflict(/revision|conflict|409/i.test(message) || message === t('errors.REVISION_CONFLICT'));
+      setError(message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function confirmForceLocalSave() {
+    if (!pendingForceLocal || saving) return;
+    setSaving(true);
+    setError(null);
+    setConflict(false);
+    try {
+      await onSave(pendingForceLocal.registry, { forceLocal: true });
+      const { taskId: savedTaskId, hostId: savedHostId } = pendingForceLocal;
+      setPendingForceLocal(null);
+      onSaved(savedTaskId, savedHostId);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setPendingForceLocal(null);
+      setConflict(/revision|conflict|409/i.test(message) || message === t('errors.REVISION_CONFLICT'));
       setError(message);
     } finally {
       setSaving(false);
@@ -303,7 +347,7 @@ export function TaskEditor({
   }
 
   return (
-    <div className="modal-overlay" onClick={() => !saving && onClose()}>
+    <div className="modal-overlay" onClick={() => !saving && !pendingForceLocal && onClose()}>
       <div
         className="modal-container task-editor"
         ref={container}
@@ -382,7 +426,7 @@ export function TaskEditor({
                     {t('taskEditor.fieldTaskLabel')}
                     <input
                       className="form-input"
-                      placeholder="例如: Llama-3-8B LoRA SFT"
+                      placeholder={t('taskEditor.placeholderLabel')}
                       value={fields.label}
                       onChange={(e) => change('label', e.target.value)}
                     />
@@ -391,7 +435,7 @@ export function TaskEditor({
                     {t('taskEditor.fieldTaskId')}
                     <input
                       className="form-input is-mono"
-                      placeholder="自动根据名称生成"
+                      placeholder={t('taskEditor.placeholderTaskId')}
                       value={fields.taskId}
                       disabled={!!task}
                       onChange={(e) => {
@@ -422,7 +466,7 @@ export function TaskEditor({
                     {t('taskEditor.fieldAlgorithm')}
                     <input
                       className="form-input"
-                      placeholder="输入任意算法或模型名称"
+                      placeholder={t('taskEditor.placeholderAlgorithm')}
                       maxLength={120}
                       value={fields.algorithm}
                       onChange={(e) => change('algorithm', e.target.value)}
@@ -435,14 +479,29 @@ export function TaskEditor({
                   {t('taskEditor.fieldWorkDir')}
                   <input
                     className={`form-input is-mono ${inlineWorkDirInvalid ? 'is-invalid' : ''}`}
-                    placeholder={allowWin ? '/workspace/project 或 C:\\Projects\\exp' : '/workspace/project'}
+                    placeholder={allowWin ? t('taskEditor.placeholderWorkDirLocal') : '/workspace/project'}
                     value={fields.allowedDirsStr}
                     onChange={(e) => change('allowedDirsStr', e.target.value)}
                   />
                   {inlineWorkDirInvalid && (
                     <span className="form-field-error">
-                      {allowWin ? '工作目录需为绝对路径' : '工作目录需以 / 开头'}
+                      {allowWin ? t('taskEditor.inlineWorkDirAbs') : t('taskEditor.inlineWorkDirSlash')}
                     </span>
+                  )}
+                  {inlineWorkDirRootsWarning && (
+                    <div className="alert alert-warning" role="status">
+                      <span>{inlineWorkDirRootsWarning}</span>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-xs"
+                        onClick={() => {
+                          onClose();
+                          onOpenSettings();
+                        }}
+                      >
+                        {t('hostOverview.openSettingsBtn')}
+                      </button>
+                    </div>
                   )}
                 </label>
 
@@ -450,7 +509,7 @@ export function TaskEditor({
                   {t('taskEditor.fieldEntry')}
                   <input
                     className="form-input is-mono"
-                    placeholder="例如: train.py 或 src/train_sft.py"
+                    placeholder={t('taskEditor.placeholderEntry')}
                     value={fields.entryPathsStr}
                     onChange={(e) => change('entryPathsStr', e.target.value)}
                   />
@@ -466,7 +525,7 @@ export function TaskEditor({
                   />
                   {inlineLogInvalid && (
                     <span className="form-field-error">
-                      {allowWin ? '日志路径需为绝对路径' : '日志路径需以 / 开头'}
+                      {allowWin ? t('taskEditor.inlineLogAbs') : t('taskEditor.inlineLogSlash')}
                     </span>
                   )}
                 </label>
@@ -523,11 +582,23 @@ export function TaskEditor({
                       </select>
                     </label>
 
+                    <label className="setting-check-row">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(fields.allowCrossUidScan)}
+                        onChange={(e) =>
+                          setFields((previous) => ({ ...previous, allowCrossUidScan: e.target.checked }))
+                        }
+                      />
+                      <span>{t('taskEditor.fieldAllowCrossUidScan')}</span>
+                    </label>
+                    <p className="form-hint">{t('taskEditor.allowCrossUidScanHelp')}</p>
+
                     <label className="form-label">
                       {t('taskEditor.fieldProgressRegex')}
                       <input
                         className="form-input is-mono"
-                        placeholder="例如: step=(?<current>\d+)/(?<total>\d+)"
+                        placeholder={t('taskEditor.placeholderProgressRegex')}
                         value={fields.progressRegex ?? ''}
                         onChange={(e) => change('progressRegex', e.target.value)}
                       />
@@ -537,7 +608,7 @@ export function TaskEditor({
                       {t('taskEditor.fieldLossRegex')}
                       <input
                         className="form-input is-mono"
-                        placeholder="例如: train_loss[:=]\s*([0-9.eE+-]+)"
+                        placeholder={t('taskEditor.placeholderLossRegex')}
                         value={fields.lossRegex ?? ''}
                         onChange={(e) => change('lossRegex', e.target.value)}
                       />
@@ -607,6 +678,17 @@ export function TaskEditor({
           </div>
         </form>
       </div>
+
+      {pendingForceLocal && (
+        <ForceLocalReconcileModal
+          taskCount={pendingForceLocal.taskCount}
+          busy={saving}
+          onCancel={() => {
+            if (!saving) setPendingForceLocal(null);
+          }}
+          onConfirm={() => void confirmForceLocalSave()}
+        />
+      )}
     </div>
   );
 }

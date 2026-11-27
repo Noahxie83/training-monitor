@@ -18,6 +18,7 @@ interface AutoStartPanelProps {
   status?: AutoStartStatus | null;
   hostSnapshots?: HostSnapshot[];
   hostId?: string;
+  taskId?: string;
   onConfigure: () => void;
   onRearm: () => void;
   onDisable: () => void;
@@ -28,6 +29,8 @@ interface AutoStartPanelProps {
 export function AutoStartPanel({
   config,
   status,
+  hostId,
+  taskId,
   onConfigure,
   onRearm,
   onDisable,
@@ -76,7 +79,7 @@ export function AutoStartPanel({
           count: gpuCount,
         })
       : gpuCount === 1
-        ? '全部 GPU · 任意一张'
+        ? t('autoStart.summaryAllPoolAny')
         : t('autoStart.summaryAllPool', { count: gpuCount });
 
   const selectedDevicesLabel = status?.selectedDeviceIds?.length
@@ -94,11 +97,27 @@ export function AutoStartPanel({
   const copyTmux = async () => {
     if (!tmuxCommand) return;
     try {
-      await navigator.clipboard?.writeText(tmuxCommand);
+      if (window.desktop?.copyCommand && hostId && taskId) {
+        try {
+          await window.desktop.copyCommand({ kind: 'tmux_attach', hostId, taskId });
+        } catch {
+          if (window.desktop.copyDiagnosticText) {
+            await window.desktop.copyDiagnosticText(tmuxCommand);
+          } else {
+            throw new Error('COPY_FAILED');
+          }
+        }
+      } else if (window.desktop?.copyDiagnosticText) {
+        await window.desktop.copyDiagnosticText(tmuxCommand);
+      } else if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(tmuxCommand);
+      } else {
+        return;
+      }
       setCopiedTmux(true);
       setTimeout(() => setCopiedTmux(false), 1800);
     } catch {
-      // Clipboard may be restricted in jsdom tests
+      // Clipboard failed — do not claim copied
     }
   };
 

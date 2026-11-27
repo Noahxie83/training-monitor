@@ -9,6 +9,11 @@
   overflow: hidden;
 }
 
+/* macOS hiddenInset traffic-light safe area fallback */
+html.platform-darwin {
+  --titlebar-inset-left: 78px;
+}
+
 /* 44px integrated frameless titlebar / top bar */
 .app-header {
   position: relative;
@@ -18,7 +23,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding-left: calc(14px + env(titlebar-area-x, 0px));
+  padding-left: calc(14px + max(env(titlebar-area-x, 0px), var(--titlebar-inset-left, 0px)));
   padding-right: calc(14px + max(0px, 100vw - env(titlebar-area-width, 100vw) - env(titlebar-area-x, 0px)));
   background-color: var(--bg-header);
   border-bottom: 1px solid var(--border-subtle);
@@ -173,7 +178,7 @@
   padding: 0 3px;
   border-radius: var(--radius-pill);
   background-color: var(--status-danger);
-  color: #FFFFFF;
+  color: var(--danger-ink);
   font-family: var(--font-mono);
   font-size: 9.5px;
   font-weight: 600;

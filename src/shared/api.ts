@@ -145,6 +145,7 @@ export interface CopyCommandRequest {
 
 /** Native window and host-environment actions are separate from the portable monitor data API. */
 export interface DesktopApi {
+  platform?: string;
   openGpuWindow(hostId?: string): Promise<void>;
   clearAlerts?(): Promise<void>;
   setActiveTask?(taskId: string | null): Promise<void>;
@@ -156,5 +157,5 @@ export interface DesktopApi {
   discoverWslDistros(): Promise<DiscoveredWslDistro[]>;
   openSshTerminal?(request: OpenSshTerminalRequest): Promise<{ ok: boolean; command: string; error: string | null }>;
   copyCommand?(request: CopyCommandRequest): Promise<string>;
-  onFocusTask?(listener: (taskId: string) => void): () => void;
+  onFocusTask?(listener: (taskId: string, hostId?: string) => void): () => void;
 }

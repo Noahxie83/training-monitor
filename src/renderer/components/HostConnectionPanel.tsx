@@ -58,7 +58,7 @@ export function HostConnectionPanel({
   return (
     <section
       className={`host-inline-alert-strip ${isDanger ? 'is-danger' : isInfo ? 'is-info' : ''}`}
-      aria-label={`${host.hostId}连接状态`}
+      aria-label={t('header.hostConnectionStatusAria', { hostId: host.hostId })}
     >
       <div className="host-inline-alert-main">
         <Icon name={isDanger ? 'warning' : 'info'} size={14} />

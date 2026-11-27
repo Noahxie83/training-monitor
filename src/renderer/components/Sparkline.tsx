@@ -19,10 +19,14 @@ export function Sparkline({ points, colorVar = 'var(--load-active)', ariaLabel }
 
     const utilCoords: string[] = [];
     const memCoords: string[] = [];
+    let firstUtilX: string | null = null;
+    let lastUtilX: string | null = null;
 
     points.forEach((pt, idx) => {
       const x = xOf(idx).toFixed(1);
       if (pt.utilPct !== null && Number.isFinite(pt.utilPct)) {
+        if (firstUtilX === null) firstUtilX = x;
+        lastUtilX = x;
         utilCoords.push(`${utilCoords.length === 0 ? 'M' : 'L'}${x},${yOf(pt.utilPct).toFixed(1)}`);
       }
       if (
@@ -41,8 +45,8 @@ export function Sparkline({ points, colorVar = 'var(--load-active)', ariaLabel }
 
     const utilPath = utilCoords.join(' ');
     const areaPath =
-      utilCoords.length >= 2
-        ? `${utilPath} L${w.toFixed(1)},${(h - padY).toFixed(1)} L0,${(h - padY).toFixed(1)} Z`
+      utilCoords.length >= 2 && firstUtilX !== null && lastUtilX !== null
+        ? `${utilPath} L${lastUtilX},${(h - padY).toFixed(1)} L${firstUtilX},${(h - padY).toFixed(1)} Z`
         : '';
 
     return {

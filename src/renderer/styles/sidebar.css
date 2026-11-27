@@ -147,6 +147,10 @@
   color: var(--text-primary);
 }
 
+.fleet-host-add {
+  flex-shrink: 0;
+}
+
 .fleet-empty-host {
   padding: 6px 10px;
   color: var(--text-muted);

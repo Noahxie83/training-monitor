@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useMonitor } from '../hooks/useMonitor';
 import { useGpuHistory } from '../hooks/useGpuHistory';
-import { I18nProvider, translateHostError, useI18n } from '../i18n';
+import { I18nProvider, translate, translateHostError, useI18n } from '../i18n';
 import { FleetSummaryStrip, buildNormalizedGpuCards } from './FleetSummaryStrip';
 import { GpuDeviceMetrics } from './ResourceMetrics';
 import { Icon } from './Icon';
@@ -26,11 +26,19 @@ function GpuMonitorInner() {
     isLoadingSnapshot,
     retrySnapshotLoad,
   } = useMonitor();
-  const { t } = useI18n();
   const [requestedHostId, setRequestedHostId] = useState<string | null>(() =>
     new URLSearchParams(window.location.search).get('hostId'),
   );
   const [filter, setFilter] = useState<'all' | 'idle'>('all');
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    if (window.desktop?.platform === 'darwin') {
+      document.documentElement.classList.add('platform-darwin');
+    } else {
+      document.documentElement.classList.remove('platform-darwin');
+    }
+  }, []);
 
   useEffect(() => window.desktop?.onGpuHostSelected(setRequestedHostId), []);
   useEffect(() => {
@@ -56,26 +64,14 @@ function GpuMonitorInner() {
   const cards = useMemo(() => buildNormalizedGpuCards(resources, gpu?.devices), [resources, gpu?.devices]);
   const hasSamples = cards.length > 0;
   const stale = hasSamples && resources.some((metric) => metric.freshness !== 'fresh');
-  const connectionMessage =
-    activeHost &&
-    (hostConnectionErrors[activeHost.hostId] ||
-      translateHostError(locale, activeHost.errorCode, activeHost.kind, registration));
   const noGpuDevice =
     connected && (activeHost?.acceleratorAvailability === 'none' || gpu?.acceleratorAvailability === 'none');
   const gpuUnavailable = connected && !noGpuDevice && gpu?.state === 'unavailable';
-  const status = connecting
-    ? t('header.hostConnecting')
-    : disabled
-      ? t('header.hostDisabled')
-      : connected
-        ? t('header.hostConnected')
-        : activeHost?.connection === 'disconnected'
-          ? t('header.hostDisconnected')
-          : t('header.hostPending');
 
   return (
     <I18nProvider
       locale={locale}
+      documentTitle={translate(locale, 'app.gpuMonitorTitle')}
       onChangeLocale={(next) => {
         void updatePreferences({ ...preferences, locale: next }).catch(() => undefined);
       }}
@@ -87,6 +83,7 @@ function GpuMonitorInner() {
         activeHostId={activeHostId}
         selectHost={selectHost}
         connectHost={connectHost}
+        hostConnectionErrors={hostConnectionErrors}
         resolvedTheme={resolvedTheme}
         preferences={preferences}
         updatePreferences={updatePreferences}
@@ -104,10 +101,8 @@ function GpuMonitorInner() {
         gpuHistory={gpuHistory}
         hasSamples={hasSamples}
         stale={stale}
-        connectionMessage={connectionMessage}
         noGpuDevice={noGpuDevice}
         gpuUnavailable={gpuUnavailable}
-        status={status}
         filter={filter}
         setFilter={setFilter}
       />
@@ -122,6 +117,7 @@ function GpuMonitorContent({
   activeHostId,
   selectHost,
   connectHost,
+  hostConnectionErrors,
   resolvedTheme,
   preferences,
   updatePreferences,
@@ -139,14 +135,27 @@ function GpuMonitorContent({
   gpuHistory,
   hasSamples,
   stale,
-  connectionMessage,
   noGpuDevice,
   gpuUnavailable,
-  status,
   filter,
   setFilter,
 }: any) {
   const { locale, t } = useI18n();
+
+  const connectionMessage =
+    activeHost &&
+    (hostConnectionErrors[activeHost.hostId] ||
+      translateHostError(locale, activeHost.errorCode, activeHost.kind, registration));
+
+  const status = connecting
+    ? t('header.hostConnecting')
+    : disabled
+      ? t('header.hostDisabled')
+      : connected
+        ? t('header.hostConnected')
+        : activeHost?.connection === 'disconnected'
+          ? t('header.hostDisconnected')
+          : t('header.hostPending');
 
   return (
     <div className="app-shell gpu-monitor-page" data-theme={resolvedTheme}>

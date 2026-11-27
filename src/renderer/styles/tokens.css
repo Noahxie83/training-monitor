@@ -116,6 +116,7 @@
   --status-danger: #DC2626;
   --status-danger-bg: rgba(220, 38, 38, 0.10);
   --status-danger-border: rgba(220, 38, 38, 0.26);
+  --danger-ink: #FFFFFF;
 
   --status-info: #2563EB;
   --status-info-bg: rgba(37, 99, 235, 0.10);
@@ -227,6 +228,7 @@
   --status-danger: #F87171;
   --status-danger-bg: rgba(248, 113, 113, 0.12);
   --status-danger-border: rgba(248, 113, 113, 0.28);
+  --danger-ink: #0B1120;
 
   --status-info: #60A5FA;
   --status-info-bg: rgba(96, 165, 250, 0.12);

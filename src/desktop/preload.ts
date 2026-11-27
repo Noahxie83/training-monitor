@@ -93,14 +93,27 @@ ipcRenderer.on(c.gpuHost, (_event, hostId: unknown) => {
   if (!hostListeners.size) pendingHostId = hostId;
   else for (const listener of hostListeners) listener(hostId);
 });
-const focusTaskListeners = new Set<(taskId: string) => void>();
-let pendingTaskId: string | undefined;
-ipcRenderer.on(c.focusTask, (_event, taskId: unknown) => {
-  if (typeof taskId !== 'string' || !taskId) return;
-  if (!focusTaskListeners.size) pendingTaskId = taskId;
-  else for (const listener of focusTaskListeners) listener(taskId);
+const focusTaskListeners = new Set<(taskId: string, hostId?: string) => void>();
+let pendingFocusTask: { taskId: string; hostId?: string } | undefined;
+ipcRenderer.on(c.focusTask, (_event, payload: unknown) => {
+  let target: { taskId: string; hostId?: string } | null = null;
+  if (typeof payload === 'string' && payload) {
+    target = { taskId: payload };
+  } else if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const item = payload as { taskId?: unknown; hostId?: unknown };
+    if (typeof item.taskId === 'string' && item.taskId) {
+      target = {
+        taskId: item.taskId,
+        ...(typeof item.hostId === 'string' && item.hostId ? { hostId: item.hostId } : {}),
+      };
+    }
+  }
+  if (!target) return;
+  if (!focusTaskListeners.size) pendingFocusTask = target;
+  else for (const listener of focusTaskListeners) listener(target.taskId, target.hostId);
 });
 const desktop: DesktopApi = {
+  platform: process.platform,
   async openGpuWindow(hostId) {
     if (hostId !== undefined && (typeof hostId !== 'string' || !hostId || hostId.length > 256)) throw new TypeError('INVALID_HOST_ID');
     await ipcRenderer.invoke(c.openGpu, hostId);
@@ -137,12 +150,12 @@ const desktop: DesktopApi = {
   async copyCommand(request) { return ipcRenderer.invoke(c.copyCommand, request); },
   onFocusTask(listener) {
     focusTaskListeners.add(listener);
-    const taskId = pendingTaskId;
-    if (taskId) {
+    const target = pendingFocusTask;
+    if (target) {
       queueMicrotask(() => {
-        if (focusTaskListeners.has(listener) && pendingTaskId === taskId) {
-          pendingTaskId = undefined;
-          listener(taskId);
+        if (focusTaskListeners.has(listener) && pendingFocusTask === target) {
+          pendingFocusTask = undefined;
+          listener(target.taskId, target.hostId);
         }
       });
     }

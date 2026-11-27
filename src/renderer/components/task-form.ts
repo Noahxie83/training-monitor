@@ -7,6 +7,7 @@ import type {
 } from '../../shared/contracts';
 import { normalizeLogFormat, taskAlgorithmName, taskLogFormat } from '../../shared/task-profile';
 import { isSafeRegexPattern, isValidAbsolutePath } from '../../shared/validate';
+import { translate, type Locale } from '../i18n';
 
 export interface TaskFormInputs {
   taskId: string;
@@ -16,6 +17,7 @@ export interface TaskFormInputs {
   logFormat?: LogFormat;
   logPathMode?: TaskSourcePathMode;
   attributionMode?: 'auto' | 'log_only';
+  allowCrossUidScan?: boolean;
   progressRegex?: string;
   lossRegex?: string;
   allowedDirsStr: string;
@@ -26,33 +28,65 @@ export interface TaskFormInputs {
   lockPath?: string;
 }
 
+export function isWithinAllowedRoots(dir: string, allowedRoots: string[], allowWinPath: boolean): boolean {
+  if (allowedRoots.length === 0) return true;
+  const normalize = (p: string) => {
+    const unified = allowWinPath ? p.replace(/\\/g, '/').toLowerCase() : p;
+    return unified.length > 1 ? unified.replace(/\/+$/, '') : unified;
+  };
+  const target = normalize(dir);
+  return allowedRoots.some((root) => {
+    const base = normalize(root);
+    if (base === '/') return target.startsWith('/');
+    return target === base || target.startsWith(`${base}/`);
+  });
+}
+
+export function getWorkDirAllowedRootsWarning(
+  dirs: string[],
+  selectedHost: HostRegistration | undefined,
+  locale: Locale = 'zh-CN',
+): string | null {
+  if (!selectedHost || selectedHost.allowedRoots.length === 0 || dirs.length === 0) return null;
+  const allowWinPath = selectedHost.target.kind === 'local';
+  const outside = dirs.some((d) => !isWithinAllowedRoots(d, selectedHost.allowedRoots, allowWinPath));
+  if (!outside) return null;
+  return translate(locale, 'taskEditor.validation.workDirOutsideRoots', {
+    roots: selectedHost.allowedRoots.join('; '),
+  });
+}
+
 export function parseAndValidateTaskForm(
   fields: TaskFormInputs,
   availableHosts: HostRegistration[],
   existingTasks: TaskRegistration[],
   isEditingTaskId?: string | null,
-): { task: TaskRegistration | null; error: string | null } {
+  locale: Locale = 'zh-CN',
+): { task: TaskRegistration | null; error: string | null; warning?: string | null } {
+  const tr = (key: string, params?: Record<string, string | number | null | undefined>) =>
+    translate(locale, `taskEditor.validation.${key}`, params);
+
   const id = fields.taskId.trim();
   if (!id) {
-    return { task: null, error: '任务 ID 不能为空' };
+    return { task: null, error: tr('taskIdRequired') };
   }
   if (!isEditingTaskId || isEditingTaskId !== id) {
     if (existingTasks.some((t) => t.taskId === id)) {
-      return { task: null, error: '该任务 ID 已存在' };
+      return { task: null, error: tr('taskIdExists') };
     }
   }
   const selectedHost = availableHosts.find((h) => h.hostId === fields.hostId);
   if (!fields.hostId || !selectedHost) {
-    return { task: null, error: '任务所属宿主不存在，请先添加或选择宿主' };
+    return { task: null, error: tr('hostMissing') };
   }
   const allowWinPath = selectedHost.target.kind === 'local';
   const algorithmName = fields.algorithm.trim();
   if (algorithmName.length > 120 || /[\u0000-\u001f\u007f]/.test(algorithmName)) {
-    return { task: null, error: '算法名称最多 120 个字符，不能包含控制字符' };
+    return { task: null, error: tr('algorithmInvalid') };
   }
   const format = fields.logFormat ?? 'generic';
   if (!['generic', 'legacy_flow', 'legacy_score', 'legacy_reflow', 'flow', 'score', 'reflow', 'raw'].includes(format)) {
-    return { task: null, error: '请选择有效的日志识别方式' };
+    return { task: null, error: tr('logFormatInvalid') };
   }
 
   const dirs = fields.allowedDirsStr
@@ -60,20 +94,21 @@ export function parseAndValidateTaskForm(
     .map((s) => s.trim())
     .filter(Boolean);
   if (dirs.length === 0) {
-    return { task: null, error: allowWinPath ? '工作目录不能为空，且必须为绝对路径' : '工作目录不能为空，且必须以 / 开头' };
+    return { task: null, error: allowWinPath ? tr('workDirRequiredWin') : tr('workDirRequiredPosix') };
   }
   for (const d of dirs) {
     if (!isValidAbsolutePath(d, allowWinPath)) {
-      return { task: null, error: allowWinPath ? '工作目录必须为绝对路径' : '工作目录必须以 / 开头' };
+      return { task: null, error: allowWinPath ? tr('workDirAbsWin') : tr('workDirAbsPosix') };
     }
   }
+  const warning = getWorkDirAllowedRootsWarning(dirs, selectedHost, locale);
 
   const entries = fields.entryPathsStr
     .split(/[;,]/)
     .map((s) => s.trim())
     .filter(Boolean);
   if (entries.length === 0) {
-    return { task: null, error: '脚本入口路径不能为空' };
+    return { task: null, error: tr('entryRequired') };
   }
 
   const ckpts = fields.ckptDirsStr
@@ -82,7 +117,7 @@ export function parseAndValidateTaskForm(
     .filter(Boolean);
   for (const c of ckpts) {
     if (!isValidAbsolutePath(c, allowWinPath)) {
-      return { task: null, error: allowWinPath ? '检查点目录必须为绝对路径' : '检查点目录必须以 / 开头' };
+      return { task: null, error: allowWinPath ? tr('ckptAbsWin') : tr('ckptAbsPosix') };
     }
   }
 
@@ -91,13 +126,13 @@ export function parseAndValidateTaskForm(
   const lossRe = fields.lossRegex?.trim();
   if (progressRe) {
     if (!isSafeRegexPattern(progressRe)) {
-      return { task: null, error: '自定义进度正则表达式语法无效或存在回溯风险' };
+      return { task: null, error: tr('progressRegexInvalid') };
     }
     customPatterns = { ...(customPatterns ?? {}), progressRegex: progressRe };
   }
   if (lossRe) {
     if (!isSafeRegexPattern(lossRe)) {
-      return { task: null, error: '自定义 Loss 正则表达式语法无效或存在回溯风险' };
+      return { task: null, error: tr('lossRegexInvalid') };
     }
     customPatterns = { ...(customPatterns ?? {}), metricRegexes: { loss: lossRe } };
   }
@@ -157,7 +192,7 @@ export function parseAndValidateTaskForm(
   }
 
   if (sources.length === 0) {
-    return { task: null, error: '至少需要配置一个有效的日志或状态文件路径' };
+    return { task: null, error: tr('sourceRequired') };
   }
 
   const task: TaskRegistration = {
@@ -169,11 +204,12 @@ export function parseAndValidateTaskForm(
     ...(retainLegacyProfile ? {} : { logFormat: format }),
     ...(customPatterns ? { customPatterns } : {}),
     ...(fields.attributionMode && fields.attributionMode !== 'auto' ? { attributionMode: fields.attributionMode } : {}),
+    ...(fields.allowCrossUidScan ? { allowCrossUidScan: true } : {}),
     allowedDirectories: dirs,
     entryPaths: entries,
     sources,
     checkpointDirectories: ckpts,
   };
 
-  return { task, error: null };
+  return { task, error: null, warning };
 }

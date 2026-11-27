@@ -1,10 +1,46 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { projectRegistrySnapshot } from '../../shared/registry-snapshot';
 import type { MonitorSnapshot, MonitorUpdate } from '../../shared/api';
-import type { AlertEvent, Preferences, Registry } from '../../shared/contracts';
+import type { AlertEvent, Preferences, Registry, SaveRegistryOptions } from '../../shared/contracts';
 import { translate, type Locale } from '../i18n';
 
 const MAX_RECENT_ALERTS = 50;
+
+export class HostUnreachableReconcileClientError extends Error {
+  readonly code = 'HOST_UNREACHABLE_RECONCILE' as const;
+  readonly errorCode = 'HOST_UNREACHABLE_RECONCILE' as const;
+  readonly taskCount: number;
+
+  constructor(taskCount: number, message: string) {
+    super(message);
+    this.name = 'HostUnreachableReconcileClientError';
+    this.taskCount = taskCount;
+  }
+}
+
+export function parseHostUnreachableReconcileError(err: unknown): { taskCount: number } | null {
+  if (!err) return null;
+  if (err instanceof HostUnreachableReconcileClientError) {
+    return { taskCount: err.taskCount };
+  }
+  const obj = err as {
+    code?: unknown;
+    errorCode?: unknown;
+    errorParams?: { taskCount?: unknown };
+    message?: unknown;
+  };
+  if (obj.errorCode === 'HOST_UNREACHABLE_RECONCILE' || obj.code === 'HOST_UNREACHABLE_RECONCILE') {
+    const count = Number(obj.errorParams?.taskCount);
+    return { taskCount: Number.isSafeInteger(count) && count > 0 ? count : 1 };
+  }
+  const msg = typeof obj.message === 'string' ? obj.message : String(err);
+  const match = /HOST_UNREACHABLE_RECONCILE(?::(\d+))?/.exec(msg);
+  if (match) {
+    const count = match[1] ? Number(match[1]) : 1;
+    return { taskCount: Number.isSafeInteger(count) && count > 0 ? count : 1 };
+  }
+  return null;
+}
 
 function applyDocumentTheme(nextTheme: 'light' | 'dark'): void {
   if (typeof document === 'undefined') return;
@@ -33,6 +69,7 @@ export function useMonitor() {
     view: 'task',
   });
   const rememberedTasks = useRef(new Map<string, string>());
+  const pendingFocusRef = useRef<{ taskId: string; hostId?: string } | null>(null);
   const connecting = useRef(new Set<string>());
   const [connectingHostIds, setConnectingHostIds] = useState<string[]>([]);
   const [hostConnectionErrors, setHostConnectionErrors] = useState<Record<string, string>>({});
@@ -59,6 +96,9 @@ export function useMonitor() {
     [cachedSnapshot, registry],
   );
 
+  const snapshotRef = useRef<MonitorSnapshot | null>(snapshot);
+  snapshotRef.current = snapshot;
+
   const [registryError, setRegistryError] = useState<string | null>(null);
   const [announcement, setAnnouncement] = useState<string>('');
   const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
@@ -78,6 +118,10 @@ export function useMonitor() {
   const prevHostsRef = useRef<Map<string, string>>(new Map());
 
   const locale: Locale = preferences.locale === 'en-US' ? 'en-US' : 'zh-CN';
+  const localeRef = useRef<Locale>(locale);
+  localeRef.current = locale;
+  const themePreferenceRef = useRef<Preferences['theme']>(preferences.theme);
+  themePreferenceRef.current = preferences.theme;
 
   // Apply theme to document with 1-frame anti-flash protection
   const applyTheme = useCallback((theme: 'system' | 'light' | 'dark') => {
@@ -102,6 +146,7 @@ export function useMonitor() {
 
     const mql = window.matchMedia('(prefers-color-scheme: dark)');
     const handleChange = (e: MediaQueryListEvent) => {
+      if (themePreferenceRef.current !== 'system') return;
       const nextTheme = e.matches ? 'dark' : 'light';
       applyDocumentTheme(nextTheme);
       setResolvedTheme(nextTheme);
@@ -127,7 +172,12 @@ export function useMonitor() {
       setLastSyncTime(new Date().toISOString());
     } catch (err: any) {
       if (mountedRef.current && request === snapshotRequest.current) {
-        setSnapshotError('读取初始快照失败: ' + (err?.message || '未知错误'));
+        const loc = localeRef.current;
+        setSnapshotError(
+          translate(loc, 'monitor.loadSnapshotFailed', {
+            reason: err?.message || translate(loc, 'app.unknownError'),
+          }),
+        );
       }
     } finally {
       if (mountedRef.current && request === snapshotRequest.current) setIsLoadingSnapshot(false);
@@ -142,11 +192,18 @@ export function useMonitor() {
     try {
       const prefs = await window.monitor.getPreferences();
       if (!mountedRef.current || request !== preferencesRequest.current) return;
+      localeRef.current = prefs.locale === 'en-US' ? 'en-US' : 'zh-CN';
+      themePreferenceRef.current = prefs.theme;
       setPreferences(prefs);
       applyTheme(prefs.theme);
     } catch (err: any) {
       if (mountedRef.current && request === preferencesRequest.current) {
-        setPreferencesError('读取偏好设置失败: ' + (err?.message || '未知错误'));
+        const loc = localeRef.current;
+        setPreferencesError(
+          translate(loc, 'monitor.loadPreferencesFailed', {
+            reason: err?.message || translate(loc, 'app.unknownError'),
+          }),
+        );
       }
     } finally {
       if (mountedRef.current && request === preferencesRequest.current) setIsLoadingPreferences(false);
@@ -163,6 +220,8 @@ export function useMonitor() {
     const stopPreferenceUpdates = window.desktop?.onPreferencesChanged((value) => {
       if (!mounted) return;
       preferencesRequest.current++;
+      localeRef.current = value.locale === 'en-US' ? 'en-US' : 'zh-CN';
+      themePreferenceRef.current = value.theme;
       setPreferences(value);
       applyTheme(value.theme);
       setIsLoadingPreferences(false);
@@ -173,9 +232,19 @@ export function useMonitor() {
     const stopRegistryUpdates = window.desktop?.onRegistryChanged((value) => {
       if (mounted) setRegistry((previous) => (previous && previous.revision > value.revision ? previous : value));
     });
-    const stopFocusTask = window.desktop?.onFocusTask?.((taskId) => {
+    const stopFocusTask = window.desktop?.onFocusTask?.((taskId, explicitHostId) => {
       if (!mounted) return;
-      setSelection((current) => ({ ...current, taskId, view: 'task' }));
+      const latest = snapshotRef.current;
+      const foundTask = latest?.tasks.find((item) => item.taskId === taskId);
+      const resolvedHostId = foundTask?.hostId ?? explicitHostId ?? null;
+      if (resolvedHostId) {
+        rememberedTasks.current.set(resolvedHostId, taskId);
+        pendingFocusRef.current = foundTask ? null : { taskId, hostId: resolvedHostId };
+        setSelection({ hostId: resolvedHostId, taskId, view: 'task' });
+      } else {
+        pendingFocusRef.current = { taskId };
+        setSelection((current) => ({ ...current, taskId, view: 'task' }));
+      }
     });
 
     window.monitor
@@ -184,7 +253,14 @@ export function useMonitor() {
         if (mounted) setRegistry((previous) => (previous && previous.revision > reg.revision ? previous : reg));
       })
       .catch((err) => {
-        if (mounted) setRegistryError('读取登记配置失败: ' + (err?.message || '未知错误'));
+        if (mounted) {
+          const loc = localeRef.current;
+          setRegistryError(
+            translate(loc, 'monitor.loadRegistryFailed', {
+              reason: err?.message || translate(loc, 'app.unknownError'),
+            }),
+          );
+        }
       });
 
     const unsubscribe = window.monitor.subscribe((update: MonitorUpdate) => {
@@ -207,7 +283,12 @@ export function useMonitor() {
         for (const host of update.snapshot.hosts) {
           const prevConn = prevHosts.get(host.hostId);
           if (prevConn && prevConn !== host.connection) {
-            setAnnouncement(`宿主 ${host.hostId} 状态变更为: ${host.connection}`);
+            setAnnouncement(
+              translate(localeRef.current, 'monitor.hostStatusChanged', {
+                hostId: host.hostId,
+                status: host.connection,
+              }),
+            );
           }
           prevHosts.set(host.hostId, host.connection);
         }
@@ -240,6 +321,18 @@ export function useMonitor() {
   useEffect(() => {
     if (!snapshot) return;
     setSelection((current) => {
+      const pending = pendingFocusRef.current;
+      if (pending) {
+        const focusedTask = snapshot.tasks.find((item) => item.taskId === pending.taskId);
+        if (focusedTask) {
+          pendingFocusRef.current = null;
+          rememberedTasks.current.set(focusedTask.hostId, focusedTask.taskId);
+          return current.hostId === focusedTask.hostId && current.taskId === focusedTask.taskId && current.view === 'task'
+            ? current
+            : { hostId: focusedTask.hostId, taskId: focusedTask.taskId, view: 'task' };
+        }
+      }
+
       const host = snapshot.hosts.find((item) => item.hostId === current.hostId) ?? snapshot.hosts[0];
       if (current.view === 'host') {
         return current.hostId === (host?.hostId ?? null)
@@ -260,6 +353,7 @@ export function useMonitor() {
   const selectHost = useCallback(
     (hostId: string) => {
       if (!snapshot?.hosts.some((host) => host.hostId === hostId)) return;
+      pendingFocusRef.current = null;
       setSelection({ hostId, taskId: null, view: 'host' });
     },
     [snapshot],
@@ -270,6 +364,7 @@ export function useMonitor() {
       const task = snapshot?.tasks.find((item) => item.taskId === taskId);
       const targetHostId = task?.hostId ?? hostId;
       if (!targetHostId || !snapshot?.hosts.some((host) => host.hostId === targetHostId)) return;
+      pendingFocusRef.current = null;
       rememberedTasks.current.set(targetHostId, taskId);
       setSelection({ hostId: targetHostId, taskId, view: 'task' });
     },
@@ -286,7 +381,9 @@ export function useMonitor() {
       setHostConnectionErrors((previous) => ({ ...previous, [hostId]: '' }));
       try {
         await window.monitor.requestRefresh({ hostId });
-        if (mountedRef.current) setAnnouncement(`宿主 ${hostId} 已完成连接检测`);
+        if (mountedRef.current) {
+          setAnnouncement(translate(localeRef.current, 'monitor.hostCheckDone', { hostId }));
+        }
       } catch (reason) {
         if (mountedRef.current) {
           setHostConnectionErrors((previous) => ({
@@ -311,13 +408,21 @@ export function useMonitor() {
       try {
         const saved = await window.monitor.savePreferences(newPrefs);
         if (!mountedRef.current || request !== preferencesRequest.current) return;
+        const nextLocale: Locale = saved.locale === 'en-US' ? 'en-US' : 'zh-CN';
+        localeRef.current = nextLocale;
+        themePreferenceRef.current = saved.theme;
         setPreferences(saved);
         applyTheme(saved.theme);
         setPreferencesError(null);
-        setAnnouncement('偏好设置已保存');
+        setAnnouncement(translate(nextLocale, 'monitor.preferencesSaved'));
       } catch (err: any) {
         if (!mountedRef.current || request !== preferencesRequest.current) return;
-        setPreferencesSaveError('保存偏好设置失败: ' + (err?.message || '未知错误'));
+        const loc = localeRef.current;
+        setPreferencesSaveError(
+          translate(loc, 'monitor.savePreferencesFailed', {
+            reason: err?.message || translate(loc, 'app.unknownError'),
+          }),
+        );
         throw err;
       } finally {
         if (mountedRef.current && request === preferencesRequest.current) setIsSavingPreferences(false);
@@ -326,26 +431,29 @@ export function useMonitor() {
     [applyTheme],
   );
 
-  const updateRegistry = useCallback(async (newRegistry: Registry) => {
+  const updateRegistry = useCallback(async (newRegistry: Registry, options?: SaveRegistryOptions) => {
     setRegistryError(null);
     try {
-      const saved = await window.monitor.saveRegistry(newRegistry);
+      const saved = options
+        ? await window.monitor.saveRegistry(newRegistry, options)
+        : await window.monitor.saveRegistry(newRegistry);
       setRegistry(saved);
-      setAnnouncement('登记配置已成功保存');
+      setAnnouncement(translate(localeRef.current, 'monitor.registrySaved'));
       return saved;
     } catch (err: any) {
-      const message = err?.message || '保存登记配置失败，可能存在版本冲突或格式错误';
-      const reconcile = /HOST_UNREACHABLE_RECONCILE:(\d+)/.exec(message);
+      const loc = localeRef.current;
+      const reconcile = parseHostUnreachableReconcileError(err);
       if (reconcile) {
-        const localized = translate(preferences.locale ?? 'zh-CN', 'errors.HOST_UNREACHABLE_RECONCILE',
-          { taskCount: Number(reconcile[1]) });
-        setRegistryError(localized);
-        throw new Error(localized);
+        const localized = translate(loc, 'errors.HOST_UNREACHABLE_RECONCILE', {
+          taskCount: reconcile.taskCount,
+        });
+        throw new HostUnreachableReconcileClientError(reconcile.taskCount, localized);
       }
+      const message = err?.message || translate(loc, 'monitor.saveRegistryFailed');
       setRegistryError(message);
       throw err;
     }
-  }, [preferences.locale]);
+  }, []);
 
   const reloadRegistry = useCallback(async () => {
     setRegistryError(null);
@@ -354,7 +462,7 @@ export function useMonitor() {
       setRegistry(reg);
       return reg;
     } catch (err: any) {
-      const msg = err?.message || '重新加载登记配置失败';
+      const msg = err?.message || translate(localeRef.current, 'monitor.reloadRegistryFailed');
       setRegistryError(msg);
       throw err;
     }
@@ -366,10 +474,17 @@ export function useMonitor() {
     setRefreshError(null);
     try {
       await window.monitor.requestRefresh({});
-      if (mountedRef.current && request === refreshRequest.current) setAnnouncement('已刷新监控观测数据');
+      if (mountedRef.current && request === refreshRequest.current) {
+        setAnnouncement(translate(localeRef.current, 'monitor.refreshed'));
+      }
     } catch (err: any) {
       if (mountedRef.current && request === refreshRequest.current) {
-        setRefreshError('刷新观测数据失败: ' + (err?.message || '未知错误'));
+        const loc = localeRef.current;
+        setRefreshError(
+          translate(loc, 'monitor.refreshFailed', {
+            reason: err?.message || translate(loc, 'app.unknownError'),
+          }),
+        );
       }
     } finally {
       if (mountedRef.current && request === refreshRequest.current) setIsRefreshing(false);

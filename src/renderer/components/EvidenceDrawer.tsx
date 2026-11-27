@@ -20,6 +20,23 @@ interface EvidenceDrawerProps {
 function CopyChip({ value }: { value: string }) {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      if (window.desktop?.copyDiagnosticText) {
+        await window.desktop.copyDiagnosticText(value);
+      } else if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        return;
+      }
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Do not mark copied when clipboard write fails
+    }
+  };
+
   return (
     <button
       type="button"
@@ -27,11 +44,7 @@ function CopyChip({ value }: { value: string }) {
       style={{ height: 20, padding: '0 4px' }}
       title={copied ? t('app.copied') : t('app.copy')}
       aria-label={copied ? t('app.copied') : t('app.copy')}
-      onClick={() => {
-        void navigator.clipboard?.writeText(value).catch(() => undefined);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      }}
+      onClick={() => void handleCopy()}
     >
       <Icon name={copied ? 'check' : 'copy'} size={11} />
     </button>
